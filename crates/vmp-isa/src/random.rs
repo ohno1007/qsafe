@@ -28,11 +28,11 @@ impl IsaRandomizer {
         let all_ops = VOp::all();
         let total_variants: usize =
             all_ops.len() * (self.variants_per_op as usize);
-        // 1 字节 opcode 空间 = 256；预留少量空缺给非法值，便于 fuzz 检测。
-        // 上限：54 VOp × 4 dup（heavy）= 216；54 × 8 dup（paranoid）= 432 → paranoid
-        // 模式下 ISA 随机化器会触发；目前 paranoid 不在默认路径，CLI 会在 build() 前
-        // 把 dup 限制在 4 以内。这条 assertion 即兜底。
-        assert!(total_variants <= 240, "ISA 随机化变体数超过 opcode 容量");
+        // 1 字节 opcode 空间 = 255（pool = 1..=255）。
+        // 当前 VOp 数：64（含 Phase 5 扩展：Rbit/Rev/Clz/FNeg/FAbs/FSqrt/Adc/Sbc/Ccmp）。
+        // Heavy / Paranoid dup=3 → 192 变体；Standard dup=2 → 128 变体；Light dup=1 → 64.
+        // cap 留到 254，给后续再加几个 VOp 留余量。
+        assert!(total_variants <= 254, "ISA 随机化变体数超过 opcode 容量");
 
         // 1) 生成可用 opcode 池并打乱
         let mut pool: Vec<u8> = (1u8..=255u8).collect();

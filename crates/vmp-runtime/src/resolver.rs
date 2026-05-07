@@ -9,10 +9,21 @@
 
 use crate::scan::discovered;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use vmp_core::Result;
 
 static IMPORT_TABLE: OnceLock<HashMap<u64, u64>> = OnceLock::new();
+static THREAT_DETECTED: AtomicBool = AtomicBool::new(false);
+
+/// 由 `policy::on_threat` 调用。设置后所有 `dispatch_region` 路径返回 corrupt 值。
+pub fn set_threat_flag() {
+    THREAT_DETECTED.store(true, Ordering::SeqCst);
+}
+
+pub fn threat_detected() -> bool {
+    THREAT_DETECTED.load(Ordering::Relaxed)
+}
 
 /// scan 完成后调用：对每个发现模块的 imports 表（如有）做 dlsym 解析。
 pub fn resolve_imports_for_all() {
@@ -91,6 +102,10 @@ fn locate_region(region_id: usize) -> Option<(&'static vmp_stub::StubBlob, usize
 /// 顶层 dispatch：BRK trap → 找 blob → vmp_stub::dispatch_vm。仅 Linux 上有 LinuxHost。
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn dispatch_region(region_id: usize, args: &[u64]) -> Result<u64> {
+    if threat_detected() {
+        // policy::corrupt：返回毒化值；攻击者拿到错的运行结果
+        return Ok(0xDEAD_C0DE_DEAD_C0DEu64);
+    }
     let (blob, idx) = locate_region(region_id)
         .ok_or_else(|| vmp_core::Error::vm("E:no-region"))?;
     let mut host = vmp_stub::linux::LinuxHost::new();

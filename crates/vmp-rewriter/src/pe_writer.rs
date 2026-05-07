@@ -16,7 +16,7 @@
 //! 异常展开仍能正确处理（unwind code 通常从 prologue 开始解析，覆盖第 1 条 ≤ 4 字节
 //! 不破坏 unwind 语义）。完整 PE 路径会在 Phase 5 补完。
 
-use crate::patcher::build_brk_trampoline;
+use crate::patcher::{build_brk_trampoline, build_x86_int3_trampoline};
 use crate::Result;
 use byteorder::{ByteOrder, LittleEndian};
 use vmp_loader::{BinaryKind, LoadedObject};
@@ -76,15 +76,23 @@ pub fn rewrite_pe(
     let magic = LittleEndian::read_u16(&out[opt_off..opt_off + 2]);
     let is_pe32_plus = magic == 0x20B;
 
-    // 读 SectionAlignment / FileAlignment / SizeOfImage
+    // PE32 vs PE32+ optional header 字段偏移（IMAGE_OPTIONAL_HEADER vs ..._64）：
+    //   字段                 PE32     PE32+
+    //   SectionAlignment     +32      +32
+    //   FileAlignment        +36      +36
+    //   SizeOfImage          +56      +56     ← 两者相同（在 ImageBase 之前）
+    //   ImageBase            +28(u32) +24(u64) ← 这里两者位置都不一样
+    // SizeOfImage 在 PE32 里是 +56，在 PE32+ 里仍是 +56（"NumberOfHeaders 之后"），
+    // 所以下面统一处理；ImageBase 我们没用，跳过。
     let sec_align_off = opt_off + 32;
     let file_align_off = opt_off + 36;
-    let size_of_image_off = if is_pe32_plus { opt_off + 56 } else { opt_off + 56 };
+    let size_of_image_off = opt_off + 56;
     let sec_align = LittleEndian::read_u32(&out[sec_align_off..sec_align_off + 4]);
     let file_align = LittleEndian::read_u32(&out[file_align_off..file_align_off + 4]);
     if sec_align == 0 || file_align == 0 {
         return Err(crate::RewriteError::Parse("alignment 字段为 0".into()));
     }
+    let _ = is_pe32_plus;
 
     // section table 紧跟 optional header
     let section_table_off = opt_off + opt_size as usize;
@@ -96,10 +104,23 @@ pub fn rewrite_pe(
         ));
     }
 
-    // 计算追加 section 的字节
+    // 计算追加 section 的字节。
+    //
+    // 跳板形式由架构决定：
+    // - ARM64 / ARM64EC：BRK + MOV X16,#region_id（[`build_brk_trampoline`]）
+    // - x86 / x86_64：INT3 (0xCC) + 一段裸 region_id 字节（runtime 在 SIGTRAP / VEH
+    //   handler 里读 region_id 并继续）
+    //
+    // 当前 MVP：所有架构统一用 ARM64 形式 16 字节跳板（仅 ARM64 上能正确触发；x86
+    // 上会被 CPU 当作非法指令，调用方需要在 cdylib 内特化处理）。后续按 `loaded.arch`
+    // 分发到各自跳板生成器。
     let mut payload: Vec<u8> = Vec::new();
     for (idx, _r) in blob.regions.iter().enumerate() {
-        payload.extend_from_slice(&build_brk_trampoline(idx as u32));
+        let tramp = match loaded.arch {
+            vmp_core::Arch::X86 | vmp_core::Arch::X86_64 => build_x86_int3_trampoline(idx as u32),
+            _ => build_brk_trampoline(idx as u32),
+        };
+        payload.extend_from_slice(&tramp);
     }
     payload.extend_from_slice(b"QVMP");
     let packed = pack_blob(blob);

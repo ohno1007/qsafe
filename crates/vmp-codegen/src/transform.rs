@@ -19,12 +19,13 @@
 
 use rand::Rng;
 use rand_chacha::ChaCha20Rng;
-use vmp_isa::{Instr, VOp, Width};
+use vmp_isa::{Cond, Instr, VOp, Width};
 
 /// 仅限 lifter 已预留的 scratch 寄存器范围（V32..V62）。绕开 V63（XZR）。
 const TMP1: u8 = 36;
 const TMP2: u8 = 37;
 const TMP3: u8 = 38;
+const TMP4: u8 = 39;
 
 #[derive(Debug, Clone)]
 pub struct ExpandOptions {
@@ -51,6 +52,7 @@ pub struct ExpandReport {
     pub arith_rewritten: usize,
     pub consts_split: usize,
     pub opaque_inserted: usize,
+    pub dead_inserted: usize,
 }
 
 /// 对 `ir` 原地膨胀。**前置条件**：所有 Br/BCond/Call.imm 已经是 IR 索引（不是绝对地址）。
@@ -68,6 +70,12 @@ pub fn expand_arith(
     for (idx, ins) in ir.iter().enumerate() {
         remap.push(new_ir.len());
         let _ = idx;
+
+        // 在原 IR 之前插入 1..N 条 dead-code（操作 scratch，下一条指令不依赖结果）
+        if opts.opaque_predicate && rng.gen_range(0..100u8) < 30 {
+            insert_opaque_predicate(&mut new_ir, rng);
+            report.opaque_inserted += 1;
+        }
 
         match ins.op {
             // 真指令变形：Add/Sub
@@ -161,6 +169,50 @@ fn rewrite_sub(ins: &Instr, out: &mut Vec<Instr>, _rng: &mut ChaCha20Rng) {
         width: w,
         ..Default::default()
     });
+}
+
+/// 不透明谓词序列 —— 写 scratch + 设置标志位但不真的分支：
+///   `Mul TMP1, TMP1, TMP1`（TMP1 = TMP1²）
+///   `Add TMP1, TMP1, TMP1`（TMP1 += TMP1，等价 *2 → 一定偶数）
+///   `Tst TMP1, TMP2(=1)`（测最低位 → Z=1，即 "always equal zero"）
+///   反汇编器看到这是**有真效果的算术 + 标志位写入**，必须解析；但下一条不读
+///   TMP1/TMP2/标志，所以语义中性。
+///
+/// 不会 emit BCond —— 见 junk.rs 注释，BCond 的 imm 在 codegen 第二遍 fixup 时
+/// 会被当成 IR 索引解释，造成跳到 IR[0] 的死循环。这里只制造算术 + 标志写。
+fn insert_opaque_predicate(out: &mut Vec<Instr>, _rng: &mut ChaCha20Rng) {
+    out.push(Instr {
+        op: VOp::Mul,
+        rd: TMP1,
+        rs: TMP1,
+        rt: TMP1,
+        width: Width::W64,
+        ..Default::default()
+    });
+    out.push(Instr {
+        op: VOp::Add,
+        rd: TMP1,
+        rs: TMP1,
+        rt: TMP1,
+        width: Width::W64,
+        ..Default::default()
+    });
+    out.push(Instr {
+        op: VOp::MovI,
+        rd: TMP4,
+        imm: 1,
+        width: Width::W64,
+        ..Default::default()
+    });
+    out.push(Instr {
+        op: VOp::Tst,
+        rs: TMP1,
+        rt: TMP4,
+        width: Width::W64,
+        ..Default::default()
+    });
+    // 维持避免 unused warning：cond 模块在外部其它 IR 已使用
+    let _ = Cond::Eq;
 }
 
 /// `MovI rd, K` ≡ `MovI tmp, K1 ; MovI rd, K2 ; Xor rd, rd, tmp`，K1 ⊕ K2 = K。

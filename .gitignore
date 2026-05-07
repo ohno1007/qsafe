@@ -23,6 +23,9 @@ samples/fpdemo/*.qvmp
 samples/fpdemo/*.text
 samples/fpdemo/sumsq_only.bin
 
+# realworld 加固脚本产物
+samples/realworld/out/
+
 # Cargo / 调试缓存
 Cargo.lock
 **/*.rs.bk

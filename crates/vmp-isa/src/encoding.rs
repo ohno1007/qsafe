@@ -200,6 +200,30 @@ impl Instr {
 
             // NEON 向量算术：r3w + lane 字段
             VOp::VAdd | VOp::VSub | VOp::VMul => Layout::r3wl(),
+
+            // 位运算扩展（rd + rs + width，无 rt）
+            VOp::Rbit | VOp::Rev | VOp::Clz => Layout {
+                has_rd: true, has_rs: true, has_rt: false,
+                has_width: true, has_cond: false, imm_bytes: 0, has_lane: false,
+            },
+
+            // FP 单源（rd + rs + width）
+            VOp::FNeg | VOp::FAbs | VOp::FSqrt => Layout {
+                has_rd: true, has_rs: true, has_rt: false,
+                has_width: true, has_cond: false, imm_bytes: 0, has_lane: false,
+            },
+
+            // ADC / SBC：r3w + cond（cond 表示是否更新标志位）
+            VOp::Adc | VOp::Sbc => Layout {
+                has_rd: true, has_rs: true, has_rt: true,
+                has_width: true, has_cond: true, imm_bytes: 0, has_lane: false,
+            },
+
+            // CCMP：rs + rt + width + cond + imm32（imm 字段低 4 bit 是 NZCV nzcv 备份值）
+            VOp::Ccmp => Layout {
+                has_rd: false, has_rs: true, has_rt: true,
+                has_width: true, has_cond: true, imm_bytes: 4, has_lane: false,
+            },
         }
     }
 

@@ -27,18 +27,33 @@
 
 use std::sync::Once;
 
+pub mod page_crypto;
+pub mod policy;
 pub mod resolver;
 pub mod scan;
 pub mod sig;
 
 /// 全局初始化入口。`JNI_OnLoad` / `__attribute__((constructor))` / `DllMain`
 /// 都在第一次进入时调用本函数。多次调用安全（Once 保护）。
+///
+/// 顺序：
+/// 1. 安装 SIGTRAP handler（VMP BRK 跳板触发后由它接管）
+/// 2. 扫描已加载 .so / .exe 找 QVMP / QIMP blob，建立全局 region 表
+/// 3. dlsym 解析 imports.tbl 中的 hash → 真实地址
+/// 4. 跑反分析检查（按环境变量 / 编译期 flag）；命中威胁触发 [`policy`] 决定的响应
 pub fn qvmp_runtime_init() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         sig::install_sigtrap_handler();
         scan::scan_loaded_modules();
         resolver::resolve_imports_for_all();
+
+        // 反分析探测：默认从 QVMP_FLAGS env var 读，未设置 = DEFAULT_HEAVY
+        let flags = vmp_protect::ProtectFlags::from_env();
+        let verdict = vmp_protect::run_checks(flags, None);
+        if verdict.any_threat() {
+            policy::on_threat(&verdict);
+        }
     });
 }
 

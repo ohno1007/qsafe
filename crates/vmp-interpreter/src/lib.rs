@@ -411,6 +411,140 @@ impl<'a> Interpreter<'a> {
                         |a, b| a.wrapping_mul(b),
                     );
                 }
+
+                // ==== 位运算扩展 ====
+                VOp::Rbit => {
+                    let v = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let r = match instr.width {
+                        Width::W32 => (v as u32).reverse_bits() as u64,
+                        Width::W64 => v.reverse_bits(),
+                        _ => v,
+                    };
+                    self.state.regs[instr.rd as usize] = r & instr.width.mask();
+                }
+                VOp::Rev => {
+                    let v = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let r = match instr.width {
+                        Width::W16 => (v as u16).swap_bytes() as u64,
+                        Width::W32 => (v as u32).swap_bytes() as u64,
+                        Width::W64 => v.swap_bytes(),
+                        _ => v,
+                    };
+                    self.state.regs[instr.rd as usize] = r & instr.width.mask();
+                }
+                VOp::Clz => {
+                    let v = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let r = match instr.width {
+                        Width::W32 => (v as u32).leading_zeros() as u64,
+                        Width::W64 => v.leading_zeros() as u64,
+                        _ => v.leading_zeros() as u64,
+                    };
+                    self.state.regs[instr.rd as usize] = r;
+                }
+
+                // ==== FP 单源 ====
+                VOp::FNeg => {
+                    let v = self.state.fregs[instr.rs as usize & 31];
+                    let r = match instr.width {
+                        Width::W32 => {
+                            let f = -f32::from_bits(v as u32);
+                            (v & !0xFFFF_FFFFu128) | (f.to_bits() as u128)
+                        }
+                        Width::W64 => {
+                            let f = -f64::from_bits(v as u64);
+                            (v & !0xFFFF_FFFF_FFFF_FFFFu128) | (f.to_bits() as u128)
+                        }
+                        _ => v,
+                    };
+                    self.state.fregs[instr.rd as usize & 31] = r;
+                }
+                VOp::FAbs => {
+                    let v = self.state.fregs[instr.rs as usize & 31];
+                    let r = match instr.width {
+                        Width::W32 => {
+                            let f = f32::from_bits(v as u32).abs();
+                            (v & !0xFFFF_FFFFu128) | (f.to_bits() as u128)
+                        }
+                        Width::W64 => {
+                            let f = f64::from_bits(v as u64).abs();
+                            (v & !0xFFFF_FFFF_FFFF_FFFFu128) | (f.to_bits() as u128)
+                        }
+                        _ => v,
+                    };
+                    self.state.fregs[instr.rd as usize & 31] = r;
+                }
+                VOp::FSqrt => {
+                    let v = self.state.fregs[instr.rs as usize & 31];
+                    let r = match instr.width {
+                        Width::W32 => {
+                            let f = f32::from_bits(v as u32).sqrt();
+                            (v & !0xFFFF_FFFFu128) | (f.to_bits() as u128)
+                        }
+                        Width::W64 => {
+                            let f = f64::from_bits(v as u64).sqrt();
+                            (v & !0xFFFF_FFFF_FFFF_FFFFu128) | (f.to_bits() as u128)
+                        }
+                        _ => v,
+                    };
+                    self.state.fregs[instr.rd as usize & 31] = r;
+                }
+
+                // ==== ADC / SBC ====
+                VOp::Adc => {
+                    let a = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let b = self.state.regs[instr.rt as usize] & instr.width.mask();
+                    let c = if self.state.flags.c { 1u64 } else { 0 };
+                    let r = a.wrapping_add(b).wrapping_add(c) & instr.width.mask();
+                    self.state.regs[instr.rd as usize] = r;
+                    if matches!(instr.cond, Cond::Ne) {
+                        // ADCS：更新 NZCV（C/V 简化）
+                        let (sum1, c1) = a.overflowing_add(b);
+                        let (sum2, c2) = sum1.overflowing_add(c);
+                        let _ = sum2;
+                        self.state.flags.update_arith(
+                            r, instr.width, c1 || c2,
+                            signed_overflow_sub(a, b.wrapping_neg(), r, instr.width),
+                        );
+                    }
+                }
+                VOp::Sbc => {
+                    // SBC: rd = rs - rt - !C
+                    let a = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let b = self.state.regs[instr.rt as usize] & instr.width.mask();
+                    let c = if self.state.flags.c { 0u64 } else { 1 };
+                    let r = a.wrapping_sub(b).wrapping_sub(c) & instr.width.mask();
+                    self.state.regs[instr.rd as usize] = r;
+                    if matches!(instr.cond, Cond::Ne) {
+                        let (d1, b1) = a.overflowing_sub(b);
+                        let (d2, b2) = d1.overflowing_sub(c);
+                        let _ = d2;
+                        self.state.flags.update_arith(
+                            r, instr.width, !(b1 || b2),
+                            signed_overflow_sub(a, b, r, instr.width),
+                        );
+                    }
+                }
+
+                // ==== CCMP ====
+                VOp::Ccmp => {
+                    if self.state.flags.matches(instr.cond) {
+                        // 条件成立 → 真做 Cmp 设标志
+                        let a = self.state.regs[instr.rs as usize] & instr.width.mask();
+                        let b = self.state.regs[instr.rt as usize] & instr.width.mask();
+                        let (res, carry) = a.overflowing_sub(b);
+                        self.state.flags.update_arith(
+                            res, instr.width, !carry,
+                            signed_overflow_sub(a, b, res, instr.width),
+                        );
+                    } else {
+                        // 不成立 → 把 imm 低 4 bit 当 nzcv 备份值写入
+                        let nzcv = (instr.imm as u8) & 0xF;
+                        self.state.flags.n = (nzcv >> 3) & 1 != 0;
+                        self.state.flags.z = (nzcv >> 2) & 1 != 0;
+                        self.state.flags.c = (nzcv >> 1) & 1 != 0;
+                        self.state.flags.v = nzcv & 1 != 0;
+                    }
+                }
             }
         }
     }

@@ -244,6 +244,33 @@ pub enum VOp {
     VSub = 111,
     /// vreg[Rd].lane[i] = vreg[Rs].lane[i] * vreg[Rt].lane[i]
     VMul = 112,
+
+    // ---- 位运算扩展（Phase 5 ARM64 完整覆盖）----
+    /// Reverse bits (RBIT) —— rd = bit-reverse(rs)；width 决定 W32 / W64
+    Rbit = 120,
+    /// Byte reverse (REV / REV16 / REV32) —— rd = byte-swap(rs)；
+    /// width=W16 半字内 swap；W32 字节级 swap32；W64 字节级 swap64
+    Rev = 121,
+    /// Count leading zeros (CLZ) —— rd = leading_zeros(rs)
+    Clz = 122,
+
+    // ---- FP 单源 ----
+    /// Floating point negate (FNEG) —— vreg[rd] = -vreg[rs]，width=W32 / W64
+    FNeg = 130,
+    /// Floating point absolute value (FABS)
+    FAbs = 131,
+    /// Floating point square root (FSQRT)
+    FSqrt = 132,
+
+    // ---- 带进位算术（ADC/SBC/ADCS/SBCS）----
+    /// rd = rs + rt + C；不更新 C 标志（Adc）/ 更新（AdcS）合并到一条，由 cond 字段
+    /// 表示是否更新（cond=Eq → 不更新；cond=Ne → 更新）。
+    Adc = 140,
+    Sbc = 141,
+
+    // ---- 条件比较（CCMP / CCMN）----
+    /// 条件比较：if cond then Cmp(Rs, Rt) else 写入 imm 作 NZCV
+    Ccmp = 150,
 }
 
 pub const VOP_COUNT: usize = 64; // 上限；实际枚举值不超过此数
@@ -307,6 +334,15 @@ impl VOp {
             110 => VOp::VAdd,
             111 => VOp::VSub,
             112 => VOp::VMul,
+            120 => VOp::Rbit,
+            121 => VOp::Rev,
+            122 => VOp::Clz,
+            130 => VOp::FNeg,
+            131 => VOp::FAbs,
+            132 => VOp::FSqrt,
+            140 => VOp::Adc,
+            141 => VOp::Sbc,
+            150 => VOp::Ccmp,
             _ => return None,
         };
         Some(result)
@@ -369,6 +405,15 @@ impl VOp {
             VOp::VAdd,
             VOp::VSub,
             VOp::VMul,
+            VOp::Rbit,
+            VOp::Rev,
+            VOp::Clz,
+            VOp::FNeg,
+            VOp::FAbs,
+            VOp::FSqrt,
+            VOp::Adc,
+            VOp::Sbc,
+            VOp::Ccmp,
         ]
     }
 }
@@ -452,6 +497,15 @@ impl VOp {
             VOp::VAdd => "VAdd",
             VOp::VSub => "VSub",
             VOp::VMul => "VMul",
+            VOp::Rbit => "Rbit",
+            VOp::Rev => "Rev",
+            VOp::Clz => "Clz",
+            VOp::FNeg => "FNeg",
+            VOp::FAbs => "FAbs",
+            VOp::FSqrt => "FSqrt",
+            VOp::Adc => "Adc",
+            VOp::Sbc => "Sbc",
+            VOp::Ccmp => "Ccmp",
         }
     }
 }

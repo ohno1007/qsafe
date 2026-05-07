@@ -61,6 +61,28 @@ pub fn encode_b(rel_bytes: i32) -> Result<u32, super::RewriteError> {
     Ok(0x14000000 | imm26_u)
 }
 
+/// 生成一个 16-byte x86 / x86_64 trampoline：INT3 + region_id + filler。
+///
+/// 布局（16 字节）：
+/// ```
+///   CC                 ; INT3 — Linux SIGTRAP / Windows EXCEPTION_BREAKPOINT
+///   00 00 00 <region_id_le_u32>     ; runtime VEH/handler 读 region_id
+///   90 90 90 ... 90    ; NOP 填到 16 字节
+/// ```
+///
+/// runtime 在 SIGTRAP handler / Windows VEH 里：
+/// - 读 fault PC → 找跳板表项偏移 → 拿 region_id
+/// - 调 `qvmp_dispatch(region_id, args, nargs)`
+/// - 把 PC 推进到原函数的 caller LR 位置，等价 ret
+pub fn build_x86_int3_trampoline(region_id: u32) -> [u8; 16] {
+    let mut out = [0x90u8; 16]; // NOP 填充
+    out[0] = 0xCC; // INT3
+    // 1..5 留 region_id（little-endian u32），handler 从 fault PC + 1 读
+    let bytes = region_id.to_le_bytes();
+    out[1..5].copy_from_slice(&bytes);
+    out
+}
+
 /// 生成一个 16-byte BRK 跳板：mov x16,#region_id ; brk #(QVMP_BASE|region_id_low) ; nop ; b .
 pub fn build_brk_trampoline(region_id: u32) -> [u8; 16] {
     let mut out = [0u8; 16];

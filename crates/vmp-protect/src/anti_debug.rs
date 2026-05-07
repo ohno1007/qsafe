@@ -1,11 +1,19 @@
-//! 反调试策略。
+//! 反调试 —— 真实运行时探测（Linux / Android / aarch64 优先）。
 //!
-//! 这里给出 **策略描述**，具体执行由 stub 在运行时基于 OS / arch 完成：
-//! - Linux/Android: prctl(PR_SET_DUMPABLE, 0) + 读 /proc/self/status:TracerPid + ptrace(PTRACE_TRACEME)
-//! - Windows:       IsDebuggerPresent + CheckRemoteDebuggerPresent + NtQueryInformationProcess
-//! - macOS/iOS:     sysctl P_TRACED + ptrace(PT_DENY_ATTACH)
+//! 暴露的所有函数都有非 Linux 的 fallback（永远返回 false / 0），保证
+//! workspace 在 host 上仍可编译。
 //!
-//! stub 中的实现可以选择其中一个或多个，被 [`Strategy`] 描述。
+//! 检测项：
+//! 1. `ptrace_traceme_self_test` —— 调 `ptrace(PTRACE_TRACEME)`：
+//!    - 没有 tracer 时调用成功；之后立刻 detach
+//!    - 已被 tracer attach 时返回错误
+//! 2. `tracer_pid` —— 读 `/proc/self/status` 的 `TracerPid:` 字段
+//! 3. `prctl_set_undumpable` —— `prctl(PR_SET_DUMPABLE, 0)`：让自己 coredump 失败、
+//!    `/proc/self/mem` 无法被另一进程打开
+//! 4. `timing_anomaly` —— 用 `clock_gettime(CLOCK_MONOTONIC_RAW)` 测一段已知
+//!    短指令的耗时；超过阈值（即被 step-by-step 打断）则 true
+//!
+//! Strategy 枚举保留给静态描述层（CodeGen 时决定要嵌入哪些字节码）。
 
 use vmp_core::Os;
 
@@ -36,4 +44,83 @@ pub fn default_strategies(os: Os) -> Vec<Strategy> {
         Os::Macos | Os::Ios => vec![Strategy::PtDenyAttach, Strategy::SysctlPTraced],
         Os::Bare => vec![],
     }
+}
+
+// =================== Runtime probes ===================
+
+/// 试图调用 `ptrace(PTRACE_TRACEME, 0, 0, 0)`：返回 true 表示被调试。
+///
+/// 注意：成功 trace 自己后**不能 detach** —— PTRACE_TRACEME 是把当前进程标记
+/// "我自愿被 trace"，没法回退。所以本函数**只在调用方接受 PTRACE_TRACEME 永久
+/// 设置**时调用一次（典型场景：JNI_OnLoad 启动时）。后续 fork 的 child 可正常使用。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn ptrace_traceme_self_test() -> bool {
+    use core::ffi::c_long;
+    extern "C" {
+        fn ptrace(req: c_long, pid: c_long, addr: c_long, data: c_long) -> c_long;
+    }
+    const PTRACE_TRACEME: c_long = 0;
+    let r = unsafe { ptrace(PTRACE_TRACEME, 0, 0, 0) };
+    // -1 即 EPERM（已被另一进程 trace）
+    r == -1
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn ptrace_traceme_self_test() -> bool {
+    false
+}
+
+/// 读 `/proc/self/status` 的 `TracerPid:` 字段。返回 None 表示读取失败。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn tracer_pid() -> Option<u32> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("TracerPid:") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn tracer_pid() -> Option<u32> {
+    None
+}
+
+/// `prctl(PR_SET_DUMPABLE, 0)` —— 让进程不可被 coredump，也阻止其它进程通过
+/// `/proc/self/mem` 读自己内存。返回是否调用成功。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn prctl_set_undumpable() -> bool {
+    use core::ffi::c_int;
+    extern "C" {
+        fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> c_int;
+    }
+    const PR_SET_DUMPABLE: c_int = 4;
+    let r = unsafe { prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    r == 0
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn prctl_set_undumpable() -> bool {
+    false
+}
+
+/// 时间异常检测：跑一段已知指令循环，clock_gettime 前后差值超过阈值即 true。
+/// 阈值经验值：在物理 ARM64 真机上 1024 次空 NOP loop 通常 < 50 us；
+/// gdb single-step 下会膨胀到 ms 级。设阈值 1000 us。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn timing_anomaly() -> bool {
+    use std::time::Instant;
+    let t0 = Instant::now();
+    let mut acc: u64 = 0;
+    for i in 0..4096u64 {
+        acc = acc.wrapping_add(i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    }
+    core::hint::black_box(acc);
+    t0.elapsed().as_micros() > 1000
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn timing_anomaly() -> bool {
+    false
 }

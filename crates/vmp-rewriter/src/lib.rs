@@ -59,5 +59,5 @@ pub use armor::{
 };
 pub use elf_writer::{rewrite_elf, RewriteOptions, RewriteReport};
 pub use imports::{djb2_hash64, pack_imports, unpack_imports, ImportEntry};
-pub use patcher::{TrampolineKind, ARM64_BRK_QVMP_BASE};
+pub use patcher::{build_brk_trampoline, build_x86_int3_trampoline, TrampolineKind, ARM64_BRK_QVMP_BASE};
 pub use pe_writer::{rewrite_pe, PeRewriteOptions, PeRewriteReport};

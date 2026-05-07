@@ -24,6 +24,7 @@ vmp-codegen.workspace = true
 vmp-interpreter.workspace = true
 vmp-stub.workspace = true
 vmp-rewriter.workspace = true
+vmp-protect.workspace = true
 byteorder.workspace = true
 # release 构建里 log::trace!/debug!/info! 的字符串字面量被 dead-code-eliminate，
 # 不会落到 .rodata。warn!/error! 保留，作崩溃诊断。

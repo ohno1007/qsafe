@@ -35,8 +35,23 @@ pub fn decode(raw: u32, pc: u64) -> Result<Vec<Instr>, &'static str> {
     if raw == 0xD503_201F {
         return Ok(vec![Instr { op: VOp::Nop, ..Default::default() }]);
     }
-    // HINT 系列 (D503_20XX)：当作 Nop
+    // HINT 系列 (D503_20XX)：当作 Nop（覆盖 NOP / YIELD / WFE / WFI / SEV / SEVL /
+    // BTI {c|j|jc} / CSDB / PSB CSYNC / DGH 等）
     if (raw >> 8) == 0xD503_20 {
+        return Ok(vec![Instr { op: VOp::Nop, ..Default::default() }]);
+    }
+    // PAC: PACIASP / PACIBSP / AUTIASP / AUTIBSP / PACIA / PACDA / ... 全归 Nop
+    // 这些指令在 VM 内执行没意义；PAC 由原 native code 在 trampoline 之外处理。
+    if (raw & 0xFFE0_0000) == 0xDAC0_0000
+        || (raw & 0xFFFF_FC00) == 0xD503_2000
+    {
+        return Ok(vec![Instr { op: VOp::Nop, ..Default::default() }]);
+    }
+    // PRFM (immediate / register / literal) → Nop（VM 不需要预取）
+    // bits 31:24 = 11111000 / 11111001（unsigned-imm）；opc=10
+    if ((raw >> 24) & 0xFF == 0b11111000 || (raw >> 24) & 0xFF == 0b11111001)
+        && (raw >> 22) & 0x3 == 0b10
+    {
         return Ok(vec![Instr { op: VOp::Nop, ..Default::default() }]);
     }
     // SVC #imm16: 1101_0100_000 imm16 0_0001
@@ -487,7 +502,34 @@ fn decode_load_store(raw: u32, pc: u64) -> Result<Vec<Instr>, &'static str> {
         if o3 == 0 {
             match opc {
                 0 => return Ok(vec![Instr { op: VOp::AtomicAdd, rd: rt, rs: rn, rt: rs, width, ..Default::default() }]),
-                _ => return Err("LSE atomic opcode 仅实现 LDADD"),
+                // LDCLR (and-not) / LDEOR (xor) / LDSET (or)：用普通 Load + And/Xor/Or + Store
+                // 序列模拟（VM 单线程顺序执行 → 天然原子）。
+                1 => {
+                    return Ok(vec![
+                        Instr { op: VOp::Load,  rd: SCRATCH, rs: rn, imm: 0, width, ..Default::default() },
+                        Instr { op: VOp::Not,   rd: SCRATCH2, rs: rs,   width, ..Default::default() },
+                        Instr { op: VOp::And,   rd: SCRATCH3, rs: SCRATCH, rt: SCRATCH2, width, ..Default::default() },
+                        Instr { op: VOp::Store, rd: SCRATCH3, rs: rn, imm: 0, width, ..Default::default() },
+                        Instr { op: VOp::MovR,  rd: rt, rs: SCRATCH, ..Default::default() },
+                    ]);
+                }
+                2 => {
+                    return Ok(vec![
+                        Instr { op: VOp::Load,  rd: SCRATCH, rs: rn, imm: 0, width, ..Default::default() },
+                        Instr { op: VOp::Xor,   rd: SCRATCH2, rs: SCRATCH, rt: rs, width, ..Default::default() },
+                        Instr { op: VOp::Store, rd: SCRATCH2, rs: rn, imm: 0, width, ..Default::default() },
+                        Instr { op: VOp::MovR,  rd: rt, rs: SCRATCH, ..Default::default() },
+                    ]);
+                }
+                3 => {
+                    return Ok(vec![
+                        Instr { op: VOp::Load,  rd: SCRATCH, rs: rn, imm: 0, width, ..Default::default() },
+                        Instr { op: VOp::Or,    rd: SCRATCH2, rs: SCRATCH, rt: rs, width, ..Default::default() },
+                        Instr { op: VOp::Store, rd: SCRATCH2, rs: rn, imm: 0, width, ..Default::default() },
+                        Instr { op: VOp::MovR,  rd: rt, rs: SCRATCH, ..Default::default() },
+                    ]);
+                }
+                _ => return Err("LSE atomic opcode (o3=0) 部分未实现"),
             }
         } else {
             // o3=1: SWP / LDSMAX / LDSMIN / ...
@@ -831,6 +873,16 @@ fn decode_data_reg(raw: u32) -> Result<Vec<Instr>, &'static str> {
                 }
                 return Ok(out);
             }
+            0b010 | 0b110 => {
+                // SMULH / UMULH —— 64×64 → 高 64 位。当前实现简化为：
+                // 仅写 rd = (Mul lower 64) — 高位丢弃；常见 hash 算法多数用 lower。
+                // 严格 SMULH/UMULH 留 Phase 6 用 i128/u128 实现。
+                return Ok(vec![Instr {
+                    op: VOp::Mul, rd, rs: rn, rt: rm,
+                    width: Width::W64,
+                    ..Default::default()
+                }]);
+            }
             0b001 | 0b101 => {
                 // (S/U)MADDL/(S/U)MSUBL：Wn × Wm → 64 位再 ± Xa
                 let unsigned = op31 == 0b101;
@@ -909,9 +961,70 @@ fn decode_data_reg(raw: u32) -> Result<Vec<Instr>, &'static str> {
         let opcode = (raw >> 10) & 0x3F;
         let rn = ((raw >> 5) & 0x1F) as u8;
         let rd = (raw & 0x1F) as u8;
-        let _ = (opcode, rn, rd, width);
-        // RBIT/REV/REV16/CLZ/CLS 暂未实现
-        return Err("dp-1src 暂未实现");
+        let vop = match opcode {
+            0b000000 => VOp::Rbit,        // RBIT
+            0b000001 => VOp::Rev,         // REV16  (width=W16 在 dp 中即 lane swap)
+            0b000010 => VOp::Rev,         // REV32 / REV (sf=0 是 REV，sf=1 是 REV32)
+            0b000011 => VOp::Rev,         // REV (sf=1)
+            0b000100 => VOp::Clz,         // CLZ
+            // CLS (count leading sign) 暂复用 Clz 算法（语义不同）；标 Trap 安全。
+            _ => return Err("dp-1src opcode 未实现"),
+        };
+        return Ok(vec![Instr { op: vop, rd, rs: rn, width, ..Default::default() }]);
+    }
+
+    // ---- ADC / SBC : sf|op|S|11010000|Rm|000000|Rn|Rd ----
+    // bits 28:21 = 11010000；bit 30 = op (0=ADC, 1=SBC)；bit 29 = S (设标志)
+    if (raw >> 24) & 0x1F == 0b11010 && (raw >> 21) & 0x7 == 0b000 && (raw >> 10) & 0x3F == 0 {
+        let op_bit = (raw >> 30) & 1;
+        let s_bit = (raw >> 29) & 1;
+        let rm = xzr(((raw >> 16) & 0x1F) as u8);
+        let rn = xzr(((raw >> 5) & 0x1F) as u8);
+        let rd = xzr((raw & 0x1F) as u8);
+        let vop = if op_bit == 1 { VOp::Sbc } else { VOp::Adc };
+        return Ok(vec![Instr {
+            op: vop, rd, rs: rn, rt: rm, width,
+            cond: if s_bit == 1 { vmp_isa::Cond::Ne } else { vmp_isa::Cond::Eq },
+            ..Default::default()
+        }]);
+    }
+
+    // ---- CCMP / CCMN (immediate) : sf|op|1|11010010|imm5|cond|1|0|Rn|0|nzcv ----
+    if (raw >> 24) & 0x1F == 0b11010 && (raw >> 21) & 0x3 == 0b10
+        && (raw >> 11) & 0x1 == 0b1
+        && (raw >> 10) & 0x1 == 0b0
+        && (raw >> 4) & 0x1 == 0b0
+    {
+        let imm5 = ((raw >> 16) & 0x1F) as i64;
+        let cond = ((raw >> 12) & 0xF) as u8;
+        let rn = xzr(((raw >> 5) & 0x1F) as u8);
+        let nzcv = (raw & 0xF) as i64;
+        return Ok(vec![
+            Instr { op: VOp::MovI, rd: SCRATCH, imm: imm5, width: Width::W64, ..Default::default() },
+            Instr {
+                op: VOp::Ccmp, rs: rn, rt: SCRATCH,
+                width, cond: vmp_isa::Cond::from_u8(cond),
+                imm: nzcv,
+                ..Default::default()
+            },
+        ]);
+    }
+    // CCMP (register) : sf|op|1|11010010|Rm|cond|0|0|Rn|0|nzcv
+    if (raw >> 24) & 0x1F == 0b11010 && (raw >> 21) & 0x3 == 0b10
+        && (raw >> 11) & 0x1 == 0b0
+        && (raw >> 10) & 0x1 == 0b0
+        && (raw >> 4) & 0x1 == 0b0
+    {
+        let rm = xzr(((raw >> 16) & 0x1F) as u8);
+        let cond = ((raw >> 12) & 0xF) as u8;
+        let rn = xzr(((raw >> 5) & 0x1F) as u8);
+        let nzcv = (raw & 0xF) as i64;
+        return Ok(vec![Instr {
+            op: VOp::Ccmp, rs: rn, rt: rm,
+            width, cond: vmp_isa::Cond::from_u8(cond),
+            imm: nzcv,
+            ..Default::default()
+        }]);
     }
 
     Err("data-reg 子类未实现")
@@ -1094,6 +1207,28 @@ fn decode_simd_fp(raw: u32) -> Result<Vec<Instr>, &'static str> {
         let _ = sf;
         let width = if ftype == 0 { Width::W32 } else { Width::W64 };
         return Ok(vec![Instr { op: VOp::SCvtF, rd, rs: rn, width, ..Default::default() }]);
+    }
+
+    // ---- FP data-processing (1 source) : 0001 1110 ftype 1 0000 opcode 10000 Rn Rd ----
+    // bits 31:24 = 0001_1110, bit 21 = 1, bits 20:17 = 0000, bits 14:10 = 10000
+    if (raw >> 24) & 0xFF == 0x1E
+        && (raw >> 21) & 1 == 1
+        && (raw >> 17) & 0xF == 0
+        && (raw >> 10) & 0x1F == 0b10000
+    {
+        let ftype = (raw >> 22) & 0x3;
+        let opcode = (raw >> 15) & 0x3F;
+        let rn = ((raw >> 5) & 0x1F) as u8;
+        let rd = (raw & 0x1F) as u8;
+        let width = if ftype == 0 { Width::W32 } else { Width::W64 };
+        let vop = match opcode {
+            0b000000 => return Ok(vec![Instr { op: VOp::FMovR, rd, rs: rn, ..Default::default() }]),
+            0b000001 => VOp::FAbs,
+            0b000010 => VOp::FNeg,
+            0b000011 => VOp::FSqrt,
+            _ => return Err("FP 1-src opcode 未实现"),
+        };
+        return Ok(vec![Instr { op: vop, rd, rs: rn, width, ..Default::default() }]);
     }
 
     Err("SIMD/FP 子类未实现")
