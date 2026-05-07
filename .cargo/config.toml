@@ -1,0 +1,9 @@
+# 使用 NDK 工具链做交叉编译。Windows 路径用正斜杠避免转义。
+[target.aarch64-linux-android]
+linker = "D:/android-ndk-r29-beta4/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd"
+ar = "D:/android-ndk-r29-beta4/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+
+[env]
+# 让 build.rs 通过 cc/链接器解析路径
+CC_aarch64_linux_android = "D:/android-ndk-r29-beta4/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd"
+AR_aarch64_linux_android = "D:/android-ndk-r29-beta4/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"

@@ -1,0 +1,11 @@
+[package]
+name = "vmp-interpreter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vmp-core.workspace = true
+vmp-isa.workspace = true
+vmp-codegen.workspace = true
+log.workspace = true

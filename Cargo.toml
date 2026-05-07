@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vmp-core",
+    "crates/vmp-isa",
+    "crates/vmp-codegen",
+    "crates/vmp-interpreter",
+    "crates/vmp-arch",
+    "crates/vmp-loader",
+    "crates/vmp-protect",
+    "crates/vmp-stub",
+    "crates/vmp-cli",
+    "crates/vmp-runtime",
+    "crates/vmp-rewriter",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Qsafe VMP"]
+license = "MIT OR Apache-2.0"
+rust-version = "1.75"
+
+[workspace.dependencies]
+thiserror = "1"
+anyhow = "1"
+rand = "0.8"
+rand_chacha = "0.3"
+byteorder = "1.5"
+clap = { version = "4.5", features = ["derive"] }
+goblin = "0.8"
+log = "0.4"
+env_logger = "0.11"
+sha2 = "0.10"
+hex = "0.4"
+
+vmp-core = { path = "crates/vmp-core" }
+vmp-isa = { path = "crates/vmp-isa" }
+vmp-codegen = { path = "crates/vmp-codegen" }
+vmp-interpreter = { path = "crates/vmp-interpreter" }
+vmp-arch = { path = "crates/vmp-arch" }
+vmp-loader = { path = "crates/vmp-loader" }
+vmp-protect = { path = "crates/vmp-protect" }
+vmp-stub = { path = "crates/vmp-stub" }
+vmp-rewriter = { path = "crates/vmp-rewriter" }
+
+[profile.release]
+opt-level = "z"      # 优先体积，同时配合 LTO 仍能拿到大部分性能
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"    # 去掉所有符号 / debug info / 函数名
+debug = false
+overflow-checks = false
+incremental = false

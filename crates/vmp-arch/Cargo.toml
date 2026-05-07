@@ -1,0 +1,16 @@
+[package]
+name = "vmp-arch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["arm64"]
+arm64 = []
+x86_64 = []
+
+[dependencies]
+vmp-core.workspace = true
+vmp-isa.workspace = true
+byteorder.workspace = true
+log.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "vmp-stub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vmp-core.workspace = true
+vmp-isa.workspace = true
+vmp-codegen.workspace = true
+vmp-interpreter.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+vmp-arch = { path = "../vmp-arch" }
+vmp-loader = { path = "../vmp-loader" }
+goblin = { workspace = true }

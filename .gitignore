@@ -1,0 +1,29 @@
+/target
+Cargo.lock
+*.swp
+.vscode/
+.idea/
+*.bin
+*.elf
+*.protected
+
+# 编译产出
+samples/multifn/multifn
+samples/multifn/multifn-rewritten
+samples/multifn/multifn-armored
+samples/multifn/multifn-final
+samples/multifn/multifn-heavy.qvmp
+samples/multifn/*.qvmp
+samples/multifn/*.text
+samples/sumsq/sumsq
+samples/sumsq/*.text
+samples/sumsq/*.qvmp
+samples/fpdemo/fpdemo
+samples/fpdemo/*.qvmp
+samples/fpdemo/*.text
+samples/fpdemo/sumsq_only.bin
+
+# Cargo / 调试缓存
+Cargo.lock
+**/*.rs.bk
+*.pdb

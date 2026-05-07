@@ -1,0 +1,10 @@
+[package]
+name = "vmp-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vmp-core.workspace = true
+goblin.workspace = true
+log.workspace = true

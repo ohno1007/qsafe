@@ -1,0 +1,29 @@
+[package]
+name = "vmp-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vmp-runtime"
+path = "src/main.rs"
+
+[dependencies]
+vmp-core.workspace = true
+vmp-isa.workspace = true
+vmp-codegen.workspace = true
+vmp-interpreter.workspace = true
+vmp-stub.workspace = true
+# release 构建里 log::trace!/debug!/info! 的字符串字面量被 dead-code-eliminate，
+# 不会落到 .rodata。warn!/error! 保留，作崩溃诊断。
+log = "0.4"
+# env_logger 通过 feature gate；默认开启，debug build 自然带；
+# release 想剥除时显式 `--no-default-features` 即可彻底不 link。
+env_logger = { workspace = true, optional = true }
+
+[features]
+default = ["dev-logger"]
+dev-logger = ["dep:env_logger"]
+
+[build-dependencies]
+# 构建时把外部 .qvmp 文件复制到 OUT_DIR，供 include_bytes! 嵌入。
