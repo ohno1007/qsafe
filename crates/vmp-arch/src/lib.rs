@@ -5,6 +5,8 @@
 pub mod lifter;
 #[cfg(feature = "arm64")]
 pub mod arm64;
+#[cfg(feature = "arm32")]
+pub mod arm32;
 #[cfg(feature = "x86_64")]
 pub mod x86_64;
 
@@ -17,6 +19,8 @@ pub fn make_lifter(arch: Arch) -> Result<Box<dyn Lifter>> {
     match arch {
         #[cfg(feature = "arm64")]
         Arch::Arm64 => Ok(Box::new(arm64::Arm64Lifter::default())),
+        #[cfg(feature = "arm32")]
+        Arch::Arm32 => Ok(Box::new(arm32::Arm32Lifter::default())),
         #[cfg(feature = "x86_64")]
         Arch::X86_64 => Ok(Box::new(x86_64::X86_64Lifter::default())),
         _ => Err(vmp_core::Error::UnsupportedArch(arch)),

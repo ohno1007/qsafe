@@ -10,8 +10,10 @@
 pub mod junk;
 pub mod resolve;
 pub mod stream;
+pub mod transform;
 
 pub use resolve::{resolve_program, FunctionRegion, ResolveReport};
+pub use transform::{expand_arith, ExpandOptions, ExpandReport};
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;

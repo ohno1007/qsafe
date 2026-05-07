@@ -13,7 +13,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::fs;
 use std::path::PathBuf;
-use vmp_codegen::{resolve_program, CodeGen, FunctionRegion};
+use vmp_codegen::{expand_arith, resolve_program, CodeGen, ExpandOptions, FunctionRegion};
 use vmp_core::{ProtectConfig, ProtectLevel};
 use vmp_isa::IsaRandomizer;
 use vmp_stub::{pack_blob, unpack_blob, StubBlob, StubRegion};
@@ -98,6 +98,25 @@ enum Cmd {
     },
     /// 列出 .a 静态库内的 .o 成员（用于 batch protect 准备）
     ArList { archive: PathBuf },
+    /// 把 .qvmp blob 嵌入 .a 静态库（追加成员，链接器后续合入产出）
+    StaticRewrite {
+        archive: PathBuf,
+        blob: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Windows PE / PE32+ 加壳：嵌入 blob + 新 section（不写跳板，MVP）
+    PeRewrite {
+        input: PathBuf,
+        blob: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        /// ARM64 Windows X18 平台保留寄存器隔离（Linux 关闭）
+        #[arg(long, default_value_t = false)]
+        x18_isolation: bool,
+    },
+    /// 扫描 APK 解包目录里的 native lib 列表
+    ApkList { apk_dir: PathBuf },
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -240,6 +259,33 @@ fn main() -> anyhow::Result<()> {
                 resolve_report.cross_region_calls,
                 resolve_report.unresolved
             );
+
+            // 第二点五遍：算术混淆膨胀（Heavy / Paranoid 启用）。**必须在 resolve 之后**
+            // 跑，因为 expand_arith 会 remap 跳转的 IR 索引；而 resolve 把 imm 改成
+            // IR 索引正是 expand_arith 的前置条件。
+            if matches!(proto_level, ProtectLevel::Heavy | ProtectLevel::Paranoid) {
+                use rand::SeedableRng;
+                use rand_chacha::ChaCha20Rng;
+                let mut total_arith = 0usize;
+                let mut total_const = 0usize;
+                let opts = ExpandOptions {
+                    arith_rewrite_prob: if proto_level == ProtectLevel::Paranoid { 50 } else { 30 },
+                    const_split_prob: if proto_level == ProtectLevel::Paranoid { 60 } else { 40 },
+                    opaque_predicate: false,
+                };
+                for (region_idx, func) in funcs.iter_mut().enumerate() {
+                    let mut bytes = [0u8; 32];
+                    bytes[..8].copy_from_slice(&cfg.seed.wrapping_add(region_idx as u64).to_le_bytes());
+                    let mut rng = ChaCha20Rng::from_seed(bytes);
+                    let rep = expand_arith(&mut func.ir, &mut rng, &opts);
+                    total_arith += rep.arith_rewritten;
+                    total_const += rep.consts_split;
+                }
+                log::info!(
+                    "expand_arith: arith_rewritten={} consts_split={}",
+                    total_arith, total_const
+                );
+            }
 
             // 第三遍：每个 region 独立 codegen，用 region_idx 作 IV salt。
             let mut pool: Vec<u8> = Vec::new();
@@ -388,6 +434,56 @@ fn main() -> anyhow::Result<()> {
             println!("AR 成员 ({} 个):", mems.len());
             for m in &mems {
                 println!("  {} @ {:#x} size={}", m.name, m.offset, m.size);
+            }
+        }
+
+        Cmd::StaticRewrite { archive, blob, output } => {
+            let arch_bytes = fs::read(&archive)?;
+            let blob_bytes = fs::read(&blob)?;
+            let stub_blob = vmp_stub::unpack_blob(&blob_bytes)?;
+            let opts = vmp_rewriter::ArRewriteOptions::default();
+            let (out, rep) = vmp_rewriter::rewrite_archive(&arch_bytes, &stub_blob, &opts)
+                .map_err(|e| anyhow::anyhow!("ar rewrite failed: {e}"))?;
+            fs::write(&output, &out)?;
+            println!(
+                "static-rewrite ok: members={} blob_member_size={} → {} ({} bytes)",
+                rep.original_members,
+                rep.blob_member_size,
+                output.display(),
+                out.len()
+            );
+        }
+
+        Cmd::PeRewrite { input, blob, output, x18_isolation } => {
+            let pe_bytes = fs::read(&input)?;
+            let loaded = vmp_loader::load(pe_bytes)?;
+            let blob_bytes = fs::read(&blob)?;
+            let stub_blob = vmp_stub::unpack_blob(&blob_bytes)?;
+            let opts = vmp_rewriter::PeRewriteOptions {
+                write_entry_trampolines: false,
+                arm64_windows_x18_isolation: x18_isolation,
+            };
+            let (out, rep) = vmp_rewriter::rewrite_pe(&loaded, &stub_blob, &opts)
+                .map_err(|e| anyhow::anyhow!("pe rewrite failed: {e}"))?;
+            fs::write(&output, &out)?;
+            println!(
+                "pe-rewrite ok: new_section_rva={:#x} new_section_size={} → {} ({} bytes)",
+                rep.new_section_rva,
+                rep.new_section_size,
+                output.display(),
+                out.len()
+            );
+        }
+
+        Cmd::ApkList { apk_dir } => {
+            use vmp_rewriter::AbiTarget;
+            let libs = vmp_rewriter::apk_list_libs(&apk_dir)
+                .map_err(|e| anyhow::anyhow!("apk 扫描失败: {e}"))?;
+            println!("APK native libs ({} 个):", libs.len());
+            for (abi, p) in &libs {
+                let sz = fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                let _: AbiTarget = *abi; // 仅强制 AbiTarget 在作用域里
+                println!("  [{}] {} ({} bytes)", abi.dir_name(), p.display(), sz);
             }
         }
 

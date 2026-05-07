@@ -84,7 +84,7 @@ pub fn parse(bytes: Vec<u8>) -> Result<LoadedObject> {
     let mut all_code = Vec::new();
     let mut all_syms = Vec::new();
     let mut arch = Arch::Arm64;
-    let mut os = Os::Linux;
+    let os = Os::Linux;
 
     // 给每个 .o 一段虚拟基址：从 0x4000_0000 开始，每个 .o 间隔 4MB（避免地址冲突）
     let mut next_base: u64 = 0x4000_0000;
@@ -122,7 +122,7 @@ pub fn parse(bytes: Vec<u8>) -> Result<LoadedObject> {
         // 简化：跳过具体重定位，只记录函数名 + 大小（vaddr=0 表示需要进一步绑定）
         for sym in elf.syms.iter() {
             if sym.is_function() && sym.st_size > 0 {
-                if let Some(Ok(name)) = elf.strtab.get(sym.st_name) {
+                if let Some(name) = elf.strtab.get_at(sym.st_name) {
                     all_syms.push(Symbol {
                         name: format!("{}::{}", m.name, name),
                         vaddr: sym.st_value,

@@ -12,3 +12,6 @@ goblin.workspace = true
 byteorder.workspace = true
 log.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+vmp-isa = { path = "../vmp-isa" }

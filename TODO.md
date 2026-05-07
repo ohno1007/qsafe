@@ -1,115 +1,160 @@
-# 明天代办
+# 已完成（Phase 4）
 
 ## 高优先级（用户提过 + 已铺架构）
 
-### 1. 直接调用改间接调用 / 导入表极简化 + 动态解析
-当前 ELF 重写后 `.dynsym` 仍有 import 名（PLT/GOT 静态绑定）。要做：
-- 把所有 import 替换成 hash（例如 djb2 `name` → 8 字节）；保留 hash → 真实 dlsym 的运行时映射表
-- 在 cdylib runtime（`libqvmp_runtime.so`）`JNI_OnLoad` / 构造函数里：
-  - walk `link_map` 拿到所有已加载 .so
-  - 对每个 .so 的 export 计算同样 hash → 建立全局表
-- VMP 字节码中的所有 `NativeCall`（lifter 已经识别）改用 hash 间接调用：runtime 查表 → 真实 native 函数地址
-- 入口：`vmp-rewriter::armor::hash_dynsym_imports`（当前 stub），需要：
-  - 解析 .dynsym 找 STT_FUNC + UND
-  - 把对应字符串覆盖为 hash 值（保持长度）
-  - 生成一个 `imports.tbl` 描述给 runtime 用
+### 1. 直接调用改间接调用 / 导入表极简化 + 动态解析 ✅
 
-### 2. VMP 算术混淆（指令膨胀）
-当前 codegen 的 `emit_decoy_seq` 已加 6 种哑指令模式。明天扩展：
-- **真指令变形**：把 `Add Rd, Ra, Rb` 改写成等价多步
-  - `Sub Rd, Ra, Rb_neg` 配合 `Neg Rb_neg, Rb`
-  - `Xor + And + Or` 模拟加法（位运算法则展开）
-- **不透明谓词**：用永远 true/false 的算术表达式作分支条件
-  - `(x*x + x) % 2 == 0` 这种 always-true（任意 int x）
-- **常量打散**：`MovI rd, 0x12345678` → `MovI scratch, K1; MovI rd, K2; Xor rd, rd, scratch`
-  其中 K1 ⊕ K2 = 0x12345678，K1 / K2 在 codegen 时随机
-- 入口：新增 `vmp-codegen::transform::expand_arith` pass，插在 `resolve_program` 后、`encode` 前
+- `vmp-rewriter::imports::djb2_hash64` —— 64-bit djb2 共享算法
+- `vmp-rewriter::armor::hash_dynsym_imports` —— 完整实现：扫 .dynsym + .dynstr，
+  替换 STT_FUNC + UND 符号名为 `h_xxxxxxxx`（16 字节 hex），保留 `__libc_start_main`
+  等 bootstrap 符号
+- `imports.tbl`（`QIMP` magic）写到 ELF 末尾，包含 hash → 原名映射
+- runtime（`vmp-runtime/src/resolver.rs`）启动时扫已加载模块的 `QIMP` blob，
+  对每条 `dlsym(RTLD_DEFAULT, name)` 解析 → 缓存 hash → 真实地址
+- `qvmp_dispatch` C ABI 暴露给受保护代码做 hash → addr 查询
 
-### 3. NEON 向量算术
-当前 lifter 对 `add v0.4s, v1.4s, v2.4s` / `fmul v0.2d, v1.2d, v2.2d` 等向量指令标 Trap。
-- VOp 加 `VAdd / VSub / VMul / VLoadQ / VStoreQ`，width 字段编码 lane size + lane count
-- 解释器用 u128 拆 lanes 计算
-- ARM64 NEON encoding 在 ARMv8 ARM C7 章节，指令族 `Advanced SIMD three same`
-- 优先级：商用 SDK 经常用 NEON 做加密/哈希，覆盖了才能保护这类库
+### 2. VMP 算术混淆（指令膨胀） ✅
 
-## 中优先级（架构已铺好，工作量适中）
+新模块 `vmp-codegen::transform`，CLI `--level heavy/paranoid` 自动启用：
+- `Add` → `Neg+Sub` 二步展开
+- `Sub` → `Not+MovI(1)+Add+Add` 四步展开（二补码恒等）
+- `MovI K` → `MovI K1 / MovI K2 / Xor`，`K1 ⊕ K2 = K`（K1/K2 RNG 决定）
+- 每条变形保持跳转 IR 索引语义（remap 表保证 Br/BCond/Call 正确指向）
 
-### 4. cdylib runtime（libqvmp_runtime.so）实现
-- vmp-runtime 改 `crate-type = ["cdylib"]`
-- `JNI_OnLoad` 作为入口：
-  - 注册 SIGTRAP handler
-  - 扫所有 PT_LOAD segment 找 `QVMP` magic 解析 blob 表
-  - 对每个保护函数 vaddr 建立 PC → blob 映射
-- SIGTRAP handler：
-  - 从 `siginfo->si_addr` 读 BRK 地址
-  - 读 `mov x16, #imm16` 拿 region_id
-  - 收集 ucontext 寄存器 → 调 `vmp_stub::dispatch_vm_fp`
-  - 把返回值写回 X0/D0
-  - 设 PC 跳过 BRK 帧 + 原函数末尾（直接 ret）
-- 这一步做完，`vmp rewrite` 输出的 ELF 才能**自包含运行**，不依赖外壳 vmp-runtime
+不透明谓词框架已铺，`opaque_predicate: true` 启用后插入永远 taken / 永远不 taken
+的算术条件分支（留 Phase 5 完整实现）。
 
-### 5. .a 静态库重写
-- `vmp-rewriter::ar_rewriter` 模块（新增）
-- 流程：
-  1. parse archive → 列 .o 成员
-  2. 对每个 .o：lift → protect blob → rewrite .o
-  3. 重新 pack archive（保持 ar 头格式 + 长名表）
-- 输入 lib.a，输出 lib-vmp.a
+### 3. NEON 向量算术 ✅
 
-### 6. payload 解密的 cdylib 实现
-现在 `vmp rewrite --xor-payload` 生成的 ELF 里 payload 加密了，但还没 runtime 能解。需要在 cdylib（任务 4）里做：
-- 进程加载时扫 ELF header → 派生 key
-- 解密 payload → 缓存解码后的 StubBlob
-- 后续 SIGTRAP 用解码后的 blob
+- VOp 新增 `VAdd / VSub / VMul`（整数）
+- `Instr` 加 `lane: u8` + `Layout::r3wl()`（width=lane size，lane=lane count）
+- 解释器 `vec_op` 闭包逐 lane 计算
+- ARM64 lifter 识别 `Advanced SIMD three same`（ADD/SUB/MUL）：8B/16B/4H/8H/2S/4S/2D
 
-### 7. ARMv7 (armeabi-v7a) lifter
-APK 在低端机上仍跑 armeabi-v7a。基本指令集 32-bit ARM + Thumb。
-- 新建 `vmp-arch::arm32` 模块
-- ARM 指令集 32-bit 长度固定；Thumb 16/32-bit 混合
-- 关键 lift：MOV/ADD/SUB/LDR/STR/B/BL/BX/CMP/CBZ
-- 工程量约 800 行（比 ARM64 简单一些）
+浮点向量（FAdd/FSub/FMul of 4S/2D 等）当前仍走标量 FP 路径，留 Phase 5 扩展。
 
-## 低优先级（独立大工程）
+## 中优先级 ✅
 
-### 8. x86_64 lifter
-`vmp-arch::x86_64` 当前是 stub。可变长指令更复杂；推荐接 `iced-x86` crate 做解码，VMP IR 沿用现有 VOp。
+### 4. cdylib runtime（libqvmp_runtime.so） ✅
 
-### 9. APK 加壳 wrapper 工具
-- 输入: APK
-- 流程: unzip → 对 `lib/arm64-v8a/*.so` 跑 protect+rewrite → zip 回 → 重签名
-- 用 `zip` crate + apksigner 命令行
-- 详见 [docs/APK_PACKING.md](docs/APK_PACKING.md)
+`vmp-runtime` 升级为 `crate-type = ["rlib", "cdylib"]`，输出
+`libqvmp_runtime.so`（Linux/Android）/ `qvmp_runtime.dll`（Windows）：
 
-### 10. Windows PE 加壳
-- 重用 vmp-loader 的 PE 解析（已有）
-- 写 vmp-rewriter PE 路径：append new section + 改 entry
-- ARM64 Windows ABI 与 Linux 不同（X18 是平台保留），lifter 需调整 X18 routing
-- 出 .exe 加壳工具
+- `JNI_OnLoad`（Android）/ `.init_array` ctor（Linux）/ `DllMain`（Windows）作入口
+- `sig::install_sigtrap_handler` 注册 `SIGTRAP` `sigaction(SA_SIGINFO)`
+- `scan::scan_loaded_modules` 调 `dl_iterate_phdr` 找所有已加载 .so 的 PT_LOAD 段，
+  搜 `QVMP` magic，解密 payload，缓存 (region_id → blob) 表
+- `sigtrap_handler`：从 ucontext 找 mcontext.pc（自适应 libc 偏移）→ 收集 X0..X7
+  → `dispatch_region` → 写回 X0、设 PC = LR
 
-## 一些 cleanup
+aarch64 Linux/Android 完整路径；Windows / x86_64 入口骨架已铺。
 
-- vmp-rewriter 的 `unused import StubRegion` warning 清掉
-- vmp-codegen 的 `unused Cond` warning 清掉
-- vmp-loader 的 `goblin Strtab.get` deprecated 改 `get_at`
-- runtime 一旦稳定，把临时调试 log（`stage X` / `[map_data]` / `SYSCALL ...`）全部用 `release_max_level_warn` 锁回
-- README 补 Phase 4 完成内容、补 TODO 完成项
+### 5. .a 静态库重写 ✅
 
-## 当前最新成品（截至本轮）
+`vmp-rewriter::ar_rewriter`：
+- 复用 `vmp-loader::ar::members` 解析
+- 把整个 stub blob 作为新 ar 成员（`qvmp_blob.bin`）追加到 archive 末尾，保持
+  System V / GNU 风格 60 字节 header 与偶数对齐
+- CLI 子命令 `vmp static-rewrite`
+
+逐 .o 内 lift（跨 .o 重定位）留 Phase 5 —— 当前路径让链接器把 blob 透明合入 .so/.exe。
+
+### 6. payload 解密的 cdylib 实现 ✅
+
+`vmp-rewriter::armor::derive_payload_key` / `apply_payload_keystream` 抽成 pub
+函数，runtime `scan.rs::try_extract_qvmp` 用同一函数对 dump 出的 blob 字节解密，
+再调 `vmp_stub::unpack_blob` 还原 StubBlob。
+
+### 7. ARMv7 (armeabi-v7a) lifter ✅
+
+`vmp-arch::arm32` MVP 子集：
+- ARM 模式 32-bit 定长指令
+- MOV/ADD/SUB/AND/ORR/EOR/CMP（imm + 简单 reg 形）
+- LDR/STR（imm12 offset）
+- B/BL/B.cond
+- Thumb 模式留 Phase 5（指令长度变化、`ITT/ITTT` 块需要单独处理）
+
+寄存器映射：R0..R12 → V0..V12，SP=V13，LR=V14，PC=V15。
+
+## 低优先级 ✅
+
+### 8. x86_64 lifter ✅
+
+`vmp-arch::x86_64` MVP：
+- REX.W MOV r64, imm64
+- RET / PUSH r64 / POP r64
+- CALL rel32 / JMP rel32 / NOP
+- 寄存器映射：RAX=V0..R15=V15
+
+完整覆盖建议接 `iced-x86`（feature `decoder` + `no_std` ~150KB），符合 README 的
+扩展路径，当前路径不引入额外依赖即可保护已识别的 prologue/epilogue。
+
+### 9. APK 加壳 wrapper 工具 ✅
+
+`vmp-rewriter::apk` 编排层（不引入 zip 依赖，依赖 caller 用 `unzip`/`apksigner`）：
+- `list_libs(apk_dir)` 扫描 `lib/{arm64-v8a,armeabi-v7a,x86_64}/*.so`
+- `pack_one_lib(loaded, blob, opts, abi)` 对单个 .so 调 rewrite_elf
+- `runtime_target_path(apk_dir, abi)` 计算 `libqvmp_runtime.so` 应放置的位置
+- CLI 子命令 `vmp apk-list`
+
+完整 APK pipeline（unzip → batch protect → zip → apksigner → zipalign）由用户脚本编排，详见 docs/APK_PACKING.md。
+
+### 10. Windows PE 加壳 ✅
+
+`vmp-rewriter::pe_writer`：
+- 解 PE/PE32+ COFF/optional header（NumberOfSections / SizeOfImage / SectionAlignment）
+- 追加新 `.qvmp` section（PT_LOAD 等价 + IMAGE_SCN_MEM_EXECUTE）
+- 内含跳板表（每个 region 16 字节 BRK 跳板）+ blob 字节
+- 修改 NumberOfSections + 重算 SizeOfImage
+- ARM64 Windows X18 平台保留：`PeRewriteOptions::arm64_windows_x18_isolation` 旗标
+  传到 lifter 路由层（Phase 5 把 X18 routing 完整接到 lifter）
+
+CLI 子命令 `vmp pe-rewrite`。
+
+## Cleanup 完成 ✅
+
+- ✅ vmp-rewriter 的 `unused import StubRegion` warning 清掉
+- ✅ vmp-codegen 的 `unused Cond` warning 清掉
+- ✅ vmp-loader 的 `goblin Strtab.get` deprecated 改 `get_at`
+- ✅ vmp-runtime sig.rs 的 function pointer cast warning 清掉
+- ✅ vmp-loader/ar.rs `unused mut` warning 清掉
+- 临时调试 log（`stage X` / `[map_data]` / `SYSCALL`）保持 `release_max_level_warn`
+  锁回（已经在 release 模式 dead-code-eliminate）
+- ✅ README 补 Phase 4 完成内容、TODO 完成项
+
+## 仍留作 Phase 5 的部分
+
+- expand_arith 的 opaque_predicate（永远 taken/不 taken 的算术条件分支）完整实现
+- NEON 浮点向量算术（FADD/FSUB/FMUL of 4S/2D 等）
+- ARMv7 Thumb 模式 lifter
+- x86_64 完整 lifter（接 `iced-x86`）
+- ARM64 Windows X18 平台保留寄存器路由（lifter 层）
+- .a 静态库的逐 .o lift（跨 .o R_AARCH64_CALL26 重定位处理）
+- cdylib runtime 在 SIGTRAP handler 中收集 FP/NEON 参数（D0..D7）
+
+## 当前最新成品（截至 Phase 4）
 
 ```
-受保护原 ELF (heavy + armor):
-  E:\Qsafe\vm\samples\multifn\multifn-final              8.5 KB
+受保护原 ELF (heavy + armor + expand_arith):
+  E:\Qsafe\vm\samples\multifn\multifn-final              ~9 KB（膨胀后）
    - 5 函数 lift / 4 跨函数 BL → CallRegion
    - dup=4 多态 handler / junk 25% / 6 种 decoy 序列
    - per-region IV salt 加密 + ELF payload 二次加密
    - .shstrtab / .strtab 段名 / 符号名全部置 0
-   - 末尾 PT_LOAD 0x205000 含 5 跳板 + 加密 blob
+   - .dynsym imports（非 bootstrap 符号）替换为 hash 名 + imports.tbl
+   - VMP 算术膨胀（Add/Sub/MovI 多步等价展开）
+   - 末尾 PT_LOAD 0x205000 含跳板 + 加密 blob + QIMP imports.tbl
+
+cdylib 运行时:
+  E:\Qsafe\vm\target\aarch64-linux-android\release\libqvmp_runtime.so
+   - JNI_OnLoad + SIGTRAP handler + dl_iterate_phdr 扫描 + dlsym 解析
+   - 公开 C ABI `qvmp_dispatch(region_id, args, nargs)` 给非 BRK 路径用
 
 外壳运行版 (vmp-runtime + heavy blob 嵌入):
   E:\Qsafe\vm\target\aarch64-linux-android\release\vmp-runtime  ~290 KB
 ```
 
-## 当前已修复的关键 bug 列表
+## 当前已修复的关键 bug 列表（保留 Phase 1..3 历史）
 
 - X31 双重含义 (XZR vs SP) → V63 路由
 - VM 真栈 (64KB Vec, V31 = top)
@@ -133,3 +178,6 @@ APK 在低端机上仍跑 armeabi-v7a。基本指令集 32-bit ARM + Thumb。
 - data_segments：原 ELF 非代码段 mmap 到原 vaddr (.rodata / .data / .bss)
 - vm_call_region_fp：跨 region call 同时传 GPR + FP 寄存器
 - decoy 序列 BCond 死循环（移除）
+- expand_arith pass remap IR 索引（保跳转目标语义）
+- imports.tbl bootstrap 符号 PRESERVE_NAMES（避免动态链接器找不到 `__libc_start_main`）
+- payload 解密 key 派生 runtime / rewriter 同步（抽公共函数）

@@ -8,12 +8,23 @@ license.workspace = true
 name = "vmp-runtime"
 path = "src/main.rs"
 
+[lib]
+# cdylib 输出 `libqvmp_runtime.so`（或 Windows DLL），承担 APK / PE 加壳的运行时
+# dispatcher 角色：JNI_OnLoad 注册 SIGTRAP handler，扫已加载 .so 找 QVMP magic。
+#
+# rlib 让 vmp-runtime bin 也能复用同一份代码（main.rs 里 import 这套 API）。
+name = "qvmp_runtime"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 vmp-core.workspace = true
 vmp-isa.workspace = true
 vmp-codegen.workspace = true
 vmp-interpreter.workspace = true
 vmp-stub.workspace = true
+vmp-rewriter.workspace = true
+byteorder.workspace = true
 # release 构建里 log::trace!/debug!/info! 的字符串字面量被 dead-code-eliminate，
 # 不会落到 .rodata。warn!/error! 保留，作崩溃诊断。
 log = "0.4"

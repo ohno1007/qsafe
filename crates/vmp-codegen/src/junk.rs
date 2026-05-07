@@ -11,7 +11,7 @@
 
 use rand::Rng;
 use rand_chacha::ChaCha20Rng;
-use vmp_isa::{Cond, Instr, VOp, Width};
+use vmp_isa::{Instr, VOp, Width};
 
 const SC1: u8 = 32;
 const SC2: u8 = 33;

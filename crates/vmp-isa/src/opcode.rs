@@ -233,6 +233,17 @@ pub enum VOp {
     AtomicCas = 102,
     /// 内存屏障：单线程 VM 环境下 noop
     Barrier = 103,
+
+    // ---- NEON 向量算术 ----
+    // 编码：rd / rs / rt 是 vreg 编号；width 决定 lane 大小（W8 / W16 / W32 / W64）；
+    // lane 字段编码 lane 数量（2 / 4 / 8 / 16）。Q=128 / D=64 vector 共用同一 VOp，
+    // 由 lane * width 决定向量总位宽。
+    /// vreg[Rd].lane[i] = vreg[Rs].lane[i] + vreg[Rt].lane[i]，i ∈ [0, lane_count)
+    VAdd = 110,
+    /// vreg[Rd].lane[i] = vreg[Rs].lane[i] - vreg[Rt].lane[i]
+    VSub = 111,
+    /// vreg[Rd].lane[i] = vreg[Rs].lane[i] * vreg[Rt].lane[i]
+    VMul = 112,
 }
 
 pub const VOP_COUNT: usize = 64; // 上限；实际枚举值不超过此数
@@ -293,6 +304,9 @@ impl VOp {
             101 => VOp::AtomicSwap,
             102 => VOp::AtomicCas,
             103 => VOp::Barrier,
+            110 => VOp::VAdd,
+            111 => VOp::VSub,
+            112 => VOp::VMul,
             _ => return None,
         };
         Some(result)
@@ -352,6 +366,9 @@ impl VOp {
             VOp::AtomicSwap,
             VOp::AtomicCas,
             VOp::Barrier,
+            VOp::VAdd,
+            VOp::VSub,
+            VOp::VMul,
         ]
     }
 }
@@ -432,6 +449,9 @@ impl VOp {
             VOp::AtomicSwap => "AtomicSwap",
             VOp::AtomicCas => "AtomicCas",
             VOp::Barrier => "Barrier",
+            VOp::VAdd => "VAdd",
+            VOp::VSub => "VSub",
+            VOp::VMul => "VMul",
         }
     }
 }

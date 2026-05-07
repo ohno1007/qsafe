@@ -32,7 +32,7 @@ pub fn parse(bytes: &[u8], elf: Elf, format: ObjectFormat) -> Result<LoadedObjec
     let mut symbols = Vec::new();
     for sym in elf.syms.iter() {
         if sym.is_function() && sym.st_size > 0 {
-            if let Some(Ok(name)) = elf.strtab.get(sym.st_name) {
+            if let Some(name) = elf.strtab.get_at(sym.st_name) {
                 symbols.push(Symbol {
                     name: name.to_string(),
                     vaddr: sym.st_value,

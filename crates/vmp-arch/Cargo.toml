@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["arm64"]
+default = ["arm64", "arm32"]
 arm64 = []
+arm32 = []
 x86_64 = []
 
 [dependencies]

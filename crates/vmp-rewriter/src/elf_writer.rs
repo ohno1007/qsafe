@@ -23,7 +23,7 @@ use crate::patcher::{build_brk_trampoline, encode_b};
 use crate::{Result, RewriteError};
 use byteorder::{ByteOrder, LittleEndian};
 use vmp_loader::{BinaryKind, LoadedObject};
-use vmp_stub::{pack_blob, StubBlob, StubRegion};
+use vmp_stub::{pack_blob, StubBlob};
 
 #[derive(Debug, Default, Clone)]
 pub struct RewriteOptions {

@@ -25,9 +25,13 @@
 //! 设计原则：本 crate 不做高强度 ELF 重排，避免触碰 dynsym / rela / eh_frame。
 //! 我们只追加新段、修改 e_phoff、e_phnum，必要时把 `.text` 中函数入口写一条 B 指令。
 
+pub mod apk;
+pub mod ar_rewriter;
 pub mod armor;
 pub mod elf_writer;
+pub mod imports;
 pub mod patcher;
+pub mod pe_writer;
 
 use thiserror::Error;
 
@@ -47,6 +51,13 @@ pub enum RewriteError {
 
 pub type Result<T> = std::result::Result<T, RewriteError>;
 
-pub use armor::{apply_armor, ArmorOptions, ArmorReport};
+pub use apk::{list_libs as apk_list_libs, pack_one_lib as apk_pack_one_lib, AbiTarget, ApkLibReport};
+pub use ar_rewriter::{rewrite_archive, ArRewriteOptions, ArRewriteReport};
+pub use armor::{
+    append_imports_table, apply_armor, apply_payload_keystream, derive_payload_key, ArmorOptions,
+    ArmorReport,
+};
 pub use elf_writer::{rewrite_elf, RewriteOptions, RewriteReport};
+pub use imports::{djb2_hash64, pack_imports, unpack_imports, ImportEntry};
 pub use patcher::{TrampolineKind, ARM64_BRK_QVMP_BASE};
+pub use pe_writer::{rewrite_pe, PeRewriteOptions, PeRewriteReport};

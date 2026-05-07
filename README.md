@@ -304,6 +304,76 @@ LinuxHost 实现完整，rewriter 写的跳板格式确定。
 - **x86_64 lifter**：vmp-arch::x86_64 当前仅是 stub
 - **DEX 加壳**：超出本项目范围（属于 Java 字节码加壳工具领域）
 
+## Phase 4 完成内容
+
+### 4a. cdylib 运行时（libqvmp_runtime）
+
+`vmp-runtime` 现在同时输出 `bin` 与 `cdylib`（`crate-type = ["rlib", "cdylib"]`）。
+模块结构：
+
+| 文件 | 作用 |
+|---|---|
+| `vmp-runtime/src/lib.rs` | `JNI_OnLoad` / `__attribute__((constructor))` / `DllMain` 入口；公开 C ABI `qvmp_dispatch` |
+| `vmp-runtime/src/scan.rs` | `dl_iterate_phdr` 扫已加载 .so，找 `QVMP` magic 并用 ELF header 派生 key 解密 payload |
+| `vmp-runtime/src/sig.rs` | aarch64 Linux/Android SIGTRAP handler；从 ucontext 解析 X0..X29 / PC，调 dispatch_vm 后写回 X0、设 PC=LR |
+| `vmp-runtime/src/resolver.rs` | imports.tbl 解析（hash → dlsym）+ region → blob 路由 |
+
+`vmp-rewriter::armor::derive_payload_key` / `apply_payload_keystream` 抽出来，
+runtime 与 rewriter 共享同一加密函数，单元测试覆盖 pack/unpack 对称。
+
+### 4b. 算术混淆膨胀（expand_arith）
+
+新模块 `vmp-codegen::transform`：
+- `Add Rd, Ra, Rb` → `Neg t, Rb ; Sub Rd, Ra, t`
+- `Sub Rd, Ra, Rb` → `Not t, Rb ; Add t, t, 1 ; Add Rd, Ra, t`（二补码恒等）
+- `MovI rd, K` → `MovI tmp, K1 ; MovI rd, K2 ; Xor rd, rd, tmp`，`K1 ⊕ K2 = K`，K1/K2 RNG 决定
+
+CLI `vmp protect --level heavy/paranoid` 自动启用；保持跳转目标语义（remap IR 索引）。
+
+### 4c. NEON 向量算术
+
+VOp 新增 `VAdd / VSub / VMul`（整数向量逐 lane）：
+- 编码：r3w + lane 数量字节（lane size 由 `width` 决定）
+- 解释器：`vec_op` 闭包逐 lane 计算，剩余高位保留
+- ARM64 lifter 识别 Advanced SIMD three-same `ADD/SUB/MUL`（含 D / Q 8B/16B/4H/8H/2S/4S/2D）
+
+### 4d. 导入表 hash 化（hash_dynsym_imports + imports.tbl）
+
+新模块 `vmp-rewriter::imports`：
+- `djb2_hash64` 算法（runtime 与 rewriter 共享）
+- ELF `.dynsym` 中的 STT_FUNC + UND 符号 → hash → 8 字节 hex 替换 `.dynstr` 字节
+- 保留关键 bootstrap 符号（`__libc_start_main` 等）原名，否则进程起不来
+- 副产 `imports.tbl`（`QIMP` magic）写到 ELF 末尾，runtime 启动时调 `dlsym` 解析
+
+### 4e. .a 静态库 / Windows PE / APK packer
+
+| 模块 | 作用 |
+|---|---|
+| `vmp-rewriter::ar_rewriter` | 把 stub blob 作为额外 archive 成员追加，链接器后续合入产出 .so/.exe |
+| `vmp-rewriter::pe_writer` | PE / PE32+ 加壳：追加 `.qvmp` section（含跳板表 + blob）；写 NumberOfSections / SizeOfImage |
+| `vmp-rewriter::apk` | APK 解包目录扫描 `lib/<abi>/*.so`；按 ABI 分类调 rewrite_elf；runtime 路径计算 |
+
+CLI 新增子命令：`vmp static-rewrite` / `vmp pe-rewrite` / `vmp apk-list`。
+
+### 4f. ARMv7 / x86_64 lifter MVP
+
+| 模块 | 范围 |
+|---|---|
+| `vmp-arch::arm32` | ARM 模式 32-bit 定长：MOV/ADD/SUB/CMP（imm + reg）/ LDR/STR / B/BL/Bcc。Thumb 模式留 Phase 5 |
+| `vmp-arch::x86_64` | REX.W MOV r64,imm64 / RET / PUSH/POP / CALL/JMP rel32 / NOP。生产路径建议接 `iced-x86` |
+
+两套 lifter 都通过 `vmp_arch::make_lifter(Arch)` 工厂注册，lift→encode→interpret 链路通用。
+
+## Phase 4 工具链
+
+| crate | 行数 | 作用 |
+|---|---|---|
+| `vmp-runtime` | ~600 | bin（外壳 + 嵌入 blob）+ cdylib（libqvmp_runtime.so，JNI/SIGTRAP/扫 PT_LOAD/dlsym 解析） |
+| `vmp-rewriter` | ~900 | ELF/PE/AR rewrite + armor + imports.tbl + APK 编排 |
+| `vmp-codegen` | ~500 | + transform.rs（expand_arith pass） |
+| `vmp-arch` | ~1500 | + arm32 / x86_64 MVP |
+| `vmp-isa` | ~700 | + VAdd/VSub/VMul + lane 字段编码 |
+
 ## 工具链一览
 
 | crate | 行数 | 作用 |

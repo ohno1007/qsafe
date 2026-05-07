@@ -921,6 +921,49 @@ fn decode_data_reg(raw: u32) -> Result<Vec<Instr>, &'static str> {
 // SIMD / FP（标量子集 + LSE atomics）
 // =================================================================
 fn decode_simd_fp(raw: u32) -> Result<Vec<Instr>, &'static str> {
+    // ---- Advanced SIMD three same: integer 向量 ADD / SUB ----
+    //   0 Q U 01110 size 1 Rm opcode 1 Rn Rd
+    //   opcode = 10000 → ADD（U=0）/ SUB（U=1）
+    //   opcode = 10011 → MUL（U=0）  (vector MUL，integer lane)
+    // 我们只识别整数 ADD/SUB/MUL；浮点 FADD/FSUB/FMUL 已经走标量 FP 路径，
+    // 向量 FP 暂不识别（commercial SDK 多用整数加密 / 哈希）。
+    if (raw >> 24) & 0xBF == 0b00001110 && (raw >> 21) & 1 == 1 && (raw >> 10) & 1 == 1 {
+        let q = (raw >> 30) & 1;
+        let u = (raw >> 29) & 1;
+        let size = (raw >> 22) & 0x3;
+        let rm = ((raw >> 16) & 0x1F) as u8;
+        let opcode = (raw >> 11) & 0x1F;
+        let rn = ((raw >> 5) & 0x1F) as u8;
+        let rd = (raw & 0x1F) as u8;
+        let lane_size = match size {
+            0 => Width::W8,
+            1 => Width::W16,
+            2 => Width::W32,
+            3 => Width::W64,
+            _ => return Err("SIMD size invalid"),
+        };
+        // total bytes = 8 (D) or 16 (Q)；lane_count = total / lane_bytes
+        let total_bytes = if q == 1 { 16 } else { 8 };
+        let lane_count = (total_bytes / lane_size.bytes()) as u8;
+        // size=11 (D) Q=0 不合法（lane_count=1）
+        if lane_count == 0 {
+            return Err("SIMD lane_count zero");
+        }
+        let vop = match (opcode, u) {
+            (0b10000, 0) => VOp::VAdd,
+            (0b10000, 1) => VOp::VSub,
+            (0b10011, 0) => VOp::VMul,
+            _ => return Err("SIMD three-same opcode 未实现"),
+        };
+        return Ok(vec![Instr {
+            op: vop,
+            rd, rs: rn, rt: rm,
+            width: lane_size,
+            lane: lane_count,
+            ..Default::default()
+        }]);
+    }
+
     // ---- MOVI (advanced SIMD modified immediate) ----
     // 仅识别 cmode=1110 + abc/defgh=0 → 整 vreg 清零的常见情形（编译器初始化用）
     // 0x2f00e400 (Q=0 D 寄存器), 0x6f00e400 (Q=1 整 Q 寄存器)

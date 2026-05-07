@@ -24,3 +24,5 @@ anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
 hex.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true

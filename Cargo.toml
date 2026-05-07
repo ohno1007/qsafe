@@ -43,6 +43,7 @@ vmp-loader = { path = "crates/vmp-loader" }
 vmp-protect = { path = "crates/vmp-protect" }
 vmp-stub = { path = "crates/vmp-stub" }
 vmp-rewriter = { path = "crates/vmp-rewriter" }
+vmp-runtime = { path = "crates/vmp-runtime" }
 
 [profile.release]
 opt-level = "z"      # 优先体积，同时配合 LTO 仍能拿到大部分性能

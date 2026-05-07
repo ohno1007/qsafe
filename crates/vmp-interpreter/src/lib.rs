@@ -382,6 +382,35 @@ impl<'a> Interpreter<'a> {
                 VOp::Barrier => {
                     // 单线程 VM：内存屏障 = noop
                 }
+
+                // ==== NEON 向量算术 ====
+                VOp::VAdd => {
+                    self.state.fregs[instr.rd as usize & 31] = vec_op(
+                        self.state.fregs[instr.rs as usize & 31],
+                        self.state.fregs[instr.rt as usize & 31],
+                        instr.width,
+                        instr.lane,
+                        |a, b| a.wrapping_add(b),
+                    );
+                }
+                VOp::VSub => {
+                    self.state.fregs[instr.rd as usize & 31] = vec_op(
+                        self.state.fregs[instr.rs as usize & 31],
+                        self.state.fregs[instr.rt as usize & 31],
+                        instr.width,
+                        instr.lane,
+                        |a, b| a.wrapping_sub(b),
+                    );
+                }
+                VOp::VMul => {
+                    self.state.fregs[instr.rd as usize & 31] = vec_op(
+                        self.state.fregs[instr.rs as usize & 31],
+                        self.state.fregs[instr.rt as usize & 31],
+                        instr.width,
+                        instr.lane,
+                        |a, b| a.wrapping_mul(b),
+                    );
+                }
             }
         }
     }
@@ -480,6 +509,42 @@ fn fp_cmp(flags: &mut state::Flags, a: u128, b: u128, w: Width) {
         flags.c = true;
         flags.v = false;
     }
+}
+
+/// 整数向量逐 lane 二元运算。lane size 由 `width` 决定（W8 / W16 / W32 / W64）；
+/// `lane_count` 决定向量总长（lane_count * width.bytes()，必须 <= 16）。
+/// 高位未占用部分保留 a 的高位字节。
+fn vec_op(
+    a: u128,
+    b: u128,
+    width: Width,
+    lane_count: u8,
+    op: impl Fn(u64, u64) -> u64,
+) -> u128 {
+    let lane_bytes = width.bytes();
+    let lc = lane_count as usize;
+    let total_bytes = lane_bytes * lc;
+    if total_bytes == 0 || total_bytes > 16 {
+        return a;
+    }
+    let mask = width.mask() as u128;
+    let mut out: u128 = 0;
+    for i in 0..lc {
+        let shift = (i * lane_bytes * 8) as u32;
+        let av = ((a >> shift) as u64) & width.mask();
+        let bv = ((b >> shift) as u64) & width.mask();
+        let r = op(av, bv) & width.mask();
+        out |= (r as u128) << shift;
+    }
+    // 保留 a 的高位（向量总长 < 128 时）
+    let used_mask = if total_bytes >= 16 {
+        u128::MAX
+    } else {
+        let bits = (total_bytes * 8) as u32;
+        (1u128 << bits) - 1
+    };
+    let _ = mask;
+    (a & !used_mask) | (out & used_mask)
 }
 
 fn signed_overflow_sub(a: u64, b: u64, res: u64, w: Width) -> bool {

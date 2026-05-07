@@ -28,6 +28,9 @@ pub struct Instr {
     pub imm: i64,
     /// 选择第几个 handler 变体（codegen 设置）
     pub variant: u8,
+    /// NEON 向量 lane 数量（2 / 4 / 8 / 16）。仅 VAdd/VSub/VMul 等向量 VOp 使用，
+    /// 配合 `width` 一起决定向量总位宽：lane * width.bytes()*8 ∈ {64, 128}。
+    pub lane: u8,
 }
 
 impl core::fmt::Debug for Instr {
@@ -43,14 +46,15 @@ impl core::fmt::Debug for Instr {
                 .field("cond", &self.cond)
                 .field("imm", &self.imm)
                 .field("variant", &self.variant)
+                .field("lane", &self.lane)
                 .finish()
         }
         #[cfg(not(debug_assertions))]
         {
             write!(
                 f,
-                "I({:?},{},{},{},{:?},{:?},{},{})",
-                self.op, self.rd, self.rs, self.rt, self.width, self.cond, self.imm, self.variant
+                "I({:?},{},{},{},{:?},{:?},{},{},{})",
+                self.op, self.rd, self.rs, self.rt, self.width, self.cond, self.imm, self.variant, self.lane
             )
         }
     }
@@ -67,6 +71,7 @@ impl Default for Instr {
             cond: Cond::Al,
             imm: 0,
             variant: 0,
+            lane: 0,
         }
     }
 }
@@ -81,35 +86,41 @@ pub struct Layout {
     pub has_cond: bool,
     /// 0 / 4 / 8
     pub imm_bytes: u8,
+    /// NEON 向量 lane 数量字段。设 true 时多出 1 字节存放 lane 数量。
+    pub has_lane: bool,
 }
 
 impl Layout {
     pub const fn r0() -> Self {
-        Layout { has_rd: false, has_rs: false, has_rt: false, has_width: false, has_cond: false, imm_bytes: 0 }
+        Layout { has_rd: false, has_rs: false, has_rt: false, has_width: false, has_cond: false, imm_bytes: 0, has_lane: false }
     }
     pub const fn r1() -> Self {
-        Layout { has_rd: true, has_rs: false, has_rt: false, has_width: false, has_cond: false, imm_bytes: 0 }
+        Layout { has_rd: true, has_rs: false, has_rt: false, has_width: false, has_cond: false, imm_bytes: 0, has_lane: false }
     }
     pub const fn r2() -> Self {
-        Layout { has_rd: true, has_rs: true, has_rt: false, has_width: false, has_cond: false, imm_bytes: 0 }
+        Layout { has_rd: true, has_rs: true, has_rt: false, has_width: false, has_cond: false, imm_bytes: 0, has_lane: false }
     }
     pub const fn r3w() -> Self {
-        Layout { has_rd: true, has_rs: true, has_rt: true, has_width: true, has_cond: false, imm_bytes: 0 }
+        Layout { has_rd: true, has_rs: true, has_rt: true, has_width: true, has_cond: false, imm_bytes: 0, has_lane: false }
+    }
+    /// 向量 r3w + lane：rd, rs, rt, width(lane size), lane(lane count)
+    pub const fn r3wl() -> Self {
+        Layout { has_rd: true, has_rs: true, has_rt: true, has_width: true, has_cond: false, imm_bytes: 0, has_lane: true }
     }
     pub const fn r1i32() -> Self {
-        Layout { has_rd: true, has_rs: false, has_rt: false, has_width: false, has_cond: false, imm_bytes: 4 }
+        Layout { has_rd: true, has_rs: false, has_rt: false, has_width: false, has_cond: false, imm_bytes: 4, has_lane: false }
     }
     pub const fn r1i64() -> Self {
-        Layout { has_rd: true, has_rs: false, has_rt: false, has_width: false, has_cond: false, imm_bytes: 8 }
+        Layout { has_rd: true, has_rs: false, has_rt: false, has_width: false, has_cond: false, imm_bytes: 8, has_lane: false }
     }
     pub const fn r2i32w() -> Self {
-        Layout { has_rd: true, has_rs: true, has_rt: false, has_width: true, has_cond: false, imm_bytes: 4 }
+        Layout { has_rd: true, has_rs: true, has_rt: false, has_width: true, has_cond: false, imm_bytes: 4, has_lane: false }
     }
     pub const fn i32_only() -> Self {
-        Layout { has_rd: false, has_rs: false, has_rt: false, has_width: false, has_cond: false, imm_bytes: 4 }
+        Layout { has_rd: false, has_rs: false, has_rt: false, has_width: false, has_cond: false, imm_bytes: 4, has_lane: false }
     }
     pub const fn cond_i32() -> Self {
-        Layout { has_rd: false, has_rs: false, has_rt: false, has_width: false, has_cond: true, imm_bytes: 4 }
+        Layout { has_rd: false, has_rs: false, has_rt: false, has_width: false, has_cond: true, imm_bytes: 4, has_lane: false }
     }
 }
 
@@ -125,6 +136,7 @@ impl Instr {
                 has_width: false,
                 has_cond: true,
                 imm_bytes: 0,
+                has_lane: false,
             },
             VOp::Add
             | VOp::Sub
@@ -145,6 +157,7 @@ impl Instr {
                 has_width: true,
                 has_cond: false,
                 imm_bytes: 0,
+                has_lane: false,
             },
             VOp::Push => Layout::r1(),
             VOp::Pop => Layout::r1(),
@@ -165,25 +178,28 @@ impl Instr {
             // FP <-> GPR: rd + rs + width
             VOp::FMovFromGpr | VOp::FMovToGpr => Layout {
                 has_rd: true, has_rs: true, has_rt: false,
-                has_width: true, has_cond: false, imm_bytes: 0,
+                has_width: true, has_cond: false, imm_bytes: 0, has_lane: false,
             },
             // FP arithmetic: rd + rs + rt + width
             VOp::FAdd | VOp::FSub | VOp::FMul | VOp::FDiv => Layout::r3w(),
             // FP compare: rs + rt + width (no rd)
             VOp::FCmp => Layout {
                 has_rd: false, has_rs: true, has_rt: true,
-                has_width: true, has_cond: false, imm_bytes: 0,
+                has_width: true, has_cond: false, imm_bytes: 0, has_lane: false,
             },
             // FP <-> Int 转换: rd + rs + width
             VOp::FCvtZS | VOp::SCvtF => Layout {
                 has_rd: true, has_rs: true, has_rt: false,
-                has_width: true, has_cond: false, imm_bytes: 0,
+                has_width: true, has_cond: false, imm_bytes: 0, has_lane: false,
             },
 
             // Atomic add/swap/cas：rd(返回) + rs(地址 GPR) + rt(值 GPR) + width
             VOp::AtomicAdd | VOp::AtomicSwap | VOp::AtomicCas => Layout::r3w(),
             // 内存屏障无操作数
             VOp::Barrier => Layout::r0(),
+
+            // NEON 向量算术：r3w + lane 字段
+            VOp::VAdd | VOp::VSub | VOp::VMul => Layout::r3wl(),
         }
     }
 
@@ -195,6 +211,7 @@ impl Instr {
             + (lay.has_rt as usize)
             + (lay.has_width as usize)
             + (lay.has_cond as usize)
+            + (lay.has_lane as usize)
             + lay.imm_bytes as usize
     }
 }
@@ -220,6 +237,9 @@ pub fn encode_instr(spec: &IsaSpec, instr: &Instr, out: &mut Vec<u8>) -> Result<
     }
     if lay.has_cond {
         out.push(instr.cond as u8);
+    }
+    if lay.has_lane {
+        out.push(instr.lane);
     }
     match lay.imm_bytes {
         0 => {}
@@ -275,6 +295,10 @@ pub fn decode_instr(spec: &IsaSpec, bytes: &[u8]) -> Result<(Instr, usize), Stri
     }
     if lay.has_cond {
         instr.cond = Cond::from_u8(*bytes.get(pos).ok_or("EOF cond")?);
+        pos += 1;
+    }
+    if lay.has_lane {
+        instr.lane = *bytes.get(pos).ok_or("EOF lane")?;
         pos += 1;
     }
     match lay.imm_bytes {
