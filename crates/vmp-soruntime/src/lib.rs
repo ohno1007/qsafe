@@ -59,32 +59,22 @@ extern "C" {
     ) -> libc::c_int;
 }
 
-/// Logging is gated by env var `QVMP_LOG`. Set `QVMP_LOG=1` (or any non-empty
-/// value) to mirror messages to stderr — useful when launching via MT 管理器
-/// or any front-end that surfaces stdio but not logcat.
-/// Logcat output is also gated by the same flag to keep silent runs silent.
+// Logging is gated by a byte at QVMP-header-offset+24 — baked into the
+// hardened ELF at rewrite time (`vmp rewrite --log on|off`). When non-zero
+// we mirror messages to stderr (fd 2) so MT 管理器's run window / `adb shell`
+// see them directly. No env-var lookup at runtime.
+static LOG_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn log_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        // Read /proc/self/environ — getenv() works too but we may be called
-        // before libc fully initializes env in extreme edge cases.
-        match std::env::var("QVMP_LOG") {
-            Ok(v) => !v.is_empty() && v != "0",
-            Err(_) => false,
-        }
-    })
+    LOG_FLAG.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn log_msg(msg: &[u8]) {
     if !log_enabled() {
         return;
     }
-    // Strip trailing NUL for stderr; keep it for __android_log_write.
     let stripped = if msg.last() == Some(&0) { &msg[..msg.len() - 1] } else { msg };
     unsafe {
-        // fd 2 = stderr; write a "[qvmp] " prefix + msg + newline so it
-        // shows up cleanly in MT 管理器's run window or `adb shell` output.
         let prefix = b"[qvmp] ";
         libc::write(2, prefix.as_ptr() as *const _, prefix.len());
         libc::write(2, stripped.as_ptr() as *const _, stripped.len());
@@ -93,7 +83,7 @@ fn log_msg(msg: &[u8]) {
     #[cfg(target_os = "android")]
     unsafe {
         __android_log_write(
-            4, // ANDROID_LOG_INFO
+            4,
             b"qvmp\0".as_ptr() as *const _,
             msg.as_ptr() as *const _,
         );
@@ -120,26 +110,24 @@ extern "C" {
 }
 
 struct Find {
-    /// virtual address of the QVMP magic (start of header) in the host process
     magic_vaddr: usize,
-    /// payload length (after the 24-byte header)
     payload_len: usize,
-    /// the file offset of the magic in the *original* on-disk ELF —
-    /// the keystream is derived from this exact value at rewrite time.
     payload_file_offset: u64,
-    /// 32 bytes of host-ELF header (we need bytes 0..32 for key derivation)
     elf_header: [u8; 32],
-    /// rodata vaddr stamped into header by armor::encrypt_rodata; 0 if disabled
     rodata_vaddr: u64,
-    /// rodata length stamped into header; 0 if disabled
     rodata_len: u64,
-    /// load_bias of the host ELF (dl_iterate_phdr's dlpi_addr) — needed to
-    /// translate rodata p_vaddr into a process-space address
     load_bias: usize,
+    log_flag: bool,
 }
 
-/// QVMP header: "QVMP"(4) + payload_len(4) + rodata_vaddr(8) + rodata_len(8)
-const QVMP_HEADER_LEN: usize = 24;
+/// QVMP header (32 bytes total):
+///   [0..4]   "QVMP" magic
+///   [4..8]   payload_len: u32
+///   [8..16]  rodata_vaddr: u64
+///   [16..24] rodata_len: u64
+///   [24]     log_flag: u8         (1 = stderr+logcat on, 0 = silent)
+///   [25..32] reserved (zero)
+const QVMP_HEADER_LEN: usize = 32;
 
 extern "C" fn iter_cb(info: *mut DlPhdrInfo, _size: libc::size_t, data: *mut c_void) -> libc::c_int {
     let info = unsafe { &*info };
@@ -191,15 +179,16 @@ extern "C" fn iter_cb(info: *mut DlPhdrInfo, _size: libc::size_t, data: *mut c_v
                     let mut header = [0u8; 32];
                     let hdr = unsafe { std::slice::from_raw_parts(elf_hdr_addr as *const u8, 32) };
                     header.copy_from_slice(hdr);
+                    let log_flag = bytes[i + 24] != 0;
                     *out = Some(Find {
                         magic_vaddr: seg_start + i,
                         payload_len,
-                        // file offset of the magic = phdr.p_offset + (magic - seg_start)
                         payload_file_offset: ph.p_offset as u64 + i as u64,
                         elf_header: header,
                         rodata_vaddr,
                         rodata_len,
                         load_bias: load_base,
+                        log_flag,
                     });
                     return 1;
                 }
@@ -292,6 +281,7 @@ fn discover_and_decrypt_blob() -> Option<StubBlob> {
         dl_iterate_phdr(iter_cb, &mut find as *mut _ as *mut c_void);
     }
     let f = find?;
+    LOG_FLAG.store(f.log_flag, std::sync::atomic::Ordering::Relaxed);
 
     // Decrypt rodata FIRST — must happen before any code that references its
     // bytes runs. Our .init_array entry is invoked before the main binary's

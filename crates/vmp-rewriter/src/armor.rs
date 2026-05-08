@@ -20,6 +20,8 @@ pub struct ArmorOptions {
     pub hash_imports: bool,
     /// 加密 .rodata（运行时由 libqvmp_runtime.so 在 .init_array 解密 mprotect 还原）
     pub encrypt_rodata: bool,
+    /// 烧录日志开关到 QVMP 头 byte 24；运行时直接读这个字节决定打不打 stderr/logcat
+    pub log_on: bool,
 }
 
 impl Default for ArmorOptions {
@@ -30,6 +32,7 @@ impl Default for ArmorOptions {
             xor_payload: true,
             hash_imports: false, // 默认关闭，因为完整动态解析需要 cdylib runtime 配合
             encrypt_rodata: true,
+            log_on: false,
         }
     }
 }
@@ -69,6 +72,11 @@ pub fn apply_armor(
             report.rodata_vaddr = vaddr;
             report.rodata_encrypted_len = len;
         }
+    }
+    // Bake log flag at QVMP header byte 24
+    let off = payload_offset as usize;
+    if off + QVMP_HEADER_LEN <= elf.len() {
+        elf[off + 24] = if opts.log_on { 1 } else { 0 };
     }
     if opts.hash_imports {
         report.imports_hashed = hash_dynsym_imports(elf)?;
@@ -113,13 +121,15 @@ fn strip_section_string_table(elf: &mut [u8], section_name: &str) -> Result<usiz
     Ok(zeroed)
 }
 
-/// QVMP block layout (24-byte header + payload):
+/// QVMP block layout (32-byte header + payload):
 ///   off+0  : "QVMP" magic (4 B)
-///   off+4  : payload_len:u32   (encrypted payload byte count)
-///   off+8  : rodata_vaddr:u64  (filled by encrypt_rodata_in_place; 0 = none)
-///   off+16 : rodata_len:u64    (filled by encrypt_rodata_in_place; 0 = none)
-///   off+24 : payload_bytes …   (XOR-encrypted by encrypt_payload_in_place)
-const QVMP_HEADER_LEN: usize = 24;
+///   off+4  : payload_len:u32
+///   off+8  : rodata_vaddr:u64   (filled by encrypt_rodata_in_place; 0 = none)
+///   off+16 : rodata_len:u64     (filled by encrypt_rodata_in_place; 0 = none)
+///   off+24 : log_flag:u8        (1 = stderr+logcat on, 0 = silent; baked from CLI)
+///   off+25 : reserved (7 B zero)
+///   off+32 : payload_bytes …    (XOR-encrypted by encrypt_payload_in_place)
+const QVMP_HEADER_LEN: usize = 32;
 
 /// Derive the 32-byte key used by both payload and rodata streams. Pure
 /// function of ELF header bytes + payload_offset → both rewriter and runtime

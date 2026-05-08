@@ -104,6 +104,12 @@ enum Cmd {
         /// 加密 .rodata（运行时由 libqvmp_runtime.so 在 .init_array 解密）
         #[arg(long, default_value_t = true)]
         encrypt_rodata: bool,
+        /// 烧录日志开关 (--log on / --log off)；运行时直接读 QVMP 头字节，无 env var
+        #[arg(long, default_value = "off")]
+        log: String,
+        /// 嵌入 libqvmp_runtime.so 的路径 → 单文件可执行（无需独立 .so 文件）
+        #[arg(long)]
+        embed_runtime: Option<PathBuf>,
     },
     /// 列出 .a 静态库内的 .o 成员（用于 batch protect 准备）
     ArList { archive: PathBuf },
@@ -366,21 +372,31 @@ fn main() -> anyhow::Result<()> {
             println!("region {} 返回值 = {} (0x{:x})", region, r, r);
         }
 
-        Cmd::Rewrite { input, blob, output, write_trampolines, strip_names, xor_payload, encrypt_rodata } => {
+        Cmd::Rewrite { input, blob, output, write_trampolines, strip_names, xor_payload, encrypt_rodata, log, embed_runtime } => {
             let elf_bytes = fs::read(&input)?;
             let loaded = vmp_loader::load(elf_bytes)?;
             let blob_bytes = fs::read(&blob)?;
             let stub_blob = vmp_stub::unpack_blob(&blob_bytes)?;
-            let opts = vmp_rewriter::RewriteOptions { write_entry_trampolines: write_trampolines };
+            let embed_so_bytes = if let Some(p) = &embed_runtime {
+                Some(fs::read(p).with_context(|| format!("read {}", p.display()))?)
+            } else {
+                None
+            };
+            let opts = vmp_rewriter::RewriteOptions {
+                write_entry_trampolines: write_trampolines,
+                embed_runtime_so: embed_so_bytes,
+            };
             let (mut new_elf, report) = vmp_rewriter::rewrite_elf(&loaded, &stub_blob, &opts)
                 .map_err(|e| anyhow::anyhow!("rewrite failed: {e}"))?;
 
+            let log_on = matches!(log.as_str(), "on" | "1" | "true" | "yes");
             let armor_opts = vmp_rewriter::ArmorOptions {
                 strip_shstrtab: strip_names,
                 strip_symtab: strip_names,
                 xor_payload,
                 hash_imports: false,
                 encrypt_rodata,
+                log_on,
             };
             let armor_rep = vmp_rewriter::apply_armor(&mut new_elf, report.blob_offset, &armor_opts)
                 .map_err(|e| anyhow::anyhow!("armor failed: {e}"))?;
@@ -390,7 +406,8 @@ fn main() -> anyhow::Result<()> {
                 "rewrite ok: kind={:?} patched_entries={} new_segment_vaddr={:#x} \
                  new_segment_size={} blob_offset={:#x}\n\
                  armor: shstrtab_zeroed={} strtab_zeroed={} payload_xor_len={} \
-                 rodata_vaddr={:#x} rodata_enc_len={} imports_hashed={}\n\
+                 rodata_vaddr={:#x} rodata_enc_len={} imports_hashed={} log_on={}\n\
+                 embed: bootstrap_vaddr={:#x} embedded_so_vaddr={:#x} embedded_so_len={} init_array_vaddr={:#x}\n\
                  → {} ({} bytes)",
                 loaded.kind,
                 report.patched_entries,
@@ -403,6 +420,11 @@ fn main() -> anyhow::Result<()> {
                 armor_rep.rodata_vaddr,
                 armor_rep.rodata_encrypted_len,
                 armor_rep.imports_hashed,
+                log_on,
+                report.bootstrap_vaddr,
+                report.embedded_so_vaddr,
+                report.embedded_so_len,
+                report.init_array_vaddr,
                 output.display(),
                 new_elf.len()
             );
