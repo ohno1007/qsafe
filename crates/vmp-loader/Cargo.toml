@@ -8,3 +8,4 @@ license.workspace = true
 vmp-core.workspace = true
 goblin.workspace = true
 log.workspace = true
+byteorder.workspace = true
