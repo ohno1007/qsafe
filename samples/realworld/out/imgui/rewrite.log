@@ -1,0 +1,3 @@
+rewrite ok: kind=SharedObject patched_entries=3155 new_segment_vaddr=0x2ab000 new_segment_size=5005312 blob_offset=0x2a3530
+armor: shstrtab_zeroed=260 strtab_zeroed=0 payload_xor_len=4951749 imports_hashed=0
+→ /tmp/qvmp-harden.VLEoQE/imgui-target-vmp.so (7721576 bytes)
