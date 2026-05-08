@@ -95,6 +95,67 @@ pub fn append_imports_table(elf: &mut Vec<u8>, table: &[ImportEntry]) -> u64 {
     off
 }
 
+/// 把 ELF 末尾追加的"新 PT_LOAD segment"（rewriter 写入的跳板表 + blob 区段）按
+/// 页粒度加密，写一份 `QPGT` 页表给 cdylib runtime。runtime 在启动时 mprotect
+/// PROT_NONE，SIGSEGV handler 命中时按页 key 解密。
+///
+/// **不动原 .text** —— 那是 rewriter 写跳板的目标，加密会破坏跳板。**只**加密
+/// 新追加 segment 的内容（最常见 4..16 KB）。
+///
+/// QPGT 格式：
+/// ```text
+/// magic[4]   = "QPGT"
+/// version u16 = 1
+/// count   u32
+/// entry[count]:
+///   vaddr u64    （4KB 对齐）
+///   key   u64    （8 字节 XOR keystream，按位置展开重复使用）
+/// ```
+pub fn apply_page_crypto(
+    elf: &mut Vec<u8>,
+    segment_file_off: u64,
+    segment_vaddr: u64,
+    segment_size: u64,
+    rng_seed: u64,
+) -> Result<(u64, usize)> {
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha20Rng;
+    let mut rng = ChaCha20Rng::seed_from_u64(rng_seed);
+    let page_size: u64 = 4096;
+    let mut entries: Vec<(u64, u64)> = Vec::new();
+    let off = segment_file_off as usize;
+    let mut pos = 0u64;
+    while pos < segment_size {
+        let key: u64 = rng.gen();
+        let chunk_off = off + pos as usize;
+        let chunk_end = (chunk_off + page_size as usize).min(off + segment_size as usize);
+        if chunk_end > elf.len() {
+            break;
+        }
+        // XOR 加密 4KB（最后一页可能不足）
+        let key_bytes = key.to_le_bytes();
+        for (i, b) in elf[chunk_off..chunk_end].iter_mut().enumerate() {
+            *b ^= key_bytes[i & 7];
+        }
+        entries.push((segment_vaddr + pos, key));
+        pos += page_size;
+    }
+
+    // 写 QPGT 页表到 ELF 末尾
+    while elf.len() % 8 != 0 {
+        elf.push(0);
+    }
+    let qpgt_off = elf.len() as u64;
+    elf.extend_from_slice(b"QPGT");
+    elf.extend_from_slice(&1u16.to_le_bytes());
+    elf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (va, k) in &entries {
+        elf.extend_from_slice(&va.to_le_bytes());
+        elf.extend_from_slice(&k.to_le_bytes());
+    }
+    Ok((qpgt_off, entries.len()))
+}
+
 /// 在 ELF 末尾追加完整性 hash（"QHSH" 起头 + SHA-256 of post-rewrite .text）。
 /// runtime 通过 dl_iterate_phdr 找 PF_X PT_LOAD，重新算 hash 比对。
 ///

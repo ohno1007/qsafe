@@ -13,6 +13,8 @@ byteorder.workspace = true
 log.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
 
 [dev-dependencies]
 vmp-isa = { path = "../vmp-isa" }

@@ -103,6 +103,7 @@ pub fn lookup_import(hash: u64) -> Option<u64> {
 }
 
 /// 找 region_id 对应的 (StubBlob, region_index)。第一个发现的 blob 默认 region 0..N。
+#[allow(dead_code)]
 fn locate_region(region_id: usize) -> Option<(&'static vmp_stub::StubBlob, usize)> {
     for d in discovered() {
         if region_id < d.blob.regions.len() {
@@ -116,6 +117,16 @@ fn locate_region(region_id: usize) -> Option<(&'static vmp_stub::StubBlob, usize
 ///
 /// 多线程 caller 通过 `DISPATCH_LOCK` 串行化。Android JNI 在不同 java 线程调用同一
 /// native 函数会触发并发，必须串行才能保证 VmState 不被踩。
+///
+/// **PIE 地址处理**：lifter 把"原 ELF vaddr"baked 进 blob（ADRP / LDR-literal /
+/// 全局变量访问）。在 cdylib 模式下，本进程已经把 .so 映射到 dlpi_addr 起的位置，
+/// 这些地址需要加 dlpi_addr 偏移才能命中真实数据。
+///
+/// 当前实现：用 `RebasedLinuxHost` 包一层 LinuxHost，把 `load`/`store`/`native_call`
+/// 收到的"看起来是模块内"的地址加上发现的 dlpi_addr。判定标准：若地址 < 0x1_0000_0000
+/// （4GB），认为是 .so 内 vaddr（PIE 相对低 32 位），需要加 base；否则视作绝对堆/栈
+/// 地址（已经被 syscall / 调用方传入），不加 base。这是启发式，无法 100% 区分；对
+/// 商用 SDK 的"读 .rodata 字符串"路径基本足够。完整方案需 lifter PIE-aware 标注。
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn dispatch_region(region_id: usize, args: &[u64]) -> Result<u64> {
     if threat_detected() {
@@ -125,12 +136,65 @@ pub fn dispatch_region(region_id: usize, args: &[u64]) -> Result<u64> {
         return Ok(0xDEAD_C0DE_DEAD_C0DEu64);
     }
     let _guard = DISPATCH_LOCK.lock().map_err(|_| vmp_core::Error::vm("E:lock"))?;
-    let (blob, idx) = locate_region(region_id)
+    let (blob, idx, module_base) = locate_region_with_base(region_id)
         .ok_or_else(|| vmp_core::Error::vm("E:no-region"))?;
-    let mut host = vmp_stub::linux::LinuxHost::new();
+    let inner = vmp_stub::linux::LinuxHost::new();
+    let mut host = RebasedLinuxHost { base: module_base, inner };
     let v = vmp_stub::dispatch_vm(blob, idx, args, &mut host)
         .map_err(|_| vmp_core::Error::vm("E:vm"))?;
     Ok(v)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn locate_region_with_base(region_id: usize) -> Option<(&'static vmp_stub::StubBlob, usize, u64)> {
+    for d in discovered() {
+        if region_id < d.blob.regions.len() {
+            return Some((&d.blob, region_id, d.module_base));
+        }
+    }
+    None
+}
+
+/// PIE-aware HostBridge wrapper：把模块内相对地址（< 4GB 启发式）加上 `dlpi_addr`。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+struct RebasedLinuxHost {
+    base: u64,
+    inner: vmp_stub::linux::LinuxHost,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl vmp_interpreter::HostBridge for RebasedLinuxHost {
+    fn load(&mut self, addr: u64, w: vmp_isa::Width) -> vmp_core::Result<u64> {
+        self.inner.load(rebase_if_relative(addr, self.base), w)
+    }
+    fn store(&mut self, addr: u64, value: u64, w: vmp_isa::Width) -> vmp_core::Result<()> {
+        self.inner.store(rebase_if_relative(addr, self.base), value, w)
+    }
+    fn native_call(&mut self, target: u64, args: &[u64]) -> vmp_core::Result<u64> {
+        self.inner.native_call(rebase_if_relative(target, self.base), args)
+    }
+    fn syscall(&mut self, no: u64, args: &[u64]) -> vmp_core::Result<u64> {
+        self.inner.syscall(no, args)
+    }
+    fn map_data(&mut self, vaddr: u64, bytes: &[u8], prot: u8) -> vmp_core::Result<()> {
+        // 在 cdylib 模式下，原 .so 数据段已被 dl_open 映射到 base+vaddr，无需再 mmap。
+        // 走 inner.map_data 反而会失败（地址被占）。直接 noop。
+        let _ = (vaddr, bytes, prot);
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[inline]
+fn rebase_if_relative(addr: u64, base: u64) -> u64 {
+    // 地址 < 4GB 视作模块内 PIE 相对（lifter 写出来的 ADRP 结果）；否则视作绝对值。
+    // 对极少见的"模块加载到低 32 位空间"情况会误判，但商用 64-bit Linux ASLR 保证
+    // 模块基址 ≥ 0x55_5555_5555 起，与"原 ELF vaddr ≤ ~10MB"区分清楚。
+    if addr < 0x1_0000_0000u64 {
+        base.wrapping_add(addr)
+    } else {
+        addr
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]

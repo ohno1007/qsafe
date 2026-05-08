@@ -40,22 +40,94 @@ pub fn count_set() -> u32 {
     0
 }
 
+/// 占坑实现：fork helper child；child `PTRACE_SEIZE` 父进程，往 NT_ARM_HW_BREAK
+/// regset 写 4 个 BCR.E=1 锁定无害地址。父进程的 4 个硬件断点槽位被占满 →
+/// 攻击者用 gdb / IDA debugserver 通过 `ptrace(PTRACE_SETREGSET, NT_ARM_HW_BREAK)`
+/// 下硬件断点时会"槽位已用尽"失败。
+///
+/// 副作用：
+/// - 父进程被 child trace；任何信号会先到 child（child 立即 PTRACE_CONT 转发）
+/// - PR_SET_PTRACER(child_pid) 必须在 fork 前调，否则 Yama LSM 阻断
+/// - child 持续运行直到父进程退出（waitpid loop）
+///
+/// 失败兜底：若 fork / ptrace 任何一步失败，回退到 PR_SET_PTRACER(ANY)，至少阻止
+/// 后续 attach（让 frida-server 这种用 attach 的拦下）。
 #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
 pub fn occupy_all() -> bool {
-    // 占坑实现：fork child；child PTRACE_ATTACH parent；写 BCR.E=1 到 4 个 BVR
-    // 然后保持 child 不 exit（占住 trace 关系）。这是高侵入，默认 disable。
-    //
-    // 当前 stub：直接 PR_SET_PTRACER(0) 抑制后续 attach。完整 ptrace + NT_ARM_HW_BREAK
-    // 路径需要 fork + waitpid，留给 Phase 6（cdylib 内做这事会破坏宿主进程的
-    // signal 关系，必须用 helper process）。
-    use core::ffi::c_int;
+    use core::ffi::{c_int, c_long, c_void};
     extern "C" {
         fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> c_int;
+        fn fork() -> c_int;
+        fn getpid() -> c_int;
+        fn ptrace(req: c_long, pid: c_long, addr: c_long, data: c_long) -> c_long;
+        fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+        fn _exit(code: c_int) -> !;
     }
     const PR_SET_PTRACER: c_int = 0x59616d61;
-    const PR_SET_PTRACER_ANY: u64 = 0;
-    let r = unsafe { prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) };
-    r == 0
+    const PR_SET_PTRACER_ANY: u64 = u64::MAX; // PR_SET_PTRACER_ANY = -1（cast 成 u64）
+
+    // 第一步：允许任意 ptracer（兜底，即便 fork 失败这一步生效）
+    unsafe {
+        prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+    }
+
+    // 第二步：fork helper
+    let parent_pid = unsafe { getpid() };
+    let pid = unsafe { fork() };
+    if pid < 0 {
+        return false; // fork 失败，仅 PR_SET_PTRACER 生效
+    }
+    if pid == 0 {
+        // child：seize 父进程，写 hw_breakpoint regset，然后 wait 直到父退出
+        const PTRACE_SEIZE: c_long = 0x4206;
+        const PTRACE_SETREGSET: c_long = 0x4205;
+        const PTRACE_DETACH: c_long = 17;
+        // ptrace SEIZE：标准 attach 不停止 tracee
+        let r = unsafe { ptrace(PTRACE_SEIZE, parent_pid as c_long, 0, 0) };
+        if r != 0 {
+            unsafe { _exit(1) };
+        }
+        // 构造 user_hwdebug_state：4 个 BCR/BVR
+        // arch/arm64/include/uapi/asm/ptrace.h:
+        //   struct user_hwdebug_state {
+        //     u32 dbg_info;
+        //     u32 pad;
+        //     struct { u64 addr; u32 ctrl; u32 pad; } dbg_regs[16];
+        //   };
+        // 我们写前 4 个；ctrl bit 0 = E（启用），bit 5 = privilege EL0，bits 8:5 access type。
+        let mut state = [0u8; 8 + 16 * 16];
+        for i in 0..4usize {
+            let off = 8 + i * 16;
+            // BVR：写无害地址（指向 1MB 边界，几乎不可能命中正常代码段）
+            let dummy_bvr: u64 = 0xCAFE_BABE_DEAD_0000u64 + (i as u64) * 0x100;
+            state[off..off + 8].copy_from_slice(&dummy_bvr.to_le_bytes());
+            // BCR：E=1 (bit 0), PMC=2 (EL0, bits 1:2), BAS=0xF (bits 5:8), TYPE=0 (BP)
+            let bcr: u32 = 0b0000_1111_1101u32; // E=1 PMC=10 BAS=1111 LBN=0
+            state[off + 8..off + 12].copy_from_slice(&bcr.to_le_bytes());
+        }
+        const NT_ARM_HW_BREAK: c_long = 0x402;
+        // PTRACE_SETREGSET(pid, type, &iov{base=state, len=...})
+        #[repr(C)]
+        struct Iovec { base: *const c_void, len: usize }
+        let iov = Iovec { base: state.as_ptr() as *const c_void, len: state.len() };
+        let _ = unsafe { ptrace(PTRACE_SETREGSET, parent_pid as c_long, NT_ARM_HW_BREAK,
+                                 &iov as *const _ as c_long) };
+        // 让父进程继续运行；child 持续等待直到父退出
+        loop {
+            let mut status: c_int = 0;
+            let w = unsafe { waitpid(parent_pid, &mut status, 0) };
+            if w <= 0 {
+                break;
+            }
+            // 任何信号都 forward 让父进程继续
+            const PTRACE_CONT: c_long = 7;
+            let _ = unsafe { ptrace(PTRACE_CONT, parent_pid as c_long, 0, 0) };
+        }
+        // 父进程死了；child 也退
+        unsafe { ptrace(PTRACE_DETACH, parent_pid as c_long, 0, 0); _exit(0); }
+    }
+    // parent：ptracer 已经设为 child；child 即将 SEIZE 我们。返回成功。
+    true
 }
 
 #[cfg(not(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64")))]

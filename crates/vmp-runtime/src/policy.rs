@@ -54,9 +54,41 @@ pub fn on_threat(verdict: &Verdict) {
 }
 
 fn corrupt_vm_state() {
-    // 通过修改 dispatcher 全局状态，让后续 dispatch_vm 落到错误 region。
-    // 当前阶段：仅 log，留给后续的 dispatch 路径检查 `THREAT_DETECTED` flag。
+    // 多层毒化：
+    // 1) 设置 THREAT_DETECTED → dispatch_region 直接返回 0xDEAD_C0DE 不进 VM
+    // 2) 把全局 corrupt 模式打开 → 即使 caller 不通过 dispatch_region 而是直接调
+    //    qvmp_dispatch（C ABI），也会被拦截
+    // 3) 写一段 syscall noise（mmap/munmap 几个无害区域）—— 让攻击者的 syscall
+    //    trace 多出几条假阳性，干扰静态分析路径标注
     crate::resolver::set_threat_flag();
+    syscall_noise();
+}
+
+/// 通过几次 mmap/munmap 制造无害的 syscall 噪声。
+/// Frida 的 syscall trace / strace 会看到额外几条 `mmap()` `munmap()` `getpid()`，
+/// 干扰攻击者的"该函数有什么副作用"判断。
+fn syscall_noise() {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        extern "C" {
+            fn mmap(
+                addr: *mut core::ffi::c_void, len: usize, prot: i32, flags: i32,
+                fd: i32, offset: i64,
+            ) -> *mut core::ffi::c_void;
+            fn munmap(addr: *mut core::ffi::c_void, len: usize) -> i32;
+            fn getpid() -> i32;
+        }
+        const PROT_NONE: i32 = 0;
+        const MAP_PRIVATE: i32 = 0x02;
+        const MAP_ANONYMOUS: i32 = 0x20;
+        for _ in 0..3 {
+            let p = mmap(core::ptr::null_mut(), 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if !p.is_null() && p as i64 != -1 {
+                let _ = munmap(p, 4096);
+            }
+        }
+        let _ = getpid();
+    }
 }
 
 fn abort_process() -> ! {

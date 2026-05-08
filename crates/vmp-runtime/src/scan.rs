@@ -28,10 +28,54 @@ static DISCOVERED: OnceLock<Vec<DiscoveredBlob>> = OnceLock::new();
 
 pub fn scan_loaded_modules() {
     let _ = DISCOVERED.set(scan_impl());
+    // 同时扫 QPGT 页表（如有），enable page-crypto
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    enable_page_crypto_from_qpgt();
 }
 
 pub fn discovered() -> &'static [DiscoveredBlob] {
     DISCOVERED.get().map(|v| v.as_slice()).unwrap_or(&[])
+}
+
+/// 扫已加载模块的 PT_LOAD 段找 "QPGT" magic；命中则解析页表 + enable page_crypto。
+/// 依赖 [`crate::page_crypto::PageEntry`] / `enable_page_crypto`。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn enable_page_crypto_from_qpgt() {
+    use byteorder::{ByteOrder, LittleEndian};
+    use crate::page_crypto::{enable_page_crypto, PageEntry, PageTable};
+
+    for d in discovered() {
+        // discovered 的每个模块都已经被 scan 过；我们用 module_base 重新搜 QPGT
+        let module_base = d.module_base as *const u8;
+        const SCAN_LEN: usize = 16 * 1024 * 1024;
+        let scan = unsafe { core::slice::from_raw_parts(module_base, SCAN_LEN) };
+        let mut found = None;
+        for i in (0..scan.len().saturating_sub(10)).rev().step_by(8) {
+            if &scan[i..i + 4] == b"QPGT" {
+                found = Some(i);
+                break;
+            }
+        }
+        let Some(off) = found else { continue };
+        let _version = LittleEndian::read_u16(&scan[off + 4..off + 6]);
+        let count = LittleEndian::read_u32(&scan[off + 6..off + 10]) as usize;
+        let mut p = off + 10;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            if p + 16 > scan.len() {
+                break;
+            }
+            let vaddr = LittleEndian::read_u64(&scan[p..p + 8]);
+            let key = LittleEndian::read_u64(&scan[p + 8..p + 16]);
+            entries.push(PageEntry { vaddr, key, decrypted: false });
+            p += 16;
+        }
+        if !entries.is_empty() {
+            let _ = enable_page_crypto(PageTable { entries });
+        }
+        // 一个进程通常只一个 QPGT；break 出循环
+        break;
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

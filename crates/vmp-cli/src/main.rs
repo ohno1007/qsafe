@@ -50,6 +50,11 @@ enum Cmd {
         /// 排除这些函数
         #[arg(long)]
         exclude: Vec<String>,
+        /// 函数 lift Trap 占比阈值（0..100）：超过该比例就跳过保护（避免运行时崩）。
+        /// 默认 30：超过 30% 指令 lift 失败的函数会被丢弃（保留原 native 实现）。
+        /// 调成 100 即"任何函数都强行保护，不顾 Trap"——只在调试 lifter 时用。
+        #[arg(long, default_value_t = 30)]
+        skip_trap_pct: u32,
     },
     /// 直接 lift 一段裸字节码（hex 或文件），用于调试 lifter
     Lift {
@@ -176,7 +181,7 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
 
     match cli.cmd {
-        Cmd::Protect { input, output, level, seed, only, exclude } => {
+        Cmd::Protect { input, output, level, seed, only, exclude, skip_trap_pct } => {
             let bytes = fs::read(&input).with_context(|| format!("读取 {}", input.display()))?;
             let obj = vmp_loader::load(bytes)?;
             log::info!(
@@ -225,17 +230,31 @@ fn main() -> anyhow::Result<()> {
 
                 match vmp_arch::lift(obj.arch, func_bytes, sym.vaddr) {
                     Ok(lifted) => {
+                        let total = lifted.report.total_input.max(1);
+                        let trap_pct = lifted.report.skipped * 100 / total;
                         log::info!(
-                            "lift {} @ {:#x}  in={} out_ir={} skipped={} notes={}",
+                            "lift {} @ {:#x}  in={} out_ir={} skipped={} ({}%) notes={}",
                             sym.name,
                             sym.vaddr,
                             lifted.report.total_input,
                             lifted.ir.len(),
                             lifted.report.skipped,
+                            trap_pct,
                             lifted.report.notes.len()
                         );
-                        if lifted.report.skipped > 0 && proto_level == ProtectLevel::Paranoid {
-                            log::warn!("paranoid 模式跳过含未支持指令的 {}", sym.name);
+                        // skip-trap-pct 阈值：lift Trap 占比超过阈值就放弃保护，
+                        // 保留原 native 实现 —— 避免运行时 dispatch_vm 命中 Trap 退出。
+                        // Paranoid 永远 skip-on-any-trap（>0 即弃）；其它级别按阈值。
+                        let trap_threshold = if proto_level == ProtectLevel::Paranoid {
+                            0
+                        } else {
+                            skip_trap_pct as usize
+                        };
+                        if trap_pct > trap_threshold {
+                            log::warn!(
+                                "跳过 {}：Trap 占比 {}% > 阈值 {}%",
+                                sym.name, trap_pct, trap_threshold
+                            );
                             continue;
                         }
                         funcs.push(FunctionRegion {
