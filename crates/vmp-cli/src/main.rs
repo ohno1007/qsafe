@@ -101,6 +101,9 @@ enum Cmd {
         /// payload 二次加密（依赖 ELF header 派生 key）
         #[arg(long, default_value_t = true)]
         xor_payload: bool,
+        /// 加密 .rodata（运行时由 libqvmp_runtime.so 在 .init_array 解密）
+        #[arg(long, default_value_t = true)]
+        encrypt_rodata: bool,
     },
     /// 列出 .a 静态库内的 .o 成员（用于 batch protect 准备）
     ArList { archive: PathBuf },
@@ -363,7 +366,7 @@ fn main() -> anyhow::Result<()> {
             println!("region {} 返回值 = {} (0x{:x})", region, r, r);
         }
 
-        Cmd::Rewrite { input, blob, output, write_trampolines, strip_names, xor_payload } => {
+        Cmd::Rewrite { input, blob, output, write_trampolines, strip_names, xor_payload, encrypt_rodata } => {
             let elf_bytes = fs::read(&input)?;
             let loaded = vmp_loader::load(elf_bytes)?;
             let blob_bytes = fs::read(&blob)?;
@@ -372,12 +375,12 @@ fn main() -> anyhow::Result<()> {
             let (mut new_elf, report) = vmp_rewriter::rewrite_elf(&loaded, &stub_blob, &opts)
                 .map_err(|e| anyhow::anyhow!("rewrite failed: {e}"))?;
 
-            // 应用 armor pass：段名剥离 + payload 加密
             let armor_opts = vmp_rewriter::ArmorOptions {
                 strip_shstrtab: strip_names,
                 strip_symtab: strip_names,
                 xor_payload,
                 hash_imports: false,
+                encrypt_rodata,
             };
             let armor_rep = vmp_rewriter::apply_armor(&mut new_elf, report.blob_offset, &armor_opts)
                 .map_err(|e| anyhow::anyhow!("armor failed: {e}"))?;
@@ -386,7 +389,8 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "rewrite ok: kind={:?} patched_entries={} new_segment_vaddr={:#x} \
                  new_segment_size={} blob_offset={:#x}\n\
-                 armor: shstrtab_zeroed={} strtab_zeroed={} payload_xor_len={} imports_hashed={}\n\
+                 armor: shstrtab_zeroed={} strtab_zeroed={} payload_xor_len={} \
+                 rodata_vaddr={:#x} rodata_enc_len={} imports_hashed={}\n\
                  → {} ({} bytes)",
                 loaded.kind,
                 report.patched_entries,
@@ -396,6 +400,8 @@ fn main() -> anyhow::Result<()> {
                 armor_rep.shstrtab_zeroed,
                 armor_rep.strtab_zeroed,
                 armor_rep.payload_xor_len,
+                armor_rep.rodata_vaddr,
+                armor_rep.rodata_encrypted_len,
                 armor_rep.imports_hashed,
                 output.display(),
                 new_elf.len()

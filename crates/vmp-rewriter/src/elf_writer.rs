@@ -71,12 +71,18 @@ pub fn rewrite_elf(
     }
 
     // ---- 3. 嵌入 blob ----
+    // Header layout (24 bytes total):
+    //   magic[4]      = "QVMP"
+    //   payload_len:u32   (后续 packed blob 字节数)
+    //   rodata_vaddr:u64  (0 if rodata encryption disabled; armor pass fills)
+    //   rodata_len:u64    (0 if disabled)
     let blob_off = out.len();
     out.extend_from_slice(b"QVMP");
     let packed = pack_blob(blob);
     let mut len_buf = [0u8; 4];
     LittleEndian::write_u32(&mut len_buf, packed.len() as u32);
     out.extend_from_slice(&len_buf);
+    out.extend_from_slice(&[0u8; 16]); // reserved for armor::encrypt_rodata
     out.extend_from_slice(&packed);
 
     // 对齐到页边界结束新 segment
@@ -177,7 +183,7 @@ fn add_load_phdr(
     out: &mut Vec<u8>,
     seg_file_off: usize,
     seg_vaddr: u64,
-    seg_size: usize,
+    _seg_size: usize,
 ) -> Result<()> {
     use goblin::elf::Elf;
     use goblin::elf::program_header::{PT_LOAD, PT_PHDR};

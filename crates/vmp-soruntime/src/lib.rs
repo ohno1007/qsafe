@@ -59,7 +59,37 @@ extern "C" {
     ) -> libc::c_int;
 }
 
+/// Logging is gated by env var `QVMP_LOG`. Set `QVMP_LOG=1` (or any non-empty
+/// value) to mirror messages to stderr — useful when launching via MT 管理器
+/// or any front-end that surfaces stdio but not logcat.
+/// Logcat output is also gated by the same flag to keep silent runs silent.
+fn log_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        // Read /proc/self/environ — getenv() works too but we may be called
+        // before libc fully initializes env in extreme edge cases.
+        match std::env::var("QVMP_LOG") {
+            Ok(v) => !v.is_empty() && v != "0",
+            Err(_) => false,
+        }
+    })
+}
+
 fn log_msg(msg: &[u8]) {
+    if !log_enabled() {
+        return;
+    }
+    // Strip trailing NUL for stderr; keep it for __android_log_write.
+    let stripped = if msg.last() == Some(&0) { &msg[..msg.len() - 1] } else { msg };
+    unsafe {
+        // fd 2 = stderr; write a "[qvmp] " prefix + msg + newline so it
+        // shows up cleanly in MT 管理器's run window or `adb shell` output.
+        let prefix = b"[qvmp] ";
+        libc::write(2, prefix.as_ptr() as *const _, prefix.len());
+        libc::write(2, stripped.as_ptr() as *const _, stripped.len());
+        libc::write(2, b"\n".as_ptr() as *const _, 1);
+    }
     #[cfg(target_os = "android")]
     unsafe {
         __android_log_write(
@@ -67,10 +97,6 @@ fn log_msg(msg: &[u8]) {
             b"qvmp\0".as_ptr() as *const _,
             msg.as_ptr() as *const _,
         );
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = msg;
     }
 }
 
@@ -96,14 +122,24 @@ extern "C" {
 struct Find {
     /// virtual address of the QVMP magic (start of header) in the host process
     magic_vaddr: usize,
-    /// payload length (after the 8-byte header)
+    /// payload length (after the 24-byte header)
     payload_len: usize,
     /// the file offset of the magic in the *original* on-disk ELF —
     /// the keystream is derived from this exact value at rewrite time.
     payload_file_offset: u64,
     /// 32 bytes of host-ELF header (we need bytes 0..32 for key derivation)
     elf_header: [u8; 32],
+    /// rodata vaddr stamped into header by armor::encrypt_rodata; 0 if disabled
+    rodata_vaddr: u64,
+    /// rodata length stamped into header; 0 if disabled
+    rodata_len: u64,
+    /// load_bias of the host ELF (dl_iterate_phdr's dlpi_addr) — needed to
+    /// translate rodata p_vaddr into a process-space address
+    load_bias: usize,
 }
+
+/// QVMP header: "QVMP"(4) + payload_len(4) + rodata_vaddr(8) + rodata_len(8)
+const QVMP_HEADER_LEN: usize = 24;
 
 extern "C" fn iter_cb(info: *mut DlPhdrInfo, _size: libc::size_t, data: *mut c_void) -> libc::c_int {
     let info = unsafe { &*info };
@@ -133,20 +169,25 @@ extern "C" fn iter_cb(info: *mut DlPhdrInfo, _size: libc::size_t, data: *mut c_v
         }
         let seg_start = load_base + ph.p_vaddr as usize;
         let seg_len = ph.p_filesz as usize;
-        if seg_len < 8 {
+        if seg_len < QVMP_HEADER_LEN {
             continue;
         }
         let bytes = unsafe { std::slice::from_raw_parts(seg_start as *const u8, seg_len) };
         let mut i = 0usize;
-        while i + 8 <= bytes.len() {
+        while i + QVMP_HEADER_LEN <= bytes.len() {
             if &bytes[i..i + 4] == b"QVMP" {
                 let payload_len = u32::from_le_bytes([
-                    bytes[i + 4],
-                    bytes[i + 5],
-                    bytes[i + 6],
-                    bytes[i + 7],
+                    bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7],
                 ]) as usize;
-                if i + 8 + payload_len <= bytes.len() {
+                let rodata_vaddr = u64::from_le_bytes([
+                    bytes[i + 8],  bytes[i + 9],  bytes[i + 10], bytes[i + 11],
+                    bytes[i + 12], bytes[i + 13], bytes[i + 14], bytes[i + 15],
+                ]);
+                let rodata_len = u64::from_le_bytes([
+                    bytes[i + 16], bytes[i + 17], bytes[i + 18], bytes[i + 19],
+                    bytes[i + 20], bytes[i + 21], bytes[i + 22], bytes[i + 23],
+                ]);
+                if i + QVMP_HEADER_LEN + payload_len <= bytes.len() {
                     let mut header = [0u8; 32];
                     let hdr = unsafe { std::slice::from_raw_parts(elf_hdr_addr as *const u8, 32) };
                     header.copy_from_slice(hdr);
@@ -156,6 +197,9 @@ extern "C" fn iter_cb(info: *mut DlPhdrInfo, _size: libc::size_t, data: *mut c_v
                         // file offset of the magic = phdr.p_offset + (magic - seg_start)
                         payload_file_offset: ph.p_offset as u64 + i as u64,
                         elf_header: header,
+                        rodata_vaddr,
+                        rodata_len,
+                        load_bias: load_base,
                     });
                     return 1;
                 }
@@ -166,6 +210,82 @@ extern "C" fn iter_cb(info: *mut DlPhdrInfo, _size: libc::size_t, data: *mut c_v
     0
 }
 
+/// Domain tags must match vmp-rewriter::armor.
+const DOMAIN_PAYLOAD: u64 = 0;
+const DOMAIN_RODATA: u64 = 0xC0DE_DA7A_BABE_F00D;
+
+fn derive_key(elf_header: &[u8; 32], magic_vaddr: usize, payload_offset: u64) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    for i in 0..16 {
+        key[i] = elf_header[i] ^ ((payload_offset >> (i % 8)) as u8);
+    }
+    let entry_field = u64::from_le_bytes([
+        elf_header[0x18], elf_header[0x19], elf_header[0x1a], elf_header[0x1b],
+        elf_header[0x1c], elf_header[0x1d], elf_header[0x1e], elf_header[0x1f],
+    ]);
+    for i in 0..8 {
+        key[16 + i] = ((entry_field >> (i * 8)) as u8) ^ 0xA5;
+    }
+    // For any real-sized binary, `elf[(off + i) % elf.len()]` lands at off..off+8
+    // — the unencrypted QVMP magic + length bytes. Read those from live memory.
+    for i in 0..8 {
+        let byte = unsafe { *((magic_vaddr + i) as *const u8) };
+        key[24 + i] = byte ^ 0x5A;
+    }
+    key
+}
+
+fn keystream_byte(key: &[u8; 32], i: usize, domain: u64) -> u8 {
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325 ^ domain;
+    h ^= key[i % 32] as u64;
+    h = h.wrapping_mul(0x100_0000_01B3);
+    h ^= (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h = h.wrapping_mul(0x100_0000_01B3);
+    (h >> 32) as u8
+}
+
+/// Make a vaddr range writable, run a closure, restore RX/RO. Page-aligns.
+unsafe fn with_writable<F: FnOnce()>(addr: usize, len: usize, restore_prot: i32, f: F) -> bool {
+    let page = 0x1000usize;
+    let aligned_addr = addr & !(page - 1);
+    let end = (addr + len + page - 1) & !(page - 1);
+    let aligned_len = end - aligned_addr;
+    let r1 = libc::mprotect(
+        aligned_addr as *mut c_void,
+        aligned_len,
+        libc::PROT_READ | libc::PROT_WRITE,
+    );
+    if r1 != 0 {
+        return false;
+    }
+    f();
+    let r2 = libc::mprotect(aligned_addr as *mut c_void, aligned_len, restore_prot);
+    r2 == 0
+}
+
+fn decrypt_rodata_in_place(f: &Find) {
+    if f.rodata_len == 0 || f.rodata_vaddr == 0 {
+        return;
+    }
+    let key = derive_key(&f.elf_header, f.magic_vaddr, f.payload_file_offset);
+    let target = f.load_bias + f.rodata_vaddr as usize;
+    let len = f.rodata_len as usize;
+    unsafe {
+        let ok = with_writable(target, len, libc::PROT_READ, || {
+            let p = target as *mut u8;
+            for i in 0..len {
+                let k = keystream_byte(&key, i, DOMAIN_RODATA);
+                *p.add(i) ^= k;
+            }
+        });
+        if !ok {
+            log_msg(b"qvmp_runtime: rodata mprotect failed; skipped decrypt\0");
+        } else {
+            log_msg(b"qvmp_runtime: rodata decrypted in place\0");
+        }
+    }
+}
+
 fn discover_and_decrypt_blob() -> Option<StubBlob> {
     let mut find: Option<Find> = None;
     unsafe {
@@ -173,49 +293,21 @@ fn discover_and_decrypt_blob() -> Option<StubBlob> {
     }
     let f = find?;
 
+    // Decrypt rodata FIRST — must happen before any code that references its
+    // bytes runs. Our .init_array entry is invoked before the main binary's
+    // .init_array (LD_PRELOAD ordering or NEEDED-deps-before-main ordering),
+    // so this is the right window.
+    decrypt_rodata_in_place(&f);
+
     // Snapshot the encrypted payload into a writable buffer.
-    let payload_addr = f.magic_vaddr + 8;
+    let payload_addr = f.magic_vaddr + QVMP_HEADER_LEN;
     let mut buf: Vec<u8> = unsafe {
         std::slice::from_raw_parts(payload_addr as *const u8, f.payload_len).to_vec()
     };
 
-    // Mirror vmp-rewriter::armor::encrypt_payload_in_place key derivation exactly.
-    let payload_offset = f.payload_file_offset;
-    let mut key = [0u8; 32];
-    for i in 0..16 {
-        key[i] = f.elf_header[i] ^ ((payload_offset >> (i % 8)) as u8);
-    }
-    let entry_field = u64::from_le_bytes([
-        f.elf_header[0x18],
-        f.elf_header[0x19],
-        f.elf_header[0x1a],
-        f.elf_header[0x1b],
-        f.elf_header[0x1c],
-        f.elf_header[0x1d],
-        f.elf_header[0x1e],
-        f.elf_header[0x1f],
-    ]);
-    for i in 0..8 {
-        key[16 + i] = ((entry_field >> (i * 8)) as u8) ^ 0xA5;
-    }
-    // The rewriter's third key chunk reads `elf[(off + i) % elf.len()] ^ 0x5A`
-    // for i in 0..8. For any real-sized binary (off + 8 << file size), the
-    // modulo doesn't wrap, so this reads bytes off..off+8 — i.e., the QVMP
-    // magic + length header, which sits *unencrypted* in front of the payload.
-    // We can read those exact bytes from the live mapping at magic_vaddr.
-    for i in 0..8 {
-        let byte = unsafe { *((f.magic_vaddr + i) as *const u8) };
-        key[24 + i] = byte ^ 0x5A;
-    }
-
+    let key = derive_key(&f.elf_header, f.magic_vaddr, f.payload_file_offset);
     for i in 0..f.payload_len {
-        let mut h: u64 = 0xCBF2_9CE4_8422_2325;
-        h ^= key[i % 32] as u64;
-        h = h.wrapping_mul(0x100_0000_01B3);
-        h ^= (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        h = h.wrapping_mul(0x100_0000_01B3);
-        let k = (h >> 32) as u8;
-        buf[i] ^= k;
+        buf[i] ^= keystream_byte(&key, i, DOMAIN_PAYLOAD);
     }
 
     vmp_stub::unpack_blob(&buf).ok()

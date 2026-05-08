@@ -18,6 +18,8 @@ pub struct ArmorOptions {
     pub strip_symtab: bool,
     pub xor_payload: bool,
     pub hash_imports: bool,
+    /// 加密 .rodata（运行时由 libqvmp_runtime.so 在 .init_array 解密 mprotect 还原）
+    pub encrypt_rodata: bool,
 }
 
 impl Default for ArmorOptions {
@@ -27,6 +29,7 @@ impl Default for ArmorOptions {
             strip_symtab: true,
             xor_payload: true,
             hash_imports: false, // 默认关闭，因为完整动态解析需要 cdylib runtime 配合
+            encrypt_rodata: true,
         }
     }
 }
@@ -37,6 +40,8 @@ pub struct ArmorReport {
     pub strtab_zeroed: usize,
     pub payload_xor_len: usize,
     pub imports_hashed: usize,
+    pub rodata_encrypted_len: usize,
+    pub rodata_vaddr: u64,
 }
 
 /// 对修改后的 ELF 应用 armor。要求 `payload_offset` 指向 `vmp-rewriter::elf_writer`
@@ -58,6 +63,12 @@ pub fn apply_armor(
     }
     if opts.xor_payload {
         report.payload_xor_len = encrypt_payload_in_place(elf, payload_offset)?;
+    }
+    if opts.encrypt_rodata {
+        if let Some((vaddr, len)) = encrypt_rodata_in_place(elf, payload_offset)? {
+            report.rodata_vaddr = vaddr;
+            report.rodata_encrypted_len = len;
+        }
     }
     if opts.hash_imports {
         report.imports_hashed = hash_dynsym_imports(elf)?;
@@ -102,23 +113,19 @@ fn strip_section_string_table(elf: &mut [u8], section_name: &str) -> Result<usiz
     Ok(zeroed)
 }
 
-/// 用 ELF magic + 文件长度低 8 字节派生的轻量 keystream 二次加密 payload。
-/// keystream 与 ELF 自身的 header 字段绑定 → dump 的 blob 字节即使被识别也无法直接解码。
-fn encrypt_payload_in_place(elf: &mut [u8], payload_offset: u64) -> Result<usize> {
-    let off = payload_offset as usize;
-    if off + 8 > elf.len() {
-        return Err(crate::RewriteError::Internal("payload offset 越界".into()));
-    }
-    if &elf[off..off + 4] != b"QVMP" {
-        return Err(crate::RewriteError::Internal("payload magic 不匹配".into()));
-    }
-    let payload_len = LittleEndian::read_u32(&elf[off + 4..off + 8]) as usize;
-    let total = off + 8 + payload_len;
-    if total > elf.len() {
-        return Err(crate::RewriteError::Internal("payload 长度超出 ELF 文件".into()));
-    }
+/// QVMP block layout (24-byte header + payload):
+///   off+0  : "QVMP" magic (4 B)
+///   off+4  : payload_len:u32   (encrypted payload byte count)
+///   off+8  : rodata_vaddr:u64  (filled by encrypt_rodata_in_place; 0 = none)
+///   off+16 : rodata_len:u64    (filled by encrypt_rodata_in_place; 0 = none)
+///   off+24 : payload_bytes …   (XOR-encrypted by encrypt_payload_in_place)
+const QVMP_HEADER_LEN: usize = 24;
 
-    // 派生 32 字节 key：取 ELF header[0..16] + ELF entry + payload_offset 哈希
+/// Derive the 32-byte key used by both payload and rodata streams. Pure
+/// function of ELF header bytes + payload_offset → both rewriter and runtime
+/// must compute it identically.
+fn derive_key(elf: &[u8], payload_offset: u64) -> [u8; 32] {
+    let off = payload_offset as usize;
     let mut key = [0u8; 32];
     for i in 0..16 {
         key[i] = elf[i] ^ ((payload_offset >> (i % 8)) as u8);
@@ -130,19 +137,102 @@ fn encrypt_payload_in_place(elf: &mut [u8], payload_offset: u64) -> Result<usize
     for i in 0..8 {
         key[24 + i] = elf[(off + i) % elf.len()] ^ 0x5A;
     }
+    key
+}
 
-    // keystream：FNV-1a 64bit 在 (key, position) 上派生
-    let payload_start = off + 8;
+/// FNV-1a × golden-ratio keystream byte at logical position `i` with the
+/// given 32-byte key, plus a domain tag XORed into the FNV initial state.
+/// Domain tags differentiate payload vs rodata streams so the same byte index
+/// produces independent keys for the two streams.
+fn keystream_byte(key: &[u8; 32], i: usize, domain: u64) -> u8 {
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325 ^ domain;
+    h ^= key[i % 32] as u64;
+    h = h.wrapping_mul(0x100_0000_01B3);
+    h ^= (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h = h.wrapping_mul(0x100_0000_01B3);
+    (h >> 32) as u8
+}
+
+const DOMAIN_PAYLOAD: u64 = 0;
+const DOMAIN_RODATA: u64 = 0xC0DE_DA7A_BABE_F00D;
+
+fn encrypt_payload_in_place(elf: &mut [u8], payload_offset: u64) -> Result<usize> {
+    let off = payload_offset as usize;
+    if off + QVMP_HEADER_LEN > elf.len() {
+        return Err(crate::RewriteError::Internal("payload offset 越界".into()));
+    }
+    if &elf[off..off + 4] != b"QVMP" {
+        return Err(crate::RewriteError::Internal("payload magic 不匹配".into()));
+    }
+    let payload_len = LittleEndian::read_u32(&elf[off + 4..off + 8]) as usize;
+    let payload_start = off + QVMP_HEADER_LEN;
+    if payload_start + payload_len > elf.len() {
+        return Err(crate::RewriteError::Internal("payload 长度超出 ELF 文件".into()));
+    }
+
+    let key = derive_key(elf, payload_offset);
     for i in 0..payload_len {
-        let mut h: u64 = 0xCBF2_9CE4_8422_2325;
-        h ^= key[i % 32] as u64;
-        h = h.wrapping_mul(0x100_0000_01B3);
-        h ^= (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        h = h.wrapping_mul(0x100_0000_01B3);
-        let k = (h >> 32) as u8;
+        let k = keystream_byte(&key, i, DOMAIN_PAYLOAD);
         elf[payload_start + i] ^= k;
     }
     Ok(payload_len)
+}
+
+/// Find `.rodata` (by section name when shstrtab still has names; otherwise
+/// by SHF_ALLOC + SHF_MERGE + SHF_STRINGS heuristic), encrypt its bytes in
+/// place using `DOMAIN_RODATA` keystream, and stamp `(vaddr, len)` into the
+/// QVMP header at `payload_offset + 8 / +16`. Runtime cdylib uses these
+/// fields to mprotect-RW → XOR-decrypt → mprotect-R the segment at load.
+fn encrypt_rodata_in_place(
+    elf: &mut [u8],
+    payload_offset: u64,
+) -> Result<Option<(u64, usize)>> {
+    let (file_off, vaddr, size) = match find_rodata(elf) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if size == 0 || file_off + size > elf.len() {
+        return Ok(None);
+    }
+    let key = derive_key(elf, payload_offset);
+    for i in 0..size {
+        let k = keystream_byte(&key, i, DOMAIN_RODATA);
+        elf[file_off + i] ^= k;
+    }
+    let off = payload_offset as usize;
+    LittleEndian::write_u64(&mut elf[off + 8..off + 16], vaddr);
+    LittleEndian::write_u64(&mut elf[off + 16..off + 24], size as u64);
+    Ok(Some((vaddr, size)))
+}
+
+/// Locate `.rodata`. Section names may be zeroed by `strip_shstrtab`, so we
+/// also fall back to a flag-based heuristic: a PROGBITS section that is
+/// SHF_ALLOC && !SHF_WRITE && !SHF_EXECINSTR && SHF_MERGE && SHF_STRINGS.
+/// Returns `(file_offset, vaddr, size)`.
+fn find_rodata(elf: &[u8]) -> Option<(usize, u64, usize)> {
+    use goblin::elf::Elf;
+    use goblin::elf::section_header::{SHF_ALLOC, SHF_EXECINSTR, SHF_MERGE, SHF_STRINGS, SHF_WRITE, SHT_PROGBITS};
+    let parsed = Elf::parse(elf).ok()?;
+    // First pass: name-based.
+    for sh in &parsed.section_headers {
+        if let Some(name) = parsed.shdr_strtab.get_at(sh.sh_name) {
+            if name == ".rodata" && sh.sh_type == SHT_PROGBITS {
+                return Some((sh.sh_offset as usize, sh.sh_addr, sh.sh_size as usize));
+            }
+        }
+    }
+    // Fallback: flag heuristic.
+    for sh in &parsed.section_headers {
+        if sh.sh_type != SHT_PROGBITS {
+            continue;
+        }
+        let f = sh.sh_flags as u32;
+        let want = SHF_ALLOC | SHF_MERGE | SHF_STRINGS;
+        if (f & want) == want && (f & (SHF_WRITE | SHF_EXECINSTR)) == 0 && sh.sh_size > 0 {
+            return Some((sh.sh_offset as usize, sh.sh_addr, sh.sh_size as usize));
+        }
+    }
+    None
 }
 
 /// 把 `.dynsym` import 字符串（每个 STT_FUNC import）替换成 8 字节伪随机标识。
