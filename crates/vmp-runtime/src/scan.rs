@@ -103,11 +103,17 @@ fn try_extract_qvmp(elf_header_va: u64, seg_va: u64, seg_len: u64) -> Option<Dis
     if seg_len < 8 {
         return None;
     }
-    let bytes = unsafe { core::slice::from_raw_parts(seg_va as *const u8, seg_len as usize) };
+    // 单段最大扫描量限制：rewriter 把 QVMP blob 写到末尾追加的 PT_LOAD，所以从段尾
+    // 往前找比从头扫快得多。同时 cap 在 16MB —— 商用 .so 极少超过这个体积；超出
+    // 部分极可能不是 QVMP 段，跳过避免 host 上 dl_iterate_phdr 把 cargo test 的
+    // 巨大主二进制（debug 信息）当作扫描目标导致几秒延迟。
+    const SCAN_CAP: u64 = 16 * 1024 * 1024;
+    let cap_len = seg_len.min(SCAN_CAP) as usize;
+    let bytes = unsafe { core::slice::from_raw_parts(seg_va as *const u8, cap_len) };
 
-    // 简单线性搜 4-byte magic（最坏 O(n)，对几 MB 段足够快）
+    // 从尾部扫起：rewriter 写 QVMP 在新追加 PT_LOAD 内，离段起点很远。
     let mut magic_off: Option<usize> = None;
-    for i in 0..bytes.len().saturating_sub(4) {
+    for i in (0..bytes.len().saturating_sub(4)).rev().step_by(4) {
         if &bytes[i..i + 4] == b"QVMP" {
             magic_off = Some(i);
             break;

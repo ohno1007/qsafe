@@ -54,8 +54,8 @@ pub type Result<T> = std::result::Result<T, RewriteError>;
 pub use apk::{list_libs as apk_list_libs, pack_one_lib as apk_pack_one_lib, AbiTarget, ApkLibReport};
 pub use ar_rewriter::{rewrite_archive, ArRewriteOptions, ArRewriteReport};
 pub use armor::{
-    append_imports_table, apply_armor, apply_payload_keystream, derive_payload_key, ArmorOptions,
-    ArmorReport,
+    append_imports_table, append_integrity_hash, apply_armor, apply_payload_keystream,
+    derive_payload_key, ArmorOptions, ArmorReport,
 };
 pub use elf_writer::{rewrite_elf, RewriteOptions, RewriteReport};
 pub use imports::{djb2_hash64, pack_imports, unpack_imports, ImportEntry};

@@ -94,7 +94,26 @@ impl<'a> Interpreter<'a> {
                 }
                 VOp::Load => {
                     let addr = self.state.regs[instr.rs as usize].wrapping_add(instr.imm as u64);
-                    let v = self.host_load(addr, instr.width)?;
+                    let mut v = self.host_load(addr, instr.width)?;
+                    // cond 字段在 Load 上被用作"符号扩展模式"：
+                    //   Cond::Al (默认)  零扩展（LDR / LDRB / LDRH / LDRW）
+                    //   Cond::Mi         符号扩展到 W64（LDRSB / LDRSH / LDRSW）
+                    //   Cond::Pl         符号扩展到 W32（LDRSB / LDRSH 32-bit form）
+                    if matches!(instr.cond, Cond::Mi | Cond::Pl) {
+                        let bits = (instr.width.bytes() as u32) * 8;
+                        let sign_bit = 1u64 << (bits - 1);
+                        if v & sign_bit != 0 {
+                            let mask = if matches!(instr.cond, Cond::Mi) {
+                                !((1u64 << bits) - 1) // 扩到全 64 位
+                            } else {
+                                !((1u64 << bits) - 1) & 0xFFFF_FFFFu64 // 扩到 32 位再零扩
+                            };
+                            v |= mask;
+                            if matches!(instr.cond, Cond::Pl) {
+                                v &= 0xFFFF_FFFFu64;
+                            }
+                        }
+                    }
                     self.state.regs[instr.rd as usize] = v;
                 }
                 VOp::Store => {
@@ -525,6 +544,64 @@ impl<'a> Interpreter<'a> {
                     }
                 }
 
+                // ==== MulH (SMULH / UMULH 真高 64) ====
+                VOp::MulH => {
+                    let a = self.state.regs[instr.rs as usize];
+                    let b = self.state.regs[instr.rt as usize];
+                    let r = if matches!(instr.cond, Cond::Eq) {
+                        // SMULH：64×64 signed → high 64
+                        ((a as i64 as i128).wrapping_mul(b as i64 as i128) >> 64) as u64
+                    } else {
+                        // UMULH：64×64 unsigned → high 64
+                        ((a as u128).wrapping_mul(b as u128) >> 64) as u64
+                    };
+                    self.state.regs[instr.rd as usize] = r;
+                }
+
+                // ==== IndirectBr：通过 NativeCall 跳到寄存器目标 ====
+                VOp::IndirectBr => {
+                    let target = self.state.regs[instr.rd as usize];
+                    let ret = match self.host.as_deref_mut() {
+                        Some(h) => h.native_call(target, &self.state.regs[..8])?,
+                        None => return Err(Error::vm("E2")),
+                    };
+                    self.state.regs[0] = ret;
+                }
+
+                // ==== NEON FP 向量 ====
+                VOp::VFAdd => {
+                    self.state.fregs[instr.rd as usize & 31] = vec_fp_op(
+                        self.state.fregs[instr.rs as usize & 31],
+                        self.state.fregs[instr.rt as usize & 31],
+                        instr.width, instr.lane,
+                        |a, b| a + b, |a, b| a + b,
+                    );
+                }
+                VOp::VFSub => {
+                    self.state.fregs[instr.rd as usize & 31] = vec_fp_op(
+                        self.state.fregs[instr.rs as usize & 31],
+                        self.state.fregs[instr.rt as usize & 31],
+                        instr.width, instr.lane,
+                        |a, b| a - b, |a, b| a - b,
+                    );
+                }
+                VOp::VFMul => {
+                    self.state.fregs[instr.rd as usize & 31] = vec_fp_op(
+                        self.state.fregs[instr.rs as usize & 31],
+                        self.state.fregs[instr.rt as usize & 31],
+                        instr.width, instr.lane,
+                        |a, b| a * b, |a, b| a * b,
+                    );
+                }
+                VOp::VFDiv => {
+                    self.state.fregs[instr.rd as usize & 31] = vec_fp_op(
+                        self.state.fregs[instr.rs as usize & 31],
+                        self.state.fregs[instr.rt as usize & 31],
+                        instr.width, instr.lane,
+                        |a, b| a / b, |a, b| a / b,
+                    );
+                }
+
                 // ==== CCMP ====
                 VOp::Ccmp => {
                     if self.state.flags.matches(instr.cond) {
@@ -678,6 +755,50 @@ fn vec_op(
         (1u128 << bits) - 1
     };
     let _ = mask;
+    (a & !used_mask) | (out & used_mask)
+}
+
+/// NEON 浮点向量逐 lane 运算。`width` = 单 lane 宽度（W32 单精度 / W64 双精度）；
+/// `lane_count` ∈ {2, 4}。其它 lane 数视作 noop（保留高位）。
+fn vec_fp_op(
+    a: u128, b: u128, width: Width, lane_count: u8,
+    op64: impl Fn(f64, f64) -> f64,
+    op32: impl Fn(f32, f32) -> f32,
+) -> u128 {
+    let lc = lane_count as usize;
+    if lc == 0 || lc > 4 {
+        return a;
+    }
+    let lane_bytes = width.bytes();
+    let total_bytes = lane_bytes * lc;
+    if total_bytes == 0 || total_bytes > 16 {
+        return a;
+    }
+    let mut out: u128 = 0;
+    for i in 0..lc {
+        let shift = (i * lane_bytes * 8) as u32;
+        match width {
+            Width::W32 => {
+                let av = f32::from_bits((a >> shift) as u32);
+                let bv = f32::from_bits((b >> shift) as u32);
+                let r = op32(av, bv).to_bits() as u128;
+                out |= r << shift;
+            }
+            Width::W64 => {
+                let av = f64::from_bits((a >> shift) as u64);
+                let bv = f64::from_bits((b >> shift) as u64);
+                let r = op64(av, bv).to_bits() as u128;
+                out |= r << shift;
+            }
+            _ => {}
+        }
+    }
+    let used_mask = if total_bytes >= 16 {
+        u128::MAX
+    } else {
+        let bits = (total_bytes * 8) as u32;
+        (1u128 << bits) - 1
+    };
     (a & !used_mask) | (out & used_mask)
 }
 

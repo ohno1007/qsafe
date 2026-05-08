@@ -54,17 +54,26 @@ fn install_sigsegv_handler() {
         sa_mask: [u64; 1],
         sa_restorer: usize,
     }
+    // SA_SIGINFO + SA_NODEFER：handler 内部如果再触发 SIGSEGV，OS 不会自动屏蔽
+    // → 由 thread-local IN_HANDLER 自己识别递归；NODEFER 比较稳健，避免 dead-lock。
     const SA_SIGINFO: i32 = 0x0000_0004;
+    const SA_NODEFER: i32 = 0x4000_0000;
     const SIGSEGV: i32 = 11;
     extern "C" {
         fn sigaction(signum: i32, act: *const SigAction, oldact: *mut SigAction) -> i32;
     }
     let mut act: SigAction = unsafe { MaybeUninit::zeroed().assume_init() };
-    act.sa_flags = SA_SIGINFO;
+    act.sa_flags = SA_SIGINFO | SA_NODEFER;
     act.sa_handler = sigsegv_handler as *const () as usize;
     unsafe {
         sigaction(SIGSEGV, &act, core::ptr::null_mut());
     }
+}
+
+// 线程本地"我已经在 handler 里"计数器。recursion ≥ 2 即放弃处理（恢复 SIG_DFL）。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+thread_local! {
+    static IN_HANDLER: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -92,7 +101,7 @@ fn mprotect_all_to_none() {
 fn mprotect_all_to_none() {}
 
 /// SIGSEGV handler：查页表，命中则解密 → mprotect R+X → 让 CPU 重跑触发指令。
-/// 未命中（真实 segfault）则用 SIG_DFL 转发，进程依然 crash。
+/// 未命中（真实 segfault）/ 递归 fault → 恢复 SIG_DFL 让进程正常 crash。
 #[cfg(any(target_os = "linux", target_os = "android"))]
 extern "C" fn sigsegv_handler(
     sig: i32,
@@ -109,8 +118,24 @@ extern "C" fn sigsegv_handler(
     const SIGSEGV: c_int = 11;
     const SIG_DFL: usize = 0;
 
+    // 递归保护：handler 内部如果再触发 SIGSEGV（页表 mutex 解锁失败 / mprotect 失败 /
+    // 解密目标地址越界），不能再进 handler；恢复 SIG_DFL 让进程崩溃。
+    let recursion_safe = IN_HANDLER.with(|c| {
+        let v = c.get();
+        c.set(v.saturating_add(1));
+        v == 0
+    });
+    if !recursion_safe {
+        unsafe {
+            signal(SIGSEGV, SIG_DFL);
+        }
+        IN_HANDLER.with(|c| c.set(c.get().saturating_sub(1)));
+        return;
+    }
+
     unsafe {
         if info.is_null() {
+            IN_HANDLER.with(|c| c.set(c.get().saturating_sub(1)));
             return;
         }
         let fault = (*info).si_addr as u64;
@@ -135,10 +160,10 @@ extern "C" fn sigsegv_handler(
         if !handled {
             // 未命中：恢复默认 handler，进程接受真实 SIGSEGV
             signal(SIGSEGV, SIG_DFL);
-            // 让信号重新发生 —— 直接 return，CPU 重跑 fault 指令 → 默认 handler kill
             let _ = sig;
         }
     }
+    IN_HANDLER.with(|c| c.set(c.get().saturating_sub(1)));
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

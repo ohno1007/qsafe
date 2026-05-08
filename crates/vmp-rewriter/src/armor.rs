@@ -95,6 +95,61 @@ pub fn append_imports_table(elf: &mut Vec<u8>, table: &[ImportEntry]) -> u64 {
     off
 }
 
+/// 在 ELF 末尾追加完整性 hash（"QHSH" 起头 + SHA-256 of post-rewrite .text）。
+/// runtime 通过 dl_iterate_phdr 找 PF_X PT_LOAD，重新算 hash 比对。
+///
+/// 格式：
+/// ```text
+/// magic[4] = "QHSH"
+/// version u16 = 1
+/// hash[32]    SHA-256
+/// ```
+pub fn append_integrity_hash(elf: &mut Vec<u8>) -> u64 {
+    use sha2::{Digest, Sha256};
+    use goblin::elf::Elf;
+    use goblin::elf::program_header::{PF_X, PT_LOAD};
+
+    let parsed = match Elf::parse(elf) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    let mut h = Sha256::new();
+    let mut snapshots: Vec<(u64, u64, u64)> = Vec::new();
+    for ph in &parsed.program_headers {
+        if ph.p_type != PT_LOAD || (ph.p_flags & PF_X) == 0 {
+            continue;
+        }
+        snapshots.push((ph.p_offset, ph.p_filesz, ph.p_memsz));
+    }
+    drop(parsed);
+    for (off, fsz, msz) in snapshots {
+        let off = off as usize;
+        let fsz = fsz as usize;
+        let msz = msz as usize;
+        if off + fsz > elf.len() {
+            continue;
+        }
+        h.update(&elf[off..off + fsz]);
+        // memsz > filesz 部分（BSS）按零填充也喂给 hash —— 与 runtime
+        // dl_iterate_phdr 读 memsz 范围一致。
+        if msz > fsz {
+            let zeros = vec![0u8; msz - fsz];
+            h.update(&zeros);
+        }
+    }
+    let digest = h.finalize();
+
+    // 8 字节对齐
+    while elf.len() % 8 != 0 {
+        elf.push(0);
+    }
+    let pos = elf.len() as u64;
+    elf.extend_from_slice(b"QHSH");
+    elf.extend_from_slice(&1u16.to_le_bytes());
+    elf.extend_from_slice(&digest);
+    pos
+}
+
 /// 把指定 string table section 里的字节置 0（除了首字节 NULL，保持 ELF 标准）。
 /// 这让 readelf -S 看到的段名都变成空字符串、`-s` 看到的符号名同样消失。
 fn strip_section_string_table(elf: &mut [u8], section_name: &str) -> Result<usize> {

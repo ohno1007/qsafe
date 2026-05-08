@@ -224,6 +224,18 @@ impl Instr {
                 has_rd: false, has_rs: true, has_rt: true,
                 has_width: true, has_cond: true, imm_bytes: 4, has_lane: false,
             },
+
+            // MulH: rd + rs + rt + width + cond（cond 选签名 / 无签名）
+            VOp::MulH => Layout {
+                has_rd: true, has_rs: true, has_rt: true,
+                has_width: true, has_cond: true, imm_bytes: 0, has_lane: false,
+            },
+
+            // IndirectBr: rd 是寄存器号
+            VOp::IndirectBr => Layout::r1(),
+
+            // NEON FP 向量：r3w + lane（width=W32 单 / W64 双；lane=2/4）
+            VOp::VFAdd | VOp::VFSub | VOp::VFMul | VOp::VFDiv => Layout::r3wl(),
         }
     }
 

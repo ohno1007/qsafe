@@ -41,12 +41,19 @@ pub mod sig;
 /// 2. 扫描已加载 .so / .exe 找 QVMP / QIMP blob，建立全局 region 表
 /// 3. dlsym 解析 imports.tbl 中的 hash → 真实地址
 /// 4. 跑反分析检查（按环境变量 / 编译期 flag）；命中威胁触发 [`policy`] 决定的响应
+///
+/// 测试旁路：设 `QVMP_INIT_BYPASS=1` 时只跑步骤 4 的反分析（不扫模块、不注册
+/// 信号 handler）。host 集成测试用此路径避免 dl_iterate_phdr 在 cargo test 的
+/// 主二进制（含巨大 debug 段）上耗时数秒。
 pub fn qvmp_runtime_init() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        sig::install_sigtrap_handler();
-        scan::scan_loaded_modules();
-        resolver::resolve_imports_for_all();
+        let bypass = std::env::var_os("QVMP_INIT_BYPASS").is_some();
+        if !bypass {
+            sig::install_sigtrap_handler();
+            scan::scan_loaded_modules();
+            resolver::resolve_imports_for_all();
+        }
 
         // 反分析探测：默认从 QVMP_FLAGS env var 读，未设置 = DEFAULT_HEAVY
         let flags = vmp_protect::ProtectFlags::from_env();
@@ -82,6 +89,11 @@ static QVMP_INIT_CTOR: extern "C" fn() = qvmp_init_ctor;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 extern "C" fn qvmp_init_ctor() {
+    // 测试 / 集成场景设 `QVMP_DISABLE_CTOR=1` 跳过自动 init，由测试代码显式调用
+    // qvmp_runtime_init 控制时机。生产 cdylib 部署时此 env 不存在，ctor 正常工作。
+    if std::env::var_os("QVMP_DISABLE_CTOR").is_some() {
+        return;
+    }
     qvmp_runtime_init();
 }
 

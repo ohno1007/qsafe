@@ -35,7 +35,8 @@ impl Lifter for Arm32Lifter {
 
     fn lift(&mut self, code: &[u8], base: u64) -> Result<LiftedFunction> {
         if self.thumb {
-            return Err(Error::internal("ARM32 Thumb 模式 lifter 未实现 — 留待 Phase 5"));
+            // 转交给 Thumb lifter
+            return crate::thumb::ThumbLifter { strict: self.strict }.lift(code, base);
         }
         if code.len() % 4 != 0 {
             return Err(Error::lift(base, "ARM32 代码长度必须是 4 的倍数"));

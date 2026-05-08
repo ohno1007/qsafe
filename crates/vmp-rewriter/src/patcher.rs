@@ -48,6 +48,15 @@ fn encode_nop() -> u32 {
     0xD503_201F
 }
 
+/// 编码 `bti jc`（HINT #0x26 = 100110）—— Branch Target Identification 接收
+/// indirect branch (j) + indirect call (c) 两种入口。Android 14 启用 PAC+BTI
+/// 后函数入口必须有 BTI 指令，否则间接跳转触发 SIGILL。
+///
+/// 编码：`HINT #imm7`，imm7=0x26 即 BTI jc
+fn encode_bti_jc() -> u32 {
+    0xD503_24DF
+}
+
 /// 编码 `b imm26` (相对当前 PC 的字节偏移；必须 4 字节对齐)
 pub fn encode_b(rel_bytes: i32) -> Result<u32, super::RewriteError> {
     if rel_bytes & 3 != 0 {
@@ -84,6 +93,8 @@ pub fn build_x86_int3_trampoline(region_id: u32) -> [u8; 16] {
 }
 
 /// 生成一个 16-byte BRK 跳板：mov x16,#region_id ; brk #(QVMP_BASE|region_id_low) ; nop ; b .
+///
+/// **不带 BTI** 形式：用于不启用 BTI 的设备 / 二进制。
 pub fn build_brk_trampoline(region_id: u32) -> [u8; 16] {
     let mut out = [0u8; 16];
     let mov = encode_movz_x16(region_id);
@@ -94,5 +105,25 @@ pub fn build_brk_trampoline(region_id: u32) -> [u8; 16] {
     LittleEndian::write_u32(&mut out[4..8], brk);
     LittleEndian::write_u32(&mut out[8..12], nop);
     LittleEndian::write_u32(&mut out[12..16], bself);
+    out
+}
+
+/// 生成一个 20-byte BTI 兼容跳板：bti jc ; mov x16,#region_id ; brk ; nop ; b .
+///
+/// 用于 Android 14 / 启用 GP（Guard Page）的 ARM64 二进制。当原函数入口使用
+/// `BLR Xn` 跳转过来（非 B 指令），CPU 需要落地点首条指令是 BTI 否则 SIGILL。
+/// 由于跳板长度变 20 字节而不是 16，调用方写入 e_text 时也要按 20 偏移。
+pub fn build_brk_trampoline_bti(region_id: u32) -> [u8; 20] {
+    let mut out = [0u8; 20];
+    let bti = encode_bti_jc();
+    let mov = encode_movz_x16(region_id);
+    let brk = encode_brk(ARM64_BRK_QVMP_BASE | ((region_id as u16) & 0xFF));
+    let nop = encode_nop();
+    let bself = 0x14000000u32;
+    LittleEndian::write_u32(&mut out[0..4], bti);
+    LittleEndian::write_u32(&mut out[4..8], mov);
+    LittleEndian::write_u32(&mut out[8..12], brk);
+    LittleEndian::write_u32(&mut out[12..16], nop);
+    LittleEndian::write_u32(&mut out[16..20], bself);
     out
 }

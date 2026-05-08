@@ -372,16 +372,20 @@ fn decode_branch(raw: u32, pc: u64) -> Result<Vec<Instr>, &'static str> {
         let rn = ((raw >> 5) & 0x1F) as u8;
         match opc {
             0b0000 => {
-                // BR Rn → 我们当前不实现间接跳转的 VM 内部跳板，标 NativeCall 占位
-                return Ok(vec![Instr { op: VOp::NativeCall, rd: rn, ..Default::default() }]);
+                // BR Rn → IndirectBr：把 X[Rn] 当成目标 PC，宿主 native_call 跳过去
+                return Ok(vec![Instr { op: VOp::IndirectBr, rd: rn, ..Default::default() }]);
             }
             0b0001 => {
-                // BLR Rn
-                return Ok(vec![Instr { op: VOp::NativeCall, rd: rn, ..Default::default() }]);
+                // BLR Rn → 同 IndirectBr（"call + ret 在 BLR 后续指令"——VM 简化路径）
+                return Ok(vec![Instr { op: VOp::IndirectBr, rd: rn, ..Default::default() }]);
             }
             0b0010 => {
                 // RET Rn
                 return Ok(vec![Instr { op: VOp::Ret, ..Default::default() }]);
+            }
+            // BRAA / BRAB / BLRAA / BLRAB（PAC 间接跳转）：忽略 PAC 校验，按普通 BR 处理
+            0b1000 | 0b1001 | 0b1010 | 0b1011 => {
+                return Ok(vec![Instr { op: VOp::IndirectBr, rd: rn, ..Default::default() }]);
             }
             _ => return Err("uncond-branch-reg 子类未实现"),
         }
@@ -415,6 +419,55 @@ fn decode_load_store(raw: u32, pc: u64) -> Result<Vec<Instr>, &'static str> {
             Instr { op: VOp::MovI, rd: SCRATCH, imm: target as i64, width: Width::W64, ..Default::default() },
             Instr { op: VOp::Load, rd: rt, rs: SCRATCH, imm: 0, width, ..Default::default() },
         ]);
+    }
+
+    // ---- LDP / STP (FP, V=1)：bits 29:25 = 10110 ----
+    // opc = 00 (32-bit S), 01 (64-bit D), 10 (128-bit Q)
+    if (raw >> 25) & 0x1F == 0b10110 {
+        let opc = (raw >> 30) & 0x3;
+        let idx = (raw >> 23) & 0x3; // 01=post, 10=offset, 11=pre
+        let l = (raw >> 22) & 1;
+        let mut imm7 = ((raw >> 15) & 0x7F) as i32;
+        if imm7 & 0x40 != 0 {
+            imm7 |= !0x7F;
+        }
+        let rt2 = ((raw >> 10) & 0x1F) as u8;
+        let rn = ((raw >> 5) & 0x1F) as u8;
+        let rt = (raw & 0x1F) as u8;
+        let (scale, width): (i64, Width) = match opc {
+            0b00 => (4, Width::W32),
+            0b01 => (8, Width::W64),
+            0b10 => (16, Width::W64), // Q：解释器 FLoad/FStore 用 width=W8 触发 Q 路径
+            _ => return Err("LDP/STP FP opc reserved"),
+        };
+        let offset = (imm7 as i64) * scale;
+        let mut out = Vec::with_capacity(6);
+        let do_pair = |out: &mut Vec<Instr>, base: u8, base_off: i64| {
+            let op = if l == 1 { VOp::FLoad } else { VOp::FStore };
+            out.push(Instr {
+                op, rd: rt, rs: base, imm: base_off, width,
+                ..Default::default()
+            });
+            out.push(Instr {
+                op, rd: rt2, rs: base, imm: base_off + scale, width,
+                ..Default::default()
+            });
+        };
+        match idx {
+            0b10 => do_pair(&mut out, rn, offset),
+            0b01 => {
+                do_pair(&mut out, rn, 0);
+                out.push(Instr { op: VOp::MovI, rd: SCRATCH, imm: offset, width: Width::W64, ..Default::default() });
+                out.push(Instr { op: VOp::Add, rd: rn, rs: rn, rt: SCRATCH, width: Width::W64, ..Default::default() });
+            }
+            0b11 => {
+                out.push(Instr { op: VOp::MovI, rd: SCRATCH, imm: offset, width: Width::W64, ..Default::default() });
+                out.push(Instr { op: VOp::Add, rd: rn, rs: rn, rt: SCRATCH, width: Width::W64, ..Default::default() });
+                do_pair(&mut out, rn, 0);
+            }
+            _ => return Err("LDP/STP FP idx 0 (no-allocate) 未实现"),
+        }
+        return Ok(out);
     }
 
     // ---- LDP / STP (整数, V=0)：bits 29:25 = 10100 ----
@@ -665,8 +718,14 @@ fn decode_load_store(raw: u32, pc: u64) -> Result<Vec<Instr>, &'static str> {
         };
         let scaled = imm12 * width.bytes() as i64;
         let op = if opc == 0 { VOp::Store } else { VOp::Load };
-        // 简化：LDRS（符号扩展）暂当作普通 Load
-        return Ok(vec![Instr { op, rd: rt, rs: rn, imm: scaled, width, ..Default::default() }]);
+        // 符号扩展：opc=10 → 扩到 W64；opc=11 → 扩到 W32（仅 size<3 时有意义，size=3
+        // 即 W64 没有符号扩展形）
+        let cond = match opc {
+            0b10 if size < 3 => Cond::Mi,
+            0b11 if size < 3 => Cond::Pl,
+            _ => Cond::Al,
+        };
+        return Ok(vec![Instr { op, rd: rt, rs: rn, imm: scaled, width, cond, ..Default::default() }]);
     }
 
     // ---- LDR/STR (immediate, 9-bit unscaled / pre-index / post-index) ----
@@ -688,14 +747,19 @@ fn decode_load_store(raw: u32, pc: u64) -> Result<Vec<Instr>, &'static str> {
             _ => Width::W64,
         };
         let op = if opc == 0 { VOp::Store } else { VOp::Load };
+        let cond = match opc {
+            0b10 if size < 3 => Cond::Mi,
+            0b11 if size < 3 => Cond::Pl,
+            _ => Cond::Al,
+        };
         let mut out = Vec::with_capacity(4);
         match idx {
             0b00 => {
-                out.push(Instr { op, rd: rt, rs: rn, imm: imm9, width, ..Default::default() });
+                out.push(Instr { op, rd: rt, rs: rn, imm: imm9, width, cond, ..Default::default() });
             }
             0b01 => {
                 // post-indexed: addr = Rn; Rn += imm9
-                out.push(Instr { op, rd: rt, rs: rn, imm: 0, width, ..Default::default() });
+                out.push(Instr { op, rd: rt, rs: rn, imm: 0, width, cond, ..Default::default() });
                 out.push(Instr { op: VOp::MovI, rd: SCRATCH, imm: imm9, width: Width::W64, ..Default::default() });
                 out.push(Instr { op: VOp::Add, rd: rn, rs: rn, rt: SCRATCH, width: Width::W64, ..Default::default() });
             }
@@ -703,7 +767,7 @@ fn decode_load_store(raw: u32, pc: u64) -> Result<Vec<Instr>, &'static str> {
                 // pre-indexed: Rn += imm9; addr = Rn
                 out.push(Instr { op: VOp::MovI, rd: SCRATCH, imm: imm9, width: Width::W64, ..Default::default() });
                 out.push(Instr { op: VOp::Add, rd: rn, rs: rn, rt: SCRATCH, width: Width::W64, ..Default::default() });
-                out.push(Instr { op, rd: rt, rs: rn, imm: 0, width, ..Default::default() });
+                out.push(Instr { op, rd: rt, rs: rn, imm: 0, width, cond, ..Default::default() });
             }
             _ => return Err("LDR/STR idx 未分配"),
         }
@@ -874,12 +938,13 @@ fn decode_data_reg(raw: u32) -> Result<Vec<Instr>, &'static str> {
                 return Ok(out);
             }
             0b010 | 0b110 => {
-                // SMULH / UMULH —— 64×64 → 高 64 位。当前实现简化为：
-                // 仅写 rd = (Mul lower 64) — 高位丢弃；常见 hash 算法多数用 lower。
-                // 严格 SMULH/UMULH 留 Phase 6 用 i128/u128 实现。
+                // SMULH (op31=010) / UMULH (op31=110)：64×64 → 高 64 位
+                // VOp::MulH 用 cond 字段区分签名与无签名（Eq=signed, Ne=unsigned）
+                let signed = op31 == 0b010;
                 return Ok(vec![Instr {
-                    op: VOp::Mul, rd, rs: rn, rt: rm,
+                    op: VOp::MulH, rd, rs: rn, rt: rm,
                     width: Width::W64,
+                    cond: if signed { Cond::Eq } else { Cond::Ne },
                     ..Default::default()
                 }]);
             }
@@ -1034,6 +1099,57 @@ fn decode_data_reg(raw: u32) -> Result<Vec<Instr>, &'static str> {
 // SIMD / FP（标量子集 + LSE atomics）
 // =================================================================
 fn decode_simd_fp(raw: u32) -> Result<Vec<Instr>, &'static str> {
+    // ---- Advanced SIMD three same (FP): FADD / FSUB / FMUL / FDIV ----
+    //   0 Q U 01110 0 sz 1 Rm opcode 1 Rn Rd     (sz=0 → 4S/2S, sz=1 → 2D)
+    //   FADD: U=0 opcode=11010
+    //   FSUB: U=0 opcode=11010 ... 实际 ARM ARM 列：
+    //     FADD = 0 Q 0 01110 0 sz 1 Rm 1 1010 1 Rn Rd
+    //     FSUB = 0 Q 0 01110 1 sz 1 Rm 1 1010 1 Rn Rd
+    //     FMUL = 0 Q 1 01110 0 sz 1 Rm 1 1011 1 Rn Rd
+    //     FDIV = 0 Q 1 01110 0 sz 1 Rm 1 1111 1 Rn Rd
+    if (raw >> 24) & 0xBF == 0b00001110
+        && (raw >> 21) & 1 == 1
+        && (raw >> 10) & 1 == 1
+        && (raw >> 11) & 0xF == 0b1010
+        || (raw >> 24) & 0xBF == 0b00001110
+            && (raw >> 21) & 1 == 1
+            && (raw >> 10) & 1 == 1
+            && (raw >> 11) & 0xF == 0b1011
+        || (raw >> 24) & 0xBF == 0b00001110
+            && (raw >> 21) & 1 == 1
+            && (raw >> 10) & 1 == 1
+            && (raw >> 11) & 0xF == 0b1111
+    {
+        let q = (raw >> 30) & 1;
+        let u = (raw >> 29) & 1;
+        let neg = (raw >> 23) & 1; // FSUB 用：上位是 1
+        let sz = (raw >> 22) & 1;
+        let rm = ((raw >> 16) & 0x1F) as u8;
+        let opcode = (raw >> 11) & 0xF;
+        let rn = ((raw >> 5) & 0x1F) as u8;
+        let rd = (raw & 0x1F) as u8;
+        let lane_size = if sz == 0 { Width::W32 } else { Width::W64 };
+        // sz=0 → 4S (Q=1) 或 2S (Q=0)；sz=1 → 2D (Q=1) 或 reserved (Q=0)
+        let lane_count = match (sz, q) {
+            (0, 1) => 4u8,
+            (0, 0) => 2u8,
+            (1, 1) => 2u8,
+            _ => return Err("SIMD FP three-same lane 不合法"),
+        };
+        let vop = match (u, neg, opcode) {
+            (0, 0, 0b1010) => VOp::VFAdd,
+            (0, 1, 0b1010) => VOp::VFSub,
+            (1, 0, 0b1011) => VOp::VFMul,
+            (1, 0, 0b1111) => VOp::VFDiv,
+            _ => return Err("SIMD FP three-same opcode 未实现"),
+        };
+        return Ok(vec![Instr {
+            op: vop, rd, rs: rn, rt: rm,
+            width: lane_size, lane: lane_count,
+            ..Default::default()
+        }]);
+    }
+
     // ---- Advanced SIMD three same: integer 向量 ADD / SUB ----
     //   0 Q U 01110 size 1 Rm opcode 1 Rn Rd
     //   opcode = 10000 → ADD（U=0）/ SUB（U=1）

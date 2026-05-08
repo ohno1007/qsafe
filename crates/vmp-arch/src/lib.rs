@@ -7,6 +7,8 @@ pub mod lifter;
 pub mod arm64;
 #[cfg(feature = "arm32")]
 pub mod arm32;
+#[cfg(feature = "arm32")]
+pub mod thumb;
 #[cfg(feature = "x86_64")]
 pub mod x86_64;
 

@@ -122,7 +122,23 @@ CLI 子命令 `vmp pe-rewrite`。
   锁回（已经在 release 模式 dead-code-eliminate）
 - ✅ README 补 Phase 4 完成内容、TODO 完成项
 
-## 仍留作 Phase 5 的部分
+## Phase 5 / 6 已完成
+
+见 README **Phase 5 / 6 增强** 章节。要点：
+- 反分析全部 9 模块（anti_debug/dump/hook/ida/inject/vm/emulator/unpack + hwbp）
+- ProtectFlags bitflag + QVMP_FLAGS env var + QVMP_RESPONSE policy
+- 按页加解密（runtime SIGSEGV handler + 递归保护）
+- 多线程 dispatch 锁
+- ARM64：MulH 真高 64 / IndirectBr / VFAdd-VFSub-VFMul-VFDiv / LDRSB-LDRSH-LDRSW
+  / LDP-STP FP / BTI-jc trampoline / DP-1src RBIT-REV-CLZ / FNEG-FABS-FSQRT /
+  ADC-SBC / CCMP / HINT 全集 / PAC* / PRFM
+- x86_64 lifter 扩展（MOV/ADD/SUB/AND/OR/XOR/CMP/Jcc/INC/DEC）
+- Thumb T1 子集
+- 完整性 hash baking (QHSH magic) + runtime 自动加载
+- CNTVCT_EL0 时序检测（避开 clock_gettime hook）
+- cdylib runtime host 集成测试 5 项
+
+## 仍留作 Phase 7 的部分
 
 - expand_arith 的 opaque_predicate（永远 taken/不 taken 的算术条件分支）完整实现
 - NEON 浮点向量算术（FADD/FSUB/FMUL of 4S/2D 等）

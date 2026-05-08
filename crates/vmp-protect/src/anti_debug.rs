@@ -105,10 +105,36 @@ pub fn prctl_set_undumpable() -> bool {
     false
 }
 
-/// 时间异常检测：跑一段已知指令循环，clock_gettime 前后差值超过阈值即 true。
-/// 阈值经验值：在物理 ARM64 真机上 1024 次空 NOP loop 通常 < 50 us；
-/// gdb single-step 下会膨胀到 ms 级。设阈值 1000 us。
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// 时间异常检测：在 aarch64 上**直接读 CNTVCT_EL0**（user-space 可读虚拟计时器），
+/// 而不是 clock_gettime —— 后者是 libc 函数，Frida 一行就能 hook。CNTVCT_EL0 是
+/// CPU 寄存器，attacker 想伪造必须改 EL2/EL1 行为（root + kernel module 才行）。
+///
+/// 阈值经验值：物理 ARM64 真机 cntfrq 通常 19.2 MHz；4096 iter 大约 100 us 即
+/// 19.2 * 100 ≈ 1920 ticks。debugger single-step 至少膨胀 100 倍。设阈 100k ticks。
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
+pub fn timing_anomaly() -> bool {
+    let t0 = read_cntvct();
+    let mut acc: u64 = 0;
+    for i in 0..4096u64 {
+        acc = acc.wrapping_add(i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    }
+    core::hint::black_box(acc);
+    let t1 = read_cntvct();
+    t1.wrapping_sub(t0) > 100_000
+}
+
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
+#[inline]
+fn read_cntvct() -> u64 {
+    let mut t: u64;
+    unsafe {
+        core::arch::asm!("mrs {0}, cntvct_el0", out(reg) t, options(nomem, nostack));
+    }
+    t
+}
+
+/// 非 aarch64 / 非 Linux：fallback 到 clock_gettime（仍然是有用的近似 + 不会假阳性）。
+#[cfg(all(any(target_os = "linux", target_os = "android"), not(target_arch = "aarch64")))]
 pub fn timing_anomaly() -> bool {
     use std::time::Instant;
     let t0 = Instant::now();

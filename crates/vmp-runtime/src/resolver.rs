@@ -10,11 +10,23 @@
 use crate::scan::discovered;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use vmp_core::Result;
 
 static IMPORT_TABLE: OnceLock<HashMap<u64, u64>> = OnceLock::new();
 static THREAT_DETECTED: AtomicBool = AtomicBool::new(false);
+
+/// 多线程互斥：一次只允许一个线程进 dispatch_vm。
+///
+/// 原因：vmp-stub 的 `dispatch_vm` 创建本地 VmState（栈、寄存器）并把指针交给宿主
+/// host bridge；如果两个线程同时调用，host_load/host_store 路径竞态；NestedDispatchHost
+/// 内部也假设单线程。
+///
+/// 性能影响：单线程 VM 已经比 native 慢 ~50x，再加锁不影响绝对值（用户感知"VMP
+/// 慢"已在预期内）。多线程并发性能差是 VMP 设计本身的代价。
+///
+/// 后续优化：把 VmState 池化，每线程拿一个；锁只保护池借出 / 归还。
+static DISPATCH_LOCK: Mutex<()> = Mutex::new(());
 
 /// 由 `policy::on_threat` 调用。设置后所有 `dispatch_region` 路径返回 corrupt 值。
 pub fn set_threat_flag() {
@@ -44,8 +56,9 @@ fn resolve_impl() -> HashMap<u64, u64> {
         // 在模块所在内存里搜 QIMP magic。
         // discovered 不直接保存 imports.tbl 偏移；我们重新在该模块内存范围里扫描。
         let module_base = d.module_base as *const u8;
-        // 启发式：模块内存窗口设 64 MB（足够覆盖单个 .so）
-        const SCAN_LEN: usize = 64 * 1024 * 1024;
+        // 启发式：模块内存窗口 cap 16 MB —— 商用 .so 极少超出该值；超出部分多半
+        // 不是当前模块属地，避免 SIGSEGV / 巨慢扫描。
+        const SCAN_LEN: usize = 16 * 1024 * 1024;
         let scan = unsafe { core::slice::from_raw_parts(module_base, SCAN_LEN) };
         for i in (0..scan.len().saturating_sub(10)).step_by(4) {
             if &scan[i..i + 4] == b"QIMP" {
@@ -100,12 +113,18 @@ fn locate_region(region_id: usize) -> Option<(&'static vmp_stub::StubBlob, usize
 }
 
 /// 顶层 dispatch：BRK trap → 找 blob → vmp_stub::dispatch_vm。仅 Linux 上有 LinuxHost。
+///
+/// 多线程 caller 通过 `DISPATCH_LOCK` 串行化。Android JNI 在不同 java 线程调用同一
+/// native 函数会触发并发，必须串行才能保证 VmState 不被踩。
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn dispatch_region(region_id: usize, args: &[u64]) -> Result<u64> {
     if threat_detected() {
         // policy::corrupt：返回毒化值；攻击者拿到错的运行结果
+        // 注：CodeGen 已经把字节码加密 → dump 出来也是密文；运行时再返回 corrupt
+        // 数值让攻击者**进一步分不清是检测触发还是普通逻辑**。
         return Ok(0xDEAD_C0DE_DEAD_C0DEu64);
     }
+    let _guard = DISPATCH_LOCK.lock().map_err(|_| vmp_core::Error::vm("E:lock"))?;
     let (blob, idx) = locate_region(region_id)
         .ok_or_else(|| vmp_core::Error::vm("E:no-region"))?;
     let mut host = vmp_stub::linux::LinuxHost::new();

@@ -37,5 +37,8 @@ env_logger = { workspace = true, optional = true }
 default = ["dev-logger"]
 dev-logger = ["dep:env_logger"]
 
+[dev-dependencies]
+vmp-protect = { path = "../vmp-protect" }
+
 [build-dependencies]
 # 构建时把外部 .qvmp 文件复制到 OUT_DIR，供 include_bytes! 嵌入。

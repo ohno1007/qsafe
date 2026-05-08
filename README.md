@@ -364,6 +364,80 @@ CLI 新增子命令：`vmp static-rewrite` / `vmp pe-rewrite` / `vmp apk-list`�
 
 两套 lifter 都通过 `vmp_arch::make_lifter(Arch)` 工厂注册，lift→encode→interpret 链路通用。
 
+## Phase 5 / 6 增强（反 *、按页加解密、ARM64 完善）
+
+### 反分析（vmp-protect 模块化）
+
+每项独立文件，bitflag `ProtectFlags` 单独开关。运行时由 `cdylib runtime` 在
+`JNI_OnLoad` / `.init_array` ctor / `DllMain` 进入时自动跑：
+
+| 模块 | 检测路径 |
+|---|---|
+| `anti_debug` | PTRACE_TRACEME 自检 / `/proc/self/status:TracerPid` / PR_SET_DUMPABLE / **CNTVCT_EL0 时序异常**（aarch64 用户态可读虚拟计时器，规避 clock_gettime hook） |
+| `anti_dump` | `/proc/self/fd` 扫 mem 句柄 / 匿名可执行段 |
+| `anti_hook` | dlsym 首字节签名（B/BL/LDR-literal）/ PLT-GOT 异常 |
+| `anti_ida` | linux_server64 / android_x64_stub / IDA_HOME / proc 扫描 |
+| `anti_inject` | libfrida-agent.so / gum-js-loop / 27042 / xposed / substrate |
+| `anti_vm` | `/proc/cpuinfo` hypervisor / DMI vendor |
+| `anti_emulator` | `ro.kernel.qemu` / `/dev/qemu_pipe` / goldfish / Nox / droid4x |
+| `anti_unpack` | `dl_iterate_phdr` 算 .text SHA-256，与 build-time `QHSH` magic 比对 |
+| `hwbp` | 硬件断点检测 + `PR_SET_PTRACER` 占坑 |
+
+环境变量配置：
+- `QVMP_FLAGS`：`anti_debug+anti_hook+anti_inject` / `paranoid` / `none`
+- `QVMP_RESPONSE`：`silent` / `corrupt`（默认）/ `abort` / `crash_random`
+- `QVMP_DISABLE_CTOR=1`：测试用，让 ctor 不自动 init
+
+### 按页动态加解密（vmp-runtime/page_crypto）
+
+mprotect PROT_NONE 隐藏受保护页；SIGSEGV handler 命中页 → 解密 → R+X →
+CPU 重跑；带**线程本地递归保护**（IN_HANDLER 计数器 + SA_NODEFER）防止 handler
+内部再次 SIGSEGV 导致死循环。runtime 侧完成；rewriter 侧的 `QPGT` 页表写入留
+Phase 7。
+
+### 多线程 VM 安全
+
+`dispatch_region` 由 `DISPATCH_LOCK` 串行化。Android JNI 多线程并发调同一 native
+函数不会破坏 VmState。
+
+### ARM64 指令补完（实测覆盖）
+
+| 类别 | 新增 |
+|---|---|
+| DP-1src | RBIT / REV / REV16 / CLZ |
+| 算术 | ADC / SBC / **SMULH / UMULH 真高 64**（i128/u128） |
+| 控制流 | **BR / BLR / BRAA / BLRAA → IndirectBr** 新 VOp（vtable / 函数指针） |
+| 比较 | CCMP / CCMN（imm + reg） |
+| FP 1-src | FNEG / FABS / FSQRT |
+| FP 向量 | **VFAdd / VFSub / VFMul / VFDiv** 新 VOp（4S / 2S / 2D） |
+| LSE atomics | LDADD / LDCLR / LDEOR / LDSET |
+| LDP/STP FP | S / D / Q pair (offset / pre / post) |
+| Sign-extend Load | LDRSB / LDRSH / LDRSW（cond 字段编码扩展模式） |
+| HINT 全集 / PAC* / PRFM | 一律 Nop |
+
+VOp 总数：64 → **70**；cap 254；heavy/paranoid `handler_duplication=3`。
+
+### BTI 兼容跳板
+
+`build_brk_trampoline_bti(region_id)` 输出 20 字节跳板，首条 `BTI jc`，兼容
+Android 14 启用 PAC+BTI 的设备：从 `BLR Xn` 跳过来不会 SIGILL。
+
+### Windows x86 / x86_64 加壳
+
+`pe_writer` 按 `loaded.arch` 分发跳板：ARM64 BRK / x86 INT3 + region_id。
+PE32 / PE32+ optional header 偏移共享代码路径。
+
+### x86_64 lifter 扩展
+
+新增：`MOV r/m64, r64` / `ADD/SUB/AND/OR/XOR/CMP r/m64, r64` / `INC/DEC r64` /
+`Jcc rel32 / rel8` / `JMP rel8` / `INT3` / `CDQE`。
+realworld.c 的 `encrypt` 函数 lift skipped 从 30 降到 10。
+
+### Thumb (T1) 子集 + ARM32 整合
+
+新模块 `vmp-arch::thumb`：识别 T1 16-bit MOV/ADD/SUB/CMP/B/Bcc/BX/NOP；T2
+32-bit 留 Phase 7。`Arm32Lifter::thumb=true` 时自动转交。
+
 ## Phase 4 工具链
 
 | crate | 行数 | 作用 |

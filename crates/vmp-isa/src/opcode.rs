@@ -271,6 +271,22 @@ pub enum VOp {
     // ---- 条件比较（CCMP / CCMN）----
     /// 条件比较：if cond then Cmp(Rs, Rt) else 写入 imm 作 NZCV
     Ccmp = 150,
+
+    // ---- 高 64 位乘法（SMULH / UMULH）----
+    /// 64×64 → 高 64 位。cond 字段：Eq=有符号 (SMULH), Ne=无符号 (UMULH)
+    MulH = 160,
+
+    // ---- 间接跳转 ----
+    /// 间接跳转：rd 是寄存器号；运行时把 regs[rd] 当目标 PC，转交宿主 native_call。
+    /// 用于支持 vtable / function pointer 调度。当前简化为：触发宿主 NativeCall 跳到
+    /// 该地址（与 BLR 一致），返回值写 X0。完整路径（VM 内部跳转表）留 Phase 7。
+    IndirectBr = 161,
+
+    // ---- NEON 浮点向量（lane 数量配合 width=W32 单精度 / W64 双精度）----
+    VFAdd = 170,
+    VFSub = 171,
+    VFMul = 172,
+    VFDiv = 173,
 }
 
 pub const VOP_COUNT: usize = 64; // 上限；实际枚举值不超过此数
@@ -343,6 +359,12 @@ impl VOp {
             140 => VOp::Adc,
             141 => VOp::Sbc,
             150 => VOp::Ccmp,
+            160 => VOp::MulH,
+            161 => VOp::IndirectBr,
+            170 => VOp::VFAdd,
+            171 => VOp::VFSub,
+            172 => VOp::VFMul,
+            173 => VOp::VFDiv,
             _ => return None,
         };
         Some(result)
@@ -414,6 +436,12 @@ impl VOp {
             VOp::Adc,
             VOp::Sbc,
             VOp::Ccmp,
+            VOp::MulH,
+            VOp::IndirectBr,
+            VOp::VFAdd,
+            VOp::VFSub,
+            VOp::VFMul,
+            VOp::VFDiv,
         ]
     }
 }
@@ -506,6 +534,12 @@ impl VOp {
             VOp::Adc => "Adc",
             VOp::Sbc => "Sbc",
             VOp::Ccmp => "Ccmp",
+            VOp::MulH => "MulH",
+            VOp::IndirectBr => "IndirectBr",
+            VOp::VFAdd => "VFAdd",
+            VOp::VFSub => "VFSub",
+            VOp::VFMul => "VFMul",
+            VOp::VFDiv => "VFDiv",
         }
     }
 }

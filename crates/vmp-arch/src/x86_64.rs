@@ -158,6 +158,195 @@ fn decode_one(bytes: &[u8], pc: u64) -> std::result::Result<(Vec<Instr>, usize),
     if op == 0x90 {
         return Ok((vec![Instr { op: VOp::Nop, ..Default::default() }], rest_off + 1));
     }
+    // INT3
+    if op == 0xCC {
+        return Ok((vec![Instr { op: VOp::Trap, ..Default::default() }], rest_off + 1));
+    }
+    // INC r64 / DEC r64：REX.W + FF /0 (inc) / FF /1 (dec) reg
+    if rex_w && op == 0xFF && bytes.len() >= rest_off + 2 {
+        let modrm = bytes[rest_off + 1];
+        let rm = modrm & 7;
+        let reg_op = (modrm >> 3) & 7;
+        let mod_field = (modrm >> 6) & 3;
+        if mod_field == 0b11 {
+            match reg_op {
+                0 => {
+                    return Ok((
+                        vec![
+                            Instr { op: VOp::MovI, rd: 32, imm: 1, width: Width::W64, ..Default::default() },
+                            Instr { op: VOp::Add, rd: rm, rs: rm, rt: 32, width: Width::W64, ..Default::default() },
+                        ],
+                        rest_off + 2,
+                    ));
+                }
+                1 => {
+                    return Ok((
+                        vec![
+                            Instr { op: VOp::MovI, rd: 32, imm: 1, width: Width::W64, ..Default::default() },
+                            Instr { op: VOp::Sub, rd: rm, rs: rm, rt: 32, width: Width::W64, ..Default::default() },
+                        ],
+                        rest_off + 2,
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    // ADD r/m64, r64 : REX.W + 0x01 + ModR/M (mod=11 → reg-reg)
+    if rex_w && op == 0x01 && bytes.len() >= rest_off + 2 {
+        let modrm = bytes[rest_off + 1];
+        if (modrm >> 6) == 0b11 {
+            let dst = modrm & 7;
+            let src = (modrm >> 3) & 7;
+            return Ok((
+                vec![Instr {
+                    op: VOp::Add, rd: dst, rs: dst, rt: src, width: Width::W64,
+                    ..Default::default()
+                }],
+                rest_off + 2,
+            ));
+        }
+    }
+    // SUB r/m64, r64 : REX.W + 0x29 + ModR/M
+    if rex_w && op == 0x29 && bytes.len() >= rest_off + 2 {
+        let modrm = bytes[rest_off + 1];
+        if (modrm >> 6) == 0b11 {
+            let dst = modrm & 7;
+            let src = (modrm >> 3) & 7;
+            return Ok((
+                vec![Instr {
+                    op: VOp::Sub, rd: dst, rs: dst, rt: src, width: Width::W64,
+                    ..Default::default()
+                }],
+                rest_off + 2,
+            ));
+        }
+    }
+    // MOV r/m64, r64 : REX.W + 0x89 + ModR/M
+    if rex_w && op == 0x89 && bytes.len() >= rest_off + 2 {
+        let modrm = bytes[rest_off + 1];
+        if (modrm >> 6) == 0b11 {
+            let dst = modrm & 7;
+            let src = (modrm >> 3) & 7;
+            return Ok((
+                vec![Instr { op: VOp::MovR, rd: dst, rs: src, ..Default::default() }],
+                rest_off + 2,
+            ));
+        }
+    }
+    // XOR r/m64, r64 : REX.W + 0x31 + ModR/M
+    if rex_w && op == 0x31 && bytes.len() >= rest_off + 2 {
+        let modrm = bytes[rest_off + 1];
+        if (modrm >> 6) == 0b11 {
+            let dst = modrm & 7;
+            let src = (modrm >> 3) & 7;
+            return Ok((
+                vec![Instr {
+                    op: VOp::Xor, rd: dst, rs: dst, rt: src, width: Width::W64,
+                    ..Default::default()
+                }],
+                rest_off + 2,
+            ));
+        }
+    }
+    // AND r/m64, r64 : REX.W + 0x21
+    if rex_w && op == 0x21 && bytes.len() >= rest_off + 2 {
+        let modrm = bytes[rest_off + 1];
+        if (modrm >> 6) == 0b11 {
+            let dst = modrm & 7;
+            let src = (modrm >> 3) & 7;
+            return Ok((
+                vec![Instr {
+                    op: VOp::And, rd: dst, rs: dst, rt: src, width: Width::W64,
+                    ..Default::default()
+                }],
+                rest_off + 2,
+            ));
+        }
+    }
+    // OR r/m64, r64 : REX.W + 0x09
+    if rex_w && op == 0x09 && bytes.len() >= rest_off + 2 {
+        let modrm = bytes[rest_off + 1];
+        if (modrm >> 6) == 0b11 {
+            let dst = modrm & 7;
+            let src = (modrm >> 3) & 7;
+            return Ok((
+                vec![Instr {
+                    op: VOp::Or, rd: dst, rs: dst, rt: src, width: Width::W64,
+                    ..Default::default()
+                }],
+                rest_off + 2,
+            ));
+        }
+    }
+    // CMP r/m64, r64 : REX.W + 0x39
+    if rex_w && op == 0x39 && bytes.len() >= rest_off + 2 {
+        let modrm = bytes[rest_off + 1];
+        if (modrm >> 6) == 0b11 {
+            let dst = modrm & 7;
+            let src = (modrm >> 3) & 7;
+            return Ok((
+                vec![Instr {
+                    op: VOp::Cmp, rs: dst, rt: src, width: Width::W64,
+                    ..Default::default()
+                }],
+                rest_off + 2,
+            ));
+        }
+    }
+    // Jcc rel32：0F 8x ib*4
+    if op == 0x0F && bytes.len() >= rest_off + 6 {
+        let cc = bytes[rest_off + 1];
+        if cc & 0xF0 == 0x80 {
+            let cond = match cc & 0xF {
+                0x4 => vmp_isa::Cond::Eq,  // JE
+                0x5 => vmp_isa::Cond::Ne,  // JNE
+                0xC => vmp_isa::Cond::Lt,  // JL  (signed)
+                0xD => vmp_isa::Cond::Ge,  // JGE
+                0xE => vmp_isa::Cond::Le,  // JLE
+                0xF => vmp_isa::Cond::Gt,  // JG
+                _ => return Err("Jcc cond 未实现"),
+            };
+            let rel = LittleEndian::read_i32(&bytes[rest_off + 2..rest_off + 6]) as i64;
+            let target = (pc as i64 + (rest_off + 6) as i64 + rel) as u64;
+            return Ok((
+                vec![Instr { op: VOp::BCond, cond, imm: target as i64, ..Default::default() }],
+                rest_off + 6,
+            ));
+        }
+    }
+    // Jcc rel8: 0x70..0x7F + ib
+    if (0x70..=0x7F).contains(&op) && bytes.len() >= rest_off + 2 {
+        let cond = match op & 0xF {
+            0x4 => vmp_isa::Cond::Eq,
+            0x5 => vmp_isa::Cond::Ne,
+            0xC => vmp_isa::Cond::Lt,
+            0xD => vmp_isa::Cond::Ge,
+            0xE => vmp_isa::Cond::Le,
+            0xF => vmp_isa::Cond::Gt,
+            _ => return Err("Jcc rel8 cond 未实现"),
+        };
+        let rel = bytes[rest_off + 1] as i8 as i64;
+        let target = (pc as i64 + (rest_off + 2) as i64 + rel) as u64;
+        return Ok((
+            vec![Instr { op: VOp::BCond, cond, imm: target as i64, ..Default::default() }],
+            rest_off + 2,
+        ));
+    }
+    // JMP rel8：EB ib
+    if op == 0xEB && bytes.len() >= rest_off + 2 {
+        let rel = bytes[rest_off + 1] as i8 as i64;
+        let target = (pc as i64 + (rest_off + 2) as i64 + rel) as u64;
+        return Ok((
+            vec![Instr { op: VOp::Br, imm: target as i64, ..Default::default() }],
+            rest_off + 2,
+        ));
+    }
+    // CDQE / CWDE：REX.W + 0x98 (cdqe) / 0x98 (cwde)
+    // 简化：noop（VM 寄存器无 32/64 区分）
+    if rex_w && op == 0x98 {
+        return Ok((vec![Instr { op: VOp::Nop, ..Default::default() }], rest_off + 1));
+    }
 
     Err("x86_64 指令未实现")
 }
