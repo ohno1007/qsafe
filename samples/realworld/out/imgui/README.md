@@ -44,21 +44,34 @@ adb logcat -d | tail -100
 adb shell "ls -la /data/tombstones/ | tail -3"
 ```
 
-## 加固指标
+## 加固指标（hybrid mode v2）
 
 ```
-原始:        2,714,304 字节
-加固:        7,721,576 字节  (+184%)
-函数发现:    3,315 个（来自 .eh_frame_hdr 挖掘，因二进制 stripped）
-VMP 保护:    3,155 个 (95%)
-跳过保护:    159 个（Trap 占比 > 30%，保留 native，避免运行时崩）
-字节码池:    4,951,749 字节（含 per-region IV salt 加密）
-新 segment:  vaddr 0x2ab000  size 5,005,312
-跳板偏移:    0 BranchTooFar 错误
-段名剥离:    .shstrtab 260 字节清零
-Payload:    用 ELF header 派生 key 二次 keystream 加密
-ELF 类型:   DYN (PIE) ARM64 — 与原文件一致，readelf 验证通过
+原始:           2,714,304 字节
+加固:           7,918,184 字节  (+192%)
+函数发现:       3,315 个（来自 .eh_frame_hdr 挖掘，因二进制 stripped）
+VMP 保护:       3,314 个 (99.97%)  ← hybrid mode 让 lift 不认识的指令也进 VM
+跳过保护:       1 个（.eh_frame_hdr 边界异常导致 lift 越界）
+hybrid 指令:    33,904 条原 ARM 指令走 RWX thunk 通道（VM 内嵌 native island）
+字节码池:       5,145,297 字节（含 per-region IV salt 加密）
+新 segment:     vaddr 0x2ab000  size 5,201,920
+跳板偏移:       0 BranchTooFar 错误
+段名剥离:       .shstrtab 260 字节清零
+Payload:        用 ELF header 派生 key 二次 keystream 加密
+ELF 类型:       DYN (PIE) ARM64 — 与原文件一致，readelf 验证通过
 ```
+
+## Hybrid mode 工作原理
+
+lifter 遇到自己不认识的指令（NEON DUP/SHL imm 子集、TBL、CRC32、AES/SHA 等）
+不再 Trap，而是 emit `VOp::NativeExec(raw_4_bytes)`。运行时由 cdylib 的
+`HostBridge::native_exec` 把 VM 状态拷到真实 ARM 寄存器，在 RWX thunk 内跑那一条
+原指令，再拷回。整个函数仍在 VM 内执行，BRK 跳板不变。
+
+性能影响：每条 NativeExec ≈ 100-200 ns（reg save/restore + cache flush + 1 inst）。
+imgui 的 33,904 条 NativeExec 加起来 ≈ 5 ms 总开销（一次完整跑），可接受。
+
+可关：`vmp protect ... --no-hybrid` 退化为旧的 skip-on-trap 行为。
 
 ## 已嵌入的 magic blob
 

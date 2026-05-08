@@ -136,4 +136,25 @@ pub trait HostBridge {
     fn map_data(&mut self, _vaddr: u64, _bytes: &[u8], _prot: u8) -> Result<()> {
         Ok(())
     }
+
+    /// 混合执行：让宿主在真实 ARM 寄存器上跑一条原 native 指令。
+    ///
+    /// `raw_instr` = 4 字节原始 ARM 指令字节（little-endian u32）；`gpr` / `fpr` /
+    /// `nzcv` 是入参出参（双向）：宿主把 VM 的 X0..X30 / V0..V31 / NZCV 拷到
+    /// 真实寄存器，跑指令，再拷回。
+    ///
+    /// 默认实现 = 拒绝（返回 Err）。LinuxHost 在 aarch64 上提供真实实现：
+    /// - 维护一个 RWX thunk 页
+    /// - 模板：load regs → 执行 raw_instr（patch 进 thunk）→ save regs → ret
+    /// - 不能跨指令边界（PC 相关指令、syscall 等不能这条路；那些 lifter 必须解码）
+    fn native_exec(
+        &mut self,
+        raw_instr: u32,
+        gpr: &mut [u64; 31],
+        fpr: &mut [u128; 32],
+        nzcv: &mut u32,
+    ) -> Result<()> {
+        let _ = (raw_instr, gpr, fpr, nzcv);
+        Err(vmp_core::Error::vm("E:hybrid-not-supported"))
+    }
 }

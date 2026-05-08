@@ -55,6 +55,11 @@ enum Cmd {
         /// 调成 100 即"任何函数都强行保护，不顾 Trap"——只在调试 lifter 时用。
         #[arg(long, default_value_t = 30)]
         skip_trap_pct: u32,
+        /// 关闭 hybrid mode（默认开）：未识别指令将 emit Trap 而非 NativeExec。
+        /// hybrid mode 让运行时把不认识的指令丢回 RWX thunk 跑原生 → 函数保护率
+        /// 接近 100%，代价是命中 NativeExec 的指令性能差 5-10×（但仍在 VM 内）。
+        #[arg(long, default_value_t = false)]
+        no_hybrid: bool,
     },
     /// 直接 lift 一段裸字节码（hex 或文件），用于调试 lifter
     Lift {
@@ -181,7 +186,7 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
 
     match cli.cmd {
-        Cmd::Protect { input, output, level, seed, only, exclude, skip_trap_pct } => {
+        Cmd::Protect { input, output, level, seed, only, exclude, skip_trap_pct, no_hybrid } => {
             let bytes = fs::read(&input).with_context(|| format!("读取 {}", input.display()))?;
             let obj = vmp_loader::load(bytes)?;
             log::info!(
@@ -228,7 +233,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 let func_bytes = &region.bytes[off..end];
 
-                match vmp_arch::lift(obj.arch, func_bytes, sym.vaddr) {
+                match vmp_arch::lift_opts(obj.arch, func_bytes, sym.vaddr, !no_hybrid) {
                     Ok(lifted) => {
                         let total = lifted.report.total_input.max(1);
                         let trap_pct = lifted.report.skipped * 100 / total;
@@ -242,20 +247,22 @@ fn main() -> anyhow::Result<()> {
                             trap_pct,
                             lifted.report.notes.len()
                         );
-                        // skip-trap-pct 阈值：lift Trap 占比超过阈值就放弃保护，
-                        // 保留原 native 实现 —— 避免运行时 dispatch_vm 命中 Trap 退出。
-                        // Paranoid 永远 skip-on-any-trap（>0 即弃）；其它级别按阈值。
-                        let trap_threshold = if proto_level == ProtectLevel::Paranoid {
-                            0
-                        } else {
-                            skip_trap_pct as usize
-                        };
-                        if trap_pct > trap_threshold {
-                            log::warn!(
-                                "跳过 {}：Trap 占比 {}% > 阈值 {}%",
-                                sym.name, trap_pct, trap_threshold
-                            );
-                            continue;
+                        // skip-trap-pct 阈值：仅当 hybrid mode 关闭时才生效。
+                        // hybrid mode 开启时所有"不认识的指令"由 host 跑原生，
+                        // 不会有 Trap 退出，全函数都能保护。
+                        if no_hybrid {
+                            let trap_threshold = if proto_level == ProtectLevel::Paranoid {
+                                0
+                            } else {
+                                skip_trap_pct as usize
+                            };
+                            if trap_pct > trap_threshold {
+                                log::warn!(
+                                    "跳过 {}：Trap 占比 {}% > 阈值 {}%（关 hybrid 时）",
+                                    sym.name, trap_pct, trap_threshold
+                                );
+                                continue;
+                            }
                         }
                         funcs.push(FunctionRegion {
                             name: sym.name.clone(),

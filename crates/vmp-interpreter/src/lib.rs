@@ -602,6 +602,83 @@ impl<'a> Interpreter<'a> {
                     );
                 }
 
+                // ==== NEON 扩展（DUP / SHL imm）====
+                VOp::VDupG => {
+                    let v = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    self.state.fregs[instr.rd as usize & 31] =
+                        broadcast_lane(v, instr.width, instr.lane,
+                                       self.state.fregs[instr.rd as usize & 31]);
+                }
+                VOp::VDupE => {
+                    let src = self.state.fregs[instr.rs as usize & 31];
+                    let lane_bytes = instr.width.bytes();
+                    let src_idx = instr.imm as usize;
+                    let v = (src >> (src_idx * lane_bytes * 8)) as u64 & instr.width.mask();
+                    self.state.fregs[instr.rd as usize & 31] =
+                        broadcast_lane(v, instr.width, instr.lane,
+                                       self.state.fregs[instr.rd as usize & 31]);
+                }
+                VOp::VShlI => {
+                    let src = self.state.fregs[instr.rs as usize & 31];
+                    let shift = instr.imm as u32 & 63;
+                    let lane_bytes = instr.width.bytes();
+                    let lc = instr.lane as usize;
+                    let mut out: u128 = 0;
+                    for i in 0..lc {
+                        let off = (i * lane_bytes * 8) as u32;
+                        let lane = ((src >> off) as u64) & instr.width.mask();
+                        let r = match instr.cond {
+                            Cond::Eq => lane.wrapping_shl(shift) & instr.width.mask(),
+                            Cond::Ne => lane.wrapping_shr(shift),
+                            Cond::Mi => {
+                                let bits = (instr.width.bytes() * 8) as u32;
+                                let signed = ((lane << (64 - bits)) as i64) >> (64 - bits);
+                                ((signed >> shift) as u64) & instr.width.mask()
+                            }
+                            _ => lane,
+                        };
+                        out |= (r as u128) << off;
+                    }
+                    let total_bytes = lane_bytes * lc;
+                    let used_mask = if total_bytes >= 16 {
+                        u128::MAX
+                    } else {
+                        (1u128 << (total_bytes * 8)) - 1
+                    };
+                    let prev = self.state.fregs[instr.rd as usize & 31];
+                    self.state.fregs[instr.rd as usize & 31] =
+                        (prev & !used_mask) | (out & used_mask);
+                }
+
+                // ==== Hybrid mode：原 ARM 指令交宿主跑 ====
+                VOp::NativeExec => {
+                    let raw = instr.imm as u32;
+                    // VM regs → [u64; 31]（X0..X30）
+                    let mut gpr = [0u64; 31];
+                    for i in 0..31 {
+                        gpr[i] = self.state.regs[i];
+                    }
+                    let mut fpr = self.state.fregs;
+                    let mut nzcv: u32 = 0;
+                    if self.state.flags.n { nzcv |= 1 << 31; }
+                    if self.state.flags.z { nzcv |= 1 << 30; }
+                    if self.state.flags.c { nzcv |= 1 << 29; }
+                    if self.state.flags.v { nzcv |= 1 << 28; }
+
+                    match self.host.as_deref_mut() {
+                        Some(h) => h.native_exec(raw, &mut gpr, &mut fpr, &mut nzcv)?,
+                        None => return Err(Error::vm("E:hybrid-no-host")),
+                    }
+                    for i in 0..31 {
+                        self.state.regs[i] = gpr[i];
+                    }
+                    self.state.fregs = fpr;
+                    self.state.flags.n = (nzcv >> 31) & 1 != 0;
+                    self.state.flags.z = (nzcv >> 30) & 1 != 0;
+                    self.state.flags.c = (nzcv >> 29) & 1 != 0;
+                    self.state.flags.v = (nzcv >> 28) & 1 != 0;
+                }
+
                 // ==== CCMP ====
                 VOp::Ccmp => {
                     if self.state.flags.matches(instr.cond) {
@@ -756,6 +833,24 @@ fn vec_op(
     };
     let _ = mask;
     (a & !used_mask) | (out & used_mask)
+}
+
+/// 把一个 lane 值广播到向量的所有 lane（VDupG / VDupE 共用）。
+fn broadcast_lane(v: u64, width: Width, lane_count: u8, prev: u128) -> u128 {
+    let lane_bytes = width.bytes();
+    let lc = lane_count as usize;
+    let mut out: u128 = 0;
+    for i in 0..lc {
+        let shift = (i * lane_bytes * 8) as u32;
+        out |= (v as u128) << shift;
+    }
+    let total_bytes = lane_bytes * lc;
+    let used_mask = if total_bytes >= 16 {
+        u128::MAX
+    } else {
+        (1u128 << (total_bytes * 8)) - 1
+    };
+    (prev & !used_mask) | (out & used_mask)
 }
 
 /// NEON 浮点向量逐 lane 运算。`width` = 单 lane 宽度（W32 单精度 / W64 双精度）；

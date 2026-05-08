@@ -19,6 +19,10 @@ use vmp_isa::{Cond, Instr, VOp, Width};
 #[derive(Default)]
 pub struct Arm64Lifter {
     pub strict: bool,
+    /// Hybrid mode：未识别指令 emit `VOp::NativeExec(raw)` 而不是 `VOp::Trap`。
+    /// 让运行时 host bridge 在 RWX thunk 里跑原 ARM 指令，VM 跑完整函数语义。
+    /// 默认 true（启用 hybrid）。strict=true 时仍然 Err 出去。
+    pub hybrid: bool,
 }
 
 impl Lifter for Arm64Lifter {
@@ -51,14 +55,28 @@ impl Lifter for Arm64Lifter {
                     if self.strict {
                         return Err(Error::lift(base + (i as u64) * 4, msg));
                     }
-                    report.skipped += 1;
-                    report.notes.push(format!(
-                        "@{:#x}: 未支持指令 0x{:08x} ({})",
-                        base + (i as u64) * 4,
-                        raw,
-                        msg
-                    ));
-                    ir.push(Instr { op: VOp::Trap, ..Default::default() });
+                    if self.hybrid {
+                        // Hybrid 兜底：emit NativeExec(raw)，运行时由 host 在
+                        // RWX thunk 中真实执行。函数仍被保护（字节码不变），
+                        // 只是这一条走 native 通道。
+                        report.skipped += 1; // 保留 skipped 计数 → 诊断用
+                        report.notes.push(format!(
+                            "@{:#x}: hybrid native_exec 0x{:08x} ({})",
+                            base + (i as u64) * 4, raw, msg
+                        ));
+                        ir.push(Instr {
+                            op: VOp::NativeExec,
+                            imm: raw as i64,
+                            ..Default::default()
+                        });
+                    } else {
+                        report.skipped += 1;
+                        report.notes.push(format!(
+                            "@{:#x}: 未支持指令 0x{:08x} ({})",
+                            base + (i as u64) * 4, raw, msg
+                        ));
+                        ir.push(Instr { op: VOp::Trap, ..Default::default() });
+                    }
                 }
             }
         }

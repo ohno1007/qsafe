@@ -16,11 +16,16 @@ pub use lifter::{LiftReport, LiftedFunction, Lifter};
 
 use vmp_core::{Arch, Result};
 
-/// 工厂：根据架构返回对应 lifter 实例。
+/// 工厂：根据架构返回对应 lifter 实例。`hybrid=true` 让 ARM64 lifter 在未识别
+/// 指令时 emit `VOp::NativeExec`（运行时走 RWX thunk）而不是 `VOp::Trap`。
 pub fn make_lifter(arch: Arch) -> Result<Box<dyn Lifter>> {
+    make_lifter_opts(arch, true)
+}
+
+pub fn make_lifter_opts(arch: Arch, hybrid: bool) -> Result<Box<dyn Lifter>> {
     match arch {
         #[cfg(feature = "arm64")]
-        Arch::Arm64 => Ok(Box::new(arm64::Arm64Lifter::default())),
+        Arch::Arm64 => Ok(Box::new(arm64::Arm64Lifter { strict: false, hybrid })),
         #[cfg(feature = "arm32")]
         Arch::Arm32 => Ok(Box::new(arm32::Arm32Lifter::default())),
         #[cfg(feature = "x86_64")]
@@ -32,5 +37,10 @@ pub fn make_lifter(arch: Arch) -> Result<Box<dyn Lifter>> {
 /// 短便利包装：让外部调用方拿到 lifter 后直接 lift。
 pub fn lift(arch: Arch, code: &[u8], base: u64) -> Result<LiftedFunction> {
     let mut lifter = make_lifter(arch)?;
+    lifter.lift(code, base)
+}
+
+pub fn lift_opts(arch: Arch, code: &[u8], base: u64, hybrid: bool) -> Result<LiftedFunction> {
+    let mut lifter = make_lifter_opts(arch, hybrid)?;
     lifter.lift(code, base)
 }

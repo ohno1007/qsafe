@@ -287,6 +287,25 @@ pub enum VOp {
     VFSub = 171,
     VFMul = 172,
     VFDiv = 173,
+
+    // ---- NEON 扩展（Phase 8：DUP / SHL / USHR / SSHR）----
+    /// Vector duplicate from GPR to all lanes：vreg[Rd].lane[i] = regs[Rs] (truncated to width)
+    /// 编码：r2 (rd vreg, rs gpr) + width(lane size) + lane(lane count)
+    VDupG = 180,
+    /// Vector duplicate from vreg element：vreg[Rd].lane[i] = vreg[Rs].lane[lane_index]
+    /// lane 字段编码 lane_count；imm 字段编码 source lane index
+    VDupE = 181,
+    /// Vector shift immediate：left if cond=Eq, unsigned right if cond=Ne, signed right if cond=Mi
+    /// imm 字段携带 shift amount
+    VShlI = 182,
+
+    // ---- 混合执行（hybrid mode）----
+    /// 原 ARM 指令直接交宿主执行：lifter 不认识的指令默认走这条；
+    /// imm 字段编码 4-byte 原始指令；运行时 host bridge 在 RWX thunk 里把当前 VM
+    /// 状态拷到真实寄存器、跑原指令、再拷回。等价于"VM 内嵌 native island"。
+    /// 性能比 lifted 路径慢 5-10×（每条指令一次完整 reg save/restore），但能让
+    /// 任何二进制都 100% 保护，不再有 lift skip。
+    NativeExec = 200,
 }
 
 pub const VOP_COUNT: usize = 64; // 上限；实际枚举值不超过此数
@@ -365,6 +384,10 @@ impl VOp {
             171 => VOp::VFSub,
             172 => VOp::VFMul,
             173 => VOp::VFDiv,
+            180 => VOp::VDupG,
+            181 => VOp::VDupE,
+            182 => VOp::VShlI,
+            200 => VOp::NativeExec,
             _ => return None,
         };
         Some(result)
@@ -442,6 +465,10 @@ impl VOp {
             VOp::VFSub,
             VOp::VFMul,
             VOp::VFDiv,
+            VOp::VDupG,
+            VOp::VDupE,
+            VOp::VShlI,
+            VOp::NativeExec,
         ]
     }
 }
@@ -540,6 +567,10 @@ impl VOp {
             VOp::VFSub => "VFSub",
             VOp::VFMul => "VFMul",
             VOp::VFDiv => "VFDiv",
+            VOp::VDupG => "VDupG",
+            VOp::VDupE => "VDupE",
+            VOp::VShlI => "VShlI",
+            VOp::NativeExec => "NativeExec",
         }
     }
 }

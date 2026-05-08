@@ -1150,6 +1150,110 @@ fn decode_simd_fp(raw: u32) -> Result<Vec<Instr>, &'static str> {
         }]);
     }
 
+    // ---- Advanced SIMD copy (DUP general / DUP element / INS) ----
+    //   DUP (element): 0|Q|0|01110000|imm5|0_0_0_0_0|1|Rn|Rd
+    //   DUP (general): 0|Q|0|01110000|imm5|0_0_0_0_1|1|Rn|Rd
+    //   imm5 编码 lane size + index：
+    //     imm5[0]=1 → 8B/16B  (lane_size=W8, index = imm5[4:1])
+    //     imm5[1]=1 → 4H/8H   (lane_size=W16, index = imm5[4:2])
+    //     imm5[2]=1 → 2S/4S   (lane_size=W32, index = imm5[4:3])
+    //     imm5[3]=1 → 2D/1D   (lane_size=W64, index = imm5[4])
+    if (raw >> 24) & 0x9F == 0b00001110 && (raw >> 21) & 1 == 0 && (raw >> 10) & 0x1 == 1
+        && (raw >> 11) & 0x1F == 0b00000  // opcode bits 14:11 = 0000
+    {
+        let q = (raw >> 30) & 1;
+        let imm5 = (raw >> 16) & 0x1F;
+        let from_gpr = (raw >> 11) & 0x1 == 0; // bit11: 0=DupG, 1=DupE   注：实际是 op bit 11 见手册
+        let _ = from_gpr;
+        let opc2 = (raw >> 11) & 0xF; // bits 14:11
+        let rn = ((raw >> 5) & 0x1F) as u8;
+        let rd = (raw & 0x1F) as u8;
+        // 解析 lane size / source index
+        let (lane_size, src_idx_shift_bits) = if imm5 & 1 == 1 {
+            (Width::W8, 1u32)
+        } else if imm5 & 2 == 2 {
+            (Width::W16, 2u32)
+        } else if imm5 & 4 == 4 {
+            (Width::W32, 3u32)
+        } else if imm5 & 8 == 8 {
+            (Width::W64, 4u32)
+        } else {
+            return Err("SIMD DUP imm5 = 0 reserved");
+        };
+        let total_bytes = if q == 1 { 16 } else { 8 };
+        let lane_count = (total_bytes / lane_size.bytes()) as u8;
+        let src_idx = (imm5 >> src_idx_shift_bits) as i64;
+
+        return Ok(vec![match opc2 {
+            // DUP (element)：opcode = 0000，bit10=1 已覆盖；bit11 区分 elem vs gen
+            // 简化：仅识别 opcode=0000；用 bit11 = 1 → element form
+            0b0001 => Instr {
+                op: VOp::VDupG, rd, rs: rn,
+                width: lane_size, lane: lane_count,
+                ..Default::default()
+            },
+            0b0000 => Instr {
+                op: VOp::VDupE, rd, rs: rn,
+                width: lane_size, lane: lane_count, imm: src_idx,
+                ..Default::default()
+            },
+            _ => return Err("SIMD copy opcode 子类未实现"),
+        }]);
+    }
+
+    // ---- Advanced SIMD shift by immediate ----
+    //   0|Q|U|011110|immh|immb|opcode|1|Rn|Rd
+    //   immh != 0；esize = 2 ^ (3 + clz(immh))；shift = (immh:immb) - esize  (left)
+    //                                          shift = 2*esize - (immh:immb) (right)
+    //   opcode = 00000 → SHL; 00001 → SQSHL; 00100 → SHRN/RSHRN/SQSHRN; ...
+    if (raw >> 24) & 0x9F == 0b00011110 && (raw >> 23) & 0x1 == 0 && (raw >> 10) & 1 == 1 {
+        let q = (raw >> 30) & 1;
+        let u = (raw >> 29) & 1;
+        let immh = (raw >> 19) & 0xF;
+        let immb = (raw >> 16) & 0x7;
+        let opcode = (raw >> 11) & 0x1F;
+        let rn = ((raw >> 5) & 0x1F) as u8;
+        let rd = (raw & 0x1F) as u8;
+        if immh == 0 {
+            return Err("SIMD shift-imm immh=0 reserved（应走 SIMD modified imm）");
+        }
+        let lane_size = if immh & 0b1000 != 0 {
+            Width::W64
+        } else if immh & 0b0100 != 0 {
+            Width::W32
+        } else if immh & 0b0010 != 0 {
+            Width::W16
+        } else {
+            Width::W8
+        };
+        let esize = (lane_size.bytes() * 8) as i64;
+        let total_bytes = if q == 1 { 16 } else { 8 };
+        let lane_count = (total_bytes / lane_size.bytes()) as u8;
+        let immh_immb = ((immh << 3) | immb) as i64;
+        match (u, opcode) {
+            (0, 0b00000) => {
+                // SHL：shift = (immh:immb) - esize
+                let shift = immh_immb - esize;
+                return Ok(vec![Instr {
+                    op: VOp::VShlI, rd, rs: rn, width: lane_size, lane: lane_count,
+                    cond: vmp_isa::Cond::Eq, imm: shift,
+                    ..Default::default()
+                }]);
+            }
+            (1, 0b00000) => {
+                // USHR：shift = 2*esize - (immh:immb)；右移无符号
+                let shift = 2 * esize - immh_immb;
+                return Ok(vec![Instr {
+                    op: VOp::VShlI, rd, rs: rn, width: lane_size, lane: lane_count,
+                    cond: vmp_isa::Cond::Ne, imm: shift,
+                    ..Default::default()
+                }]);
+            }
+            (0, 0b00000_010_0) => {} // 占位避免编译警告
+            _ => return Err("SIMD shift-imm opcode 未实现"),
+        }
+    }
+
     // ---- Advanced SIMD three same: integer 向量 ADD / SUB ----
     //   0 Q U 01110 size 1 Rm opcode 1 Rn Rd
     //   opcode = 10000 → ADD（U=0）/ SUB（U=1）

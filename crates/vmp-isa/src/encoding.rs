@@ -236,6 +236,25 @@ impl Instr {
 
             // NEON FP 向量：r3w + lane（width=W32 单 / W64 双；lane=2/4）
             VOp::VFAdd | VOp::VFSub | VOp::VFMul | VOp::VFDiv => Layout::r3wl(),
+
+            // VDupG: rd(vreg) + rs(gpr) + width + lane
+            VOp::VDupG => Layout {
+                has_rd: true, has_rs: true, has_rt: false,
+                has_width: true, has_cond: false, imm_bytes: 0, has_lane: true,
+            },
+            // VDupE: rd(vreg) + rs(vreg) + width + lane + imm32(source lane index)
+            VOp::VDupE => Layout {
+                has_rd: true, has_rs: true, has_rt: false,
+                has_width: true, has_cond: false, imm_bytes: 4, has_lane: true,
+            },
+            // VShlI: rd + rs + width + lane + cond(direction) + imm32(shift amount)
+            VOp::VShlI => Layout {
+                has_rd: true, has_rs: true, has_rt: false,
+                has_width: true, has_cond: true, imm_bytes: 4, has_lane: true,
+            },
+
+            // NativeExec: imm32 = 4-byte 原 ARM 指令；不需要寄存器字段（VmState 由 host 直接读写）
+            VOp::NativeExec => Layout::i32_only(),
         }
     }
 
