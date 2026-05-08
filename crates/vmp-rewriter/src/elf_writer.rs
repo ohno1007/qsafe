@@ -164,6 +164,15 @@ fn vaddr_to_file_off(elf_bytes: &[u8], vaddr: u64) -> Option<usize> {
 
 /// 复制原 program header table 到文件末尾，并追加一个新的 PT_LOAD 条目。
 /// 同时把 ELF header 中的 `e_phoff` / `e_phnum` 更新指向新位置。
+///
+/// 关键点（早期版本踩坑）：
+/// - PHDR table 移动后，原 `PT_PHDR` 条目里 `p_offset` / `p_vaddr` / `p_filesz`
+///   指向旧位置；Android linker64 的 `FindPhdr()` 依赖该条目，链接器报
+///   "Could not find a PHDR: broken executable" 然后 abort 即源于此。必须把
+///   `PT_PHDR` 条目改写到新位置。
+/// - 新 PHDR table 必须落在某个 PT_LOAD 的 file/vaddr 范围内（否则它根本不会
+///   被 mmap 到内存里，PT_PHDR.vaddr 验证失败）。我们把新 PHDR table 直接接在
+///   新 LOAD segment 后面，并把该 segment 的 `p_filesz`/`p_memsz` 延伸覆盖之。
 fn add_load_phdr(
     out: &mut Vec<u8>,
     seg_file_off: usize,
@@ -171,6 +180,7 @@ fn add_load_phdr(
     seg_size: usize,
 ) -> Result<()> {
     use goblin::elf::Elf;
+    use goblin::elf::program_header::{PT_LOAD, PT_PHDR};
     let elf = Elf::parse(&out[..]).map_err(|e| RewriteError::Parse(e.to_string()))?;
     if !elf.is_64 {
         return Err(RewriteError::Unsupported);
@@ -178,38 +188,59 @@ fn add_load_phdr(
     let phentsize = elf.header.e_phentsize as usize;
     let old_phoff = elf.header.e_phoff as usize;
     let old_phnum = elf.header.e_phnum as usize;
-    let old_phdr_bytes = out[old_phoff..old_phoff + old_phnum * phentsize].to_vec();
+    let mut phdr_bytes = out[old_phoff..old_phoff + old_phnum * phentsize].to_vec();
 
-    // 在文件末尾对齐 8 字节，然后写入旧 phdr + 新 phdr 项
+    let new_phnum = old_phnum + 1;
+    let new_phdr_total = new_phnum * phentsize;
+
+    // 在文件末尾对齐 8 字节，然后写入修改后的旧 phdr + 新 phdr 项
     while out.len() % 8 != 0 {
         out.push(0);
     }
     let new_phoff = out.len();
-    out.extend_from_slice(&old_phdr_bytes);
 
-    // 构造新 PT_LOAD entry (Elf64_Phdr, 56 字节)
+    // 新 PHDR table 的虚拟地址：落在新 LOAD segment 内部
+    let new_phdr_vaddr = seg_vaddr + (new_phoff as u64 - seg_file_off as u64);
+
+    // 改写 phdr_bytes 里的 PT_PHDR 条目
+    for i in 0..old_phnum {
+        let off = i * phentsize;
+        let p_type = LittleEndian::read_u32(&phdr_bytes[off..off + 4]);
+        if p_type == PT_PHDR {
+            LittleEndian::write_u64(&mut phdr_bytes[off + 8..off + 16], new_phoff as u64);
+            LittleEndian::write_u64(&mut phdr_bytes[off + 16..off + 24], new_phdr_vaddr);
+            LittleEndian::write_u64(&mut phdr_bytes[off + 24..off + 32], new_phdr_vaddr);
+            LittleEndian::write_u64(&mut phdr_bytes[off + 32..off + 40], new_phdr_total as u64);
+            LittleEndian::write_u64(&mut phdr_bytes[off + 40..off + 48], new_phdr_total as u64);
+            break;
+        }
+    }
+
+    // 新 LOAD 条目 —— filesz/memsz 延伸到 PHDR table 末尾
+    let extended_seg_size = (new_phoff + new_phdr_total) - seg_file_off;
     let mut entry = [0u8; 56];
-    LittleEndian::write_u32(&mut entry[0..4], goblin::elf::program_header::PT_LOAD);
+    LittleEndian::write_u32(&mut entry[0..4], PT_LOAD);
     // p_flags: PF_R | PF_X (可读 + 可执行)
     LittleEndian::write_u32(&mut entry[4..8], 0x4 | 0x1);
     LittleEndian::write_u64(&mut entry[8..16], seg_file_off as u64);
     LittleEndian::write_u64(&mut entry[16..24], seg_vaddr);
-    LittleEndian::write_u64(&mut entry[24..32], seg_vaddr); // p_paddr
-    LittleEndian::write_u64(&mut entry[32..40], seg_size as u64); // p_filesz
-    LittleEndian::write_u64(&mut entry[40..48], seg_size as u64); // p_memsz
-    LittleEndian::write_u64(&mut entry[48..56], 0x1000); // p_align
+    LittleEndian::write_u64(&mut entry[24..32], seg_vaddr);
+    LittleEndian::write_u64(&mut entry[32..40], extended_seg_size as u64);
+    LittleEndian::write_u64(&mut entry[40..48], extended_seg_size as u64);
+    LittleEndian::write_u64(&mut entry[48..56], 0x1000);
     if entry.len() != phentsize {
-        // 不匹配（理论上 64-bit 永远是 56 字节）
         return Err(RewriteError::Internal(format!(
             "phentsize 不匹配: {} vs {}",
             phentsize,
             entry.len()
         )));
     }
+
+    out.extend_from_slice(&phdr_bytes);
     out.extend_from_slice(&entry);
 
-    // 更新 ELF header 中的 e_phoff (offset 0x20, 8 bytes) + e_phnum (offset 0x38, 2 bytes)
+    // 更新 ELF header：e_phoff (offset 0x20, 8B) + e_phnum (offset 0x38, 2B)
     LittleEndian::write_u64(&mut out[0x20..0x28], new_phoff as u64);
-    LittleEndian::write_u16(&mut out[0x38..0x3A], (old_phnum + 1) as u16);
+    LittleEndian::write_u16(&mut out[0x38..0x3A], new_phnum as u16);
     Ok(())
 }
