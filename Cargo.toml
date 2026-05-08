@@ -29,6 +29,7 @@ rand_chacha = "0.3"
 byteorder = "1.5"
 clap = { version = "4.5", features = ["derive"] }
 goblin = "0.8"
+gimli = { version = "0.30", default-features = false, features = ["read", "std"] }
 log = "0.4"
 env_logger = "0.11"
 sha2 = "0.10"

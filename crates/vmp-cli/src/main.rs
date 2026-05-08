@@ -50,6 +50,12 @@ enum Cmd {
         /// 排除这些函数
         #[arg(long)]
         exclude: Vec<String>,
+        /// 跳过 lift 报告含 skipped/Trap 的函数（保留原生执行，避免运行时 Trap）
+        #[arg(long, default_value_t = true)]
+        skip_traps: bool,
+        /// 函数大小上限（字节）；超出则跳过 lift（默认 0 = 无限制）
+        #[arg(long, default_value_t = 0u64)]
+        max_func_size: u64,
     },
     /// 直接 lift 一段裸字节码（hex 或文件），用于调试 lifter
     Lift {
@@ -157,7 +163,7 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
 
     match cli.cmd {
-        Cmd::Protect { input, output, level, seed, only, exclude } => {
+        Cmd::Protect { input, output, level, seed, only, exclude, skip_traps, max_func_size } => {
             let bytes = fs::read(&input).with_context(|| format!("读取 {}", input.display()))?;
             let obj = vmp_loader::load(bytes)?;
             log::info!(
@@ -186,11 +192,17 @@ fn main() -> anyhow::Result<()> {
 
             // 第一遍：lift 每个候选函数到 IR（branch imm 仍是绝对地址）。
             let mut funcs: Vec<FunctionRegion> = Vec::new();
+            let mut skipped_size = 0usize;
+            let mut skipped_traps = 0usize;
             for sym in &obj.symbols {
                 if !cfg.exclude_funcs.is_empty() && cfg.exclude_funcs.iter().any(|n| n == &sym.name) {
                     continue;
                 }
                 if !cfg.include_funcs.is_empty() && !cfg.include_funcs.iter().any(|n| n == &sym.name) {
+                    continue;
+                }
+                if max_func_size > 0 && sym.size > max_func_size {
+                    skipped_size += 1;
                     continue;
                 }
                 let region = match obj.code.iter().find(|r| r.contains(sym.vaddr)) {
@@ -206,7 +218,7 @@ fn main() -> anyhow::Result<()> {
 
                 match vmp_arch::lift(obj.arch, func_bytes, sym.vaddr) {
                     Ok(lifted) => {
-                        log::info!(
+                        log::debug!(
                             "lift {} @ {:#x}  in={} out_ir={} skipped={} notes={}",
                             sym.name,
                             sym.vaddr,
@@ -215,8 +227,10 @@ fn main() -> anyhow::Result<()> {
                             lifted.report.skipped,
                             lifted.report.notes.len()
                         );
-                        if lifted.report.skipped > 0 && proto_level == ProtectLevel::Paranoid {
-                            log::warn!("paranoid 模式跳过含未支持指令的 {}", sym.name);
+                        if lifted.report.skipped > 0
+                            && (skip_traps || proto_level == ProtectLevel::Paranoid)
+                        {
+                            skipped_traps += 1;
                             continue;
                         }
                         funcs.push(FunctionRegion {
@@ -230,6 +244,13 @@ fn main() -> anyhow::Result<()> {
                     Err(e) => log::warn!("lift 失败 {}: {}", sym.name, e),
                 }
             }
+            log::info!(
+                "lift summary: kept={} skipped_traps={} skipped_size={} (of {} candidates)",
+                funcs.len(),
+                skipped_traps,
+                skipped_size,
+                obj.symbols.len()
+            );
 
             // 第二遍：全局多函数解析 —— BL <另一个被保护函数> 转为 CallRegion，
             // 函数内部分支转 IR 索引，无法解析的目标占位 Trap。

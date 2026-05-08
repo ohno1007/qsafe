@@ -7,4 +7,5 @@ license.workspace = true
 [dependencies]
 vmp-core.workspace = true
 goblin.workspace = true
+gimli.workspace = true
 log.workspace = true
