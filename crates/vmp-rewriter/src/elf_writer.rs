@@ -193,7 +193,8 @@ fn add_load_phdr(
     let new_phnum = old_phnum + 1;
     let new_phdr_total = new_phnum * phentsize;
 
-    // 在文件末尾对齐 8 字节，然后写入修改后的旧 phdr + 新 phdr 项
+    // 把 PHDR table 放在新 LOAD segment 内部、紧接现有 trampolines+blob 之后。
+    // 对齐到 8 字节就够了（PHDR 自身要求 alignof(Elf64_Phdr) = 8）；不需要页对齐。
     while out.len() % 8 != 0 {
         out.push(0);
     }
@@ -216,12 +217,15 @@ fn add_load_phdr(
         }
     }
 
-    // 新 LOAD 条目 —— filesz/memsz 延伸到 PHDR table 末尾
-    let extended_seg_size = (new_phoff + new_phdr_total) - seg_file_off;
+    // 1) 写 PHDR table（旧 phdrs + 新 LOAD entry）
+    // 2) 向上 page-pad 文件，让 PHDR table 完整落在 page-aligned 段内
+    // 3) 新 LOAD entry 的 filesz/memsz 延伸覆盖 padding 后整个范围
+    let raw_end = new_phoff + new_phdr_total;
+    let aligned_end = (raw_end + 0xFFF) & !0xFFF;
+    let extended_seg_size = aligned_end - seg_file_off;
     let mut entry = [0u8; 56];
     LittleEndian::write_u32(&mut entry[0..4], PT_LOAD);
-    // p_flags: PF_R | PF_X (可读 + 可执行)
-    LittleEndian::write_u32(&mut entry[4..8], 0x4 | 0x1);
+    LittleEndian::write_u32(&mut entry[4..8], 0x4 | 0x1); // PF_R | PF_X
     LittleEndian::write_u64(&mut entry[8..16], seg_file_off as u64);
     LittleEndian::write_u64(&mut entry[16..24], seg_vaddr);
     LittleEndian::write_u64(&mut entry[24..32], seg_vaddr);
@@ -236,8 +240,13 @@ fn add_load_phdr(
         )));
     }
 
+    // (1) PHDR table goes here, at new_phoff
     out.extend_from_slice(&phdr_bytes);
     out.extend_from_slice(&entry);
+    // (2) page-pad to aligned_end so the new LOAD's filesz lands on a page boundary
+    while out.len() < aligned_end {
+        out.push(0);
+    }
 
     // 更新 ELF header：e_phoff (offset 0x20, 8B) + e_phnum (offset 0x38, 2B)
     LittleEndian::write_u64(&mut out[0x20..0x28], new_phoff as u64);
