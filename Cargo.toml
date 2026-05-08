@@ -12,6 +12,7 @@ members = [
     "crates/vmp-cli",
     "crates/vmp-runtime",
     "crates/vmp-rewriter",
+    "crates/vmp-soruntime",
 ]
 
 [workspace.package]
