@@ -69,14 +69,16 @@ pub fn rewrite_elf(
     let (new_vaddr_base, page_align_u64) = next_load_vaddr(&loaded.raw)?;
     let page_align = page_align_u64 as usize;
 
-    // ---- 1. 在末尾对齐到 page 边界（同时也要让 (vaddr - file_off) % p_align == 0）----
-    // file offset 必须满足: (new_vaddr_base - file_off) % p_align == 0
-    // → file_off ≡ new_vaddr_base (mod p_align)
-    let target_off_mod = (new_vaddr_base as usize) & (page_align - 1);
-    while (out.len() & (page_align - 1)) != target_off_mod {
+    // ---- 1. 用 identity mapping (p_offset == p_vaddr) 放新 LOAD ----
+    // 之前用 file_offset = next-page (例如 0x298000) + vaddr = 0x2ac000，差
+    // 0x14000。Android 14+ 上某些 kernel/linker 路径用 `load_bias + e_phoff`
+    // 算 AT_PHDR (回退分支)，把 PHDR.p_offset 当 vaddr 用。这种情况下 vaddr
+    // 必须等于 file offset 否则 PHDR 读到错地方 → 通用 PIE error。
+    // 直接把文件 pad 到 new_vaddr_base，让接下来追加的内容 file_off == vaddr。
+    let new_segment_off = new_vaddr_base as usize;
+    while out.len() < new_segment_off {
         out.push(0);
     }
-    let new_segment_off = out.len();
 
     // ---- 2. 跳板表（每个 region 16 字节）----
     let trampoline_table_off = out.len();
