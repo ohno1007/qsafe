@@ -170,10 +170,14 @@ pub fn rewrite_elf(
     // ---- 4. 添加新 PT_LOAD program header（先把整个 phdr 复制到末尾再增加一条）----
     add_load_phdr(&mut out, new_segment_off, new_segment_vaddr, new_segment_size, page_align_u64)?;
 
-    // ---- 4b. 改写 INIT_ARRAY[0] 的 R_AARCH64_RELATIVE 让它先跑 bootstrap ----
+    // ---- 4b. 改写 ELF e_entry 让 bootstrap 在 _start 之前跑 ----
+    // (之前用 INIT_ARRAY[0] 劫持，但发现 dlopen 在主 exec 的 INIT_ARRAY 上下文
+    // 会触发 bionic 栈金丝雀 abort —— 大概率某个 thread-local 状态还没准备好。
+    // 改成 e_entry 劫持，bootstrap 在 NEEDED libs 的 init 都跑完之后、主 exec
+    // 的 _start 之前执行，dlopen 在这个时机是安全的。)
     if bootstrap_vaddr != 0 {
         init_array_vaddr_new =
-            patch_init_array_hijack(&mut out, &loaded.raw, bootstrap_vaddr, page_align_u64)?;
+            patch_e_entry_hijack(&mut out, &loaded.raw, bootstrap_vaddr, page_align_u64)?;
     }
 
     // ---- 5. 在每个 region 的 patch_addr 写 B <trampoline> ----
@@ -221,6 +225,79 @@ pub fn rewrite_elf(
     ))
 }
 
+/// Hijack ELF `e_entry` to point at a freshly-emitted shim that calls
+/// `bootstrap` and then tail-jumps to the original `_start`. The shim runs
+/// **before** the main exec's INIT_ARRAY (which is invoked from inside
+/// `_start` → `__libc_init`), so dlopen during bootstrap is safe.
+///
+/// Returns the shim's runtime vaddr (== new `e_entry`).
+fn patch_e_entry_hijack(
+    out: &mut Vec<u8>,
+    orig_elf: &[u8],
+    bootstrap_vaddr: u64,
+    page_align: u64,
+) -> Result<u64> {
+    use byteorder::{ByteOrder, LittleEndian};
+
+    let orig_entry = LittleEndian::read_u64(&orig_elf[0x18..0x20]);
+    if orig_entry == 0 {
+        return Err(RewriteError::Internal("orig e_entry is 0".into()));
+    }
+
+    // 4-byte align (need to be 4-byte aligned for ARM64 instructions)
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    let shim_file_off = out.len();
+    // Find the latest PT_LOAD to compute the shim's vaddr (identity-mapped).
+    let new_elf = goblin::elf::Elf::parse(out)
+        .map_err(|e| RewriteError::Parse(e.to_string()))?;
+    let mut last_load: Option<&goblin::elf::ProgramHeader> = None;
+    for ph in &new_elf.program_headers {
+        if ph.p_type == goblin::elf::program_header::PT_LOAD
+            && last_load.map_or(true, |p| ph.p_vaddr > p.p_vaddr)
+        {
+            last_load = Some(ph);
+        }
+    }
+    let last = last_load.ok_or_else(|| RewriteError::Internal("no PT_LOAD".into()))?;
+    let shim_vaddr = last.p_vaddr + (shim_file_off - last.p_offset as usize) as u64;
+
+    // shim:
+    //   stp x29, x30, [sp, #-16]!     ; preserve LR (kernel sets x30=0 but
+    //                                   bionic _start expects x30 not used so
+    //                                   conservatively save anyway)
+    //   bl bootstrap                  ; do dlopen of embedded runtime
+    //   ldp x29, x30, [sp], #16
+    //   b orig_e_entry                ; tail-jump to libc _start
+    let mut emit = |w: u32| {
+        let mut b = [0u8; 4];
+        LittleEndian::write_u32(&mut b, w);
+        out.extend_from_slice(&b);
+    };
+    emit(0xa9bf7bfd); // STP X29,X30,[SP,#-16]!
+    let bl_pc = shim_vaddr + 4;
+    let bl_imm26 = ((bootstrap_vaddr as i64 - bl_pc as i64) / 4) & 0x3ff_ffff;
+    emit(0x94_00_00_00u32 | bl_imm26 as u32);
+    emit(0xa8c17bfd); // LDP X29,X30,[SP],#16
+    let b_pc = shim_vaddr + 12;
+    let b_imm26 = ((orig_entry as i64 - b_pc as i64) / 4) & 0x3ff_ffff;
+    emit(0x14_00_00_00u32 | b_imm26 as u32);
+
+    // Page-align tail and extend last LOAD's filesz/memsz.
+    let page = page_align as usize;
+    let aligned_end = (out.len() + page - 1) & !(page - 1);
+    while out.len() < aligned_end {
+        out.push(0);
+    }
+    extend_last_load_to_file_end(out)?;
+
+    // Patch ELF header's e_entry to shim_vaddr.
+    LittleEndian::write_u64(&mut out[0x18..0x20], shim_vaddr);
+
+    Ok(shim_vaddr)
+}
+
 /// Hijack INIT_ARRAY[0] in place — modify its R_AARCH64_RELATIVE relocation's
 /// `r_addend` to point at a wrapper that does our bootstrap then tail-calls
 /// the original first init function. This avoids relocating .init_array
@@ -241,7 +318,7 @@ fn patch_init_array_hijack(
     page_align: u64,
 ) -> Result<u64> {
     use goblin::elf::Elf;
-    use goblin::elf::dynamic::DT_INIT_ARRAY;
+    use goblin::elf::dynamic::{DT_INIT_ARRAY, DT_INIT_ARRAYSZ};
     use goblin::elf::reloc::R_AARCH64_RELATIVE;
 
     let elf = Elf::parse(orig_elf).map_err(|e| RewriteError::Parse(e.to_string()))?;
@@ -251,15 +328,23 @@ fn patch_init_array_hijack(
         .ok_or_else(|| RewriteError::Internal("missing PT_DYNAMIC".into()))?;
 
     let mut init_array_vaddr: Option<u64> = None;
+    let mut init_array_size: Option<u64> = None;
     for d in &dynamic.dyns {
-        if d.d_tag == DT_INIT_ARRAY {
-            init_array_vaddr = Some(d.d_val);
+        match d.d_tag {
+            DT_INIT_ARRAY => init_array_vaddr = Some(d.d_val),
+            DT_INIT_ARRAYSZ => init_array_size = Some(d.d_val),
+            _ => {}
         }
     }
     let ia_vaddr =
         init_array_vaddr.ok_or_else(|| RewriteError::Internal("DT_INIT_ARRAY missing".into()))?;
+    let ia_size = init_array_size.unwrap_or(8);
+    // Pick the LAST entry — by then all C++ static init has run, libc is in a
+    // settled state, and dlopen() during INIT_ARRAY apparently corrupts the
+    // canary when called too early (before that point).
+    let target_entry_vaddr = ia_vaddr + ia_size.saturating_sub(8);
 
-    // Find the .rela.dyn relocation whose r_offset == ia_vaddr (= INIT_ARRAY[0])
+    // Find the .rela.dyn relocation whose r_offset == target_entry_vaddr
     // and which is R_AARCH64_RELATIVE (= 1027 on aarch64).
     let mut rela_file_off: Option<usize> = None;
     let mut original_addend: i64 = 0;
@@ -284,7 +369,7 @@ fn patch_init_array_hijack(
             let r_info = LittleEndian::read_u64(&orig_elf[p + 8..p + 16]);
             let r_addend = LittleEndian::read_i64(&orig_elf[p + 16..p + 24]);
             let r_type = (r_info & 0xffff_ffff) as u32;
-            if r_offset == ia_vaddr && r_type == R_AARCH64_RELATIVE {
+            if r_offset == target_entry_vaddr && r_type == R_AARCH64_RELATIVE {
                 rela_file_off = Some(p);
                 original_addend = r_addend;
                 break;
