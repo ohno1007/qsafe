@@ -63,16 +63,20 @@ pub fn rewrite_elf(
     }
     let mut out = loaded.raw.clone();
 
-    // ---- 1. 在末尾对齐到 0x1000 边界 ----
-    let page_align = 0x1000usize;
-    while out.len() % page_align != 0 {
+    // 关键：选 vaddr 同时拿到原有 LOAD 的最大 p_align（典型现代 ARM64 binary
+    // 是 0x4000 = 16KB）。新 LOAD 必须用同样对齐，否则 16KB 页设备 mmap 会
+    // 跟前段最后一页冲突 → bionic 报通用 PIE error。
+    let (new_vaddr_base, page_align_u64) = next_load_vaddr(&loaded.raw)?;
+    let page_align = page_align_u64 as usize;
+
+    // ---- 1. 在末尾对齐到 page 边界（同时也要让 (vaddr - file_off) % p_align == 0）----
+    // file offset 必须满足: (new_vaddr_base - file_off) % p_align == 0
+    // → file_off ≡ new_vaddr_base (mod p_align)
+    let target_off_mod = (new_vaddr_base as usize) & (page_align - 1);
+    while (out.len() & (page_align - 1)) != target_off_mod {
         out.push(0);
     }
     let new_segment_off = out.len();
-
-    // 选择新 segment 的 vaddr：找到所有 PT_LOAD 中最高 vaddr+memsz，向上对齐 0x1000。
-    // 紧贴原 ELF 最高 LOAD vaddr 之后（对齐 0x1000），让 B-imm26 跳板偏移在 ±128MB 内
-    let new_vaddr_base = next_load_vaddr(&loaded.raw)?;
 
     // ---- 2. 跳板表（每个 region 16 字节）----
     let trampoline_table_off = out.len();
@@ -162,12 +166,12 @@ pub fn rewrite_elf(
     let new_segment_size = out.len() - new_segment_off;
 
     // ---- 4. 添加新 PT_LOAD program header（先把整个 phdr 复制到末尾再增加一条）----
-    add_load_phdr(&mut out, new_segment_off, new_segment_vaddr, new_segment_size)?;
+    add_load_phdr(&mut out, new_segment_off, new_segment_vaddr, new_segment_size, page_align_u64)?;
 
     // ---- 4b. 改写 INIT_ARRAY[0] 的 R_AARCH64_RELATIVE 让它先跑 bootstrap ----
     if bootstrap_vaddr != 0 {
         init_array_vaddr_new =
-            patch_init_array_hijack(&mut out, &loaded.raw, bootstrap_vaddr)?;
+            patch_init_array_hijack(&mut out, &loaded.raw, bootstrap_vaddr, page_align_u64)?;
     }
 
     // ---- 5. 在每个 region 的 patch_addr 写 B <trampoline> ----
@@ -232,6 +236,7 @@ fn patch_init_array_hijack(
     out: &mut Vec<u8>,
     orig_elf: &[u8],
     bootstrap_vaddr: u64,
+    page_align: u64,
 ) -> Result<u64> {
     use goblin::elf::Elf;
     use goblin::elf::dynamic::DT_INIT_ARRAY;
@@ -331,7 +336,7 @@ fn patch_init_array_hijack(
 
     // Page-align tail and extend the last PT_LOAD's filesz/memsz to cover
     // the wrapper.
-    let page = 0x1000usize;
+    let page = page_align as usize;
     let aligned_end = (out.len() + page - 1) & !(page - 1);
     while out.len() < aligned_end {
         out.push(0);
@@ -376,21 +381,32 @@ fn extend_last_load_to_file_end(out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// 找到所有 PT_LOAD segment 中最大的 vaddr+memsz，向上对齐 0x1000。
-fn next_load_vaddr(elf_bytes: &[u8]) -> Result<u64> {
+/// 找到所有 PT_LOAD segment 中最大的 vaddr+memsz，向上对齐到与原有 LOAD
+/// 一致的 page 大小。返回 (aligned_vaddr, page_size)。
+///
+/// 关键：Android 14+ 在 Pixel 6+ / 高通新 SoC 上**默认 16KB 页**。原 binary 通常
+/// 编译时按 16KB 对齐 (LOAD `p_align=0x4000`)，新 LOAD 必须用相同对齐，否则
+/// 16KB 页系统的 mmap 会拒绝（与上一段的最后一页相冲），bionic 给出
+/// 通用 "Android only supports PIE" 错误。
+fn next_load_vaddr(elf_bytes: &[u8]) -> Result<(u64, u64)> {
     use goblin::elf::Elf;
     let elf = Elf::parse(elf_bytes).map_err(|e| RewriteError::Parse(e.to_string()))?;
     let mut max_end = 0u64;
+    let mut max_align = 0x1000u64;
     for ph in &elf.program_headers {
         if ph.p_type == goblin::elf::program_header::PT_LOAD {
             let end = ph.p_vaddr + ph.p_memsz;
             if end > max_end {
                 max_end = end;
             }
+            if ph.p_align > max_align {
+                max_align = ph.p_align;
+            }
         }
     }
-    let aligned = (max_end + 0xFFF) & !0xFFFu64;
-    Ok(aligned)
+    let mask = max_align - 1;
+    let aligned = (max_end + mask) & !mask;
+    Ok((aligned, max_align))
 }
 
 /// 把 patch_addr (虚拟地址) 转成原 ELF 文件内的字节偏移。
@@ -424,6 +440,7 @@ fn add_load_phdr(
     seg_file_off: usize,
     seg_vaddr: u64,
     _seg_size: usize,
+    page_align: u64,
 ) -> Result<()> {
     use goblin::elf::Elf;
     use goblin::elf::program_header::{PT_LOAD, PT_PHDR};
@@ -466,8 +483,9 @@ fn add_load_phdr(
     // 1) 写 PHDR table（旧 phdrs + 新 LOAD entry）
     // 2) 向上 page-pad 文件，让 PHDR table 完整落在 page-aligned 段内
     // 3) 新 LOAD entry 的 filesz/memsz 延伸覆盖 padding 后整个范围
+    let mask = (page_align - 1) as usize;
     let raw_end = new_phoff + new_phdr_total;
-    let aligned_end = (raw_end + 0xFFF) & !0xFFF;
+    let aligned_end = (raw_end + mask) & !mask;
     let extended_seg_size = aligned_end - seg_file_off;
     let mut entry = [0u8; 56];
     LittleEndian::write_u32(&mut entry[0..4], PT_LOAD);
@@ -477,7 +495,7 @@ fn add_load_phdr(
     LittleEndian::write_u64(&mut entry[24..32], seg_vaddr);
     LittleEndian::write_u64(&mut entry[32..40], extended_seg_size as u64);
     LittleEndian::write_u64(&mut entry[40..48], extended_seg_size as u64);
-    LittleEndian::write_u64(&mut entry[48..56], 0x1000);
+    LittleEndian::write_u64(&mut entry[48..56], page_align);
     if entry.len() != phentsize {
         return Err(RewriteError::Internal(format!(
             "phentsize 不匹配: {} vs {}",

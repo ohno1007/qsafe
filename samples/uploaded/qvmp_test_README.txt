@@ -1,33 +1,24 @@
-qvmp_test.zip — diagnostic bundle for hardened ELF "PIE error" bisect
-=====================================================================
+qvmp_test.zip — 16KB-page alignment fix v2
+==========================================
 
-7 files inside. Push each to /data/local/tmp/ (or wherever you ran the
-original from), chmod +x, run the SAME way you ran the original.
+之前所有加固版都报 PIE error 是因为新 LOAD vaddr (0x2ab000) 在 16KB 页系统里
+和原 LOAD #4 的最后一页冲突。这版改成 16KB 对齐 (0x2ac000)，page_align 也
+从 0x1000 改成 0x4000 跟原 binary 一致。
 
-Tell me which files run and which fail.
+跑法跟之前一样。理论上现在所有 hardened 版本都能起来：
+  - onlytrampolines / strip_only / xor_only: 不会跑保护函数 (无 SIGTRAP handler) →
+    起 GUI 后第一次命中保护函数会 SIGSEGV，但能起来证明 ELF 加载正常
+  - rodata_only: rodata 加密但没人解密，起 GUI 用到 rodata 字符串时会乱码/崩
+  - no_embed: 同上，加上 payload+strip
+  - hardened: 完整版，理应跑通
 
-  AndroidSurfaceImguiEnhanced                              原版 (没改)
-                                                           你已经验证它能跑
+最关键的是 onlytrampolines 能不能起来 —— 它是「ELF 结构没问题」的判定基线。
 
-  AndroidSurfaceImguiEnhanced.onlytrampolines.hardened     只写跳板，零 armor
-  AndroidSurfaceImguiEnhanced.strip_only.hardened          跳板 + .shstrtab 置零
-  AndroidSurfaceImguiEnhanced.xor_only.hardened            跳板 + payload XOR
-  AndroidSurfaceImguiEnhanced.rodata_only.hardened         跳板 + .rodata 加密(无解密)
-
-  AndroidSurfaceImguiEnhanced.no_embed.hardened            跳板 + 全 armor，无嵌入 runtime
-  AndroidSurfaceImguiEnhanced.hardened                     单文件完整版 (含 runtime)
-
-第一行 onlytrampolines 是最关键的一档：什么 armor 都不开，只写跳板。
-- 它跑得起来 → 跳板/PHDR/新 LOAD 本身没问题，是某个 armor 项搞坏了
-- 它跑不起来 → 跳板/PHDR 本身就有 bug
-
-剩下三个 strip/xor/rodata 是单独开一项 armor 看哪一项的锅。
-
-MD5 校验（push 后在手机上 md5sum 应该对得上）：
-1e33950ddd0f3ca282d638ba92b892ba  AndroidSurfaceImguiEnhanced
-774ed409599e2bdbc1021421137f0645  AndroidSurfaceImguiEnhanced.hardened
-876a5e9aa3f2e797b529970f88f1539a  AndroidSurfaceImguiEnhanced.no_embed.hardened
-dfd9e5025a0a874da8a4dc171ff9bf63  AndroidSurfaceImguiEnhanced.onlytrampolines.hardened
-8e56ead674b5d0f4c3a14bc83e3ec091  AndroidSurfaceImguiEnhanced.rodata_only.hardened
-88b6b62787e625c2e54c67ca33dcfd7b  AndroidSurfaceImguiEnhanced.strip_only.hardened
-a8c55ba46d1f0214de19761a11400ef2  AndroidSurfaceImguiEnhanced.xor_only.hardened
+MD5 manifest:
+  1e33950ddd0f3ca282d638ba92b892ba  AndroidSurfaceImguiEnhanced
+  5c590dcf7b8c59c440f6ed24b520a62a  AndroidSurfaceImguiEnhanced.hardened
+  9193f873c75d27140ab071eb7911405d  AndroidSurfaceImguiEnhanced.no_embed.hardened
+  58f902ceca15052006a41e2d3e69d328  AndroidSurfaceImguiEnhanced.onlytrampolines.hardened
+  f603507157a2b916940bc7f758756d07  AndroidSurfaceImguiEnhanced.rodata_only.hardened
+  a44d74b7d6dd769c205f67566eaa9497  AndroidSurfaceImguiEnhanced.strip_only.hardened
+  4cca6e24ffce68e65ceba402d9124cbb  AndroidSurfaceImguiEnhanced.xor_only.hardened
