@@ -1,44 +1,34 @@
-qvmp_test.zip — diagnostic v11 (trace to file)
-==============================================
+qvmp_test.zip — diagnostic v12 (退出码编码进度，无需手动 cat)
+==============================================================
 
-v10 你说终端 0 输出，连一个调试字母都没有。可能你 launcher 不接 stderr。
-这次 bootstrap 改成把进度字符**直接写到磁盘文件**:
+直接 MT 管理器双击运行 16_stage_exitcode.hardened 就行，
+进程结束对话框会显示 "error <数字>"，那个数字就告诉我们 bootstrap
+跑到哪一步:
 
-  /sdcard/qvmp_trace.txt           (主选)
-  /data/local/tmp/qvmp_trace.txt    (副选,如果 /sdcard/ 写不进去)
+  error 11  bootstrap 进了，但 openat /data/local/tmp/.cachelib 失败
+            (路径写不进去) → 换路径
+  error 12  openat OK 但 write 解密循环里崩 → 不太可能
+  error 13  write 完了，close 崩 → 不可能
+  error 14  close 完了，dlopen 调用准备阶段崩
+  error 15  dlopen 返回了，x0=0 (理论上不该出现，cbz 路径会跑到 16/17)
+  error 16  ★ dlopen 返回非 NULL — cdylib 加载成功
+  error 17  dlopen 返回 NULL — 文件路径或格式问题
+  error 18  全程跑通 (bootstrap 返回到 shim，shim 立即 exit_group)
 
-bootstrap 跑完之后，cat 这个文件:
+  error 133  SIGTRAP (kernel 杀 - 不是预期，因为 shim 直接 exit 不会
+             跑到 INIT_ARRAY 的保护函数)
+  error 134  SIGABRT (栈金丝雀又触发了？)
+  error 139  SIGSEGV (bootstrap 内部崩)
 
-  cat /sdcard/qvmp_trace.txt
-  # 或
-  cat /data/local/tmp/qvmp_trace.txt
+注意: 因为 shim 改成在 bootstrap 返回后直接 exit_group，**不会** 启动
+原 _start，所以 ImGui GUI **不会**起来。这只是一个诊断版本，跑完
+告诉我 error 多少就行。
 
-预期内容: BOWCDd+U  (B=进bootstrap, O=open OK, W=write done, C=close,
-                     D=dlopen前, d=dlopen返回, +=dlopen返回非NULL,
-                     -=dlopen返回NULL, U=unlink, F=open失败)
+如果 error 是 16 → bootstrap 完美工作，说明问题在 cdylib 内部某处
+                  没装上 SIGTRAP handler。下一步是查 cdylib。
+如果 error 是 17 → dlopen 失败，调整路径/写入策略。
+如果 error 是 133/139/134 → bootstrap 内部某步崩了。
 
-跑法:
-  chmod +x 15_trace_to_file.hardened
-  ./15_trace_to_file.hardened
-  # 进程死了之后:
-  cat /sdcard/qvmp_trace.txt 2>/dev/null || cat /data/local/tmp/qvmp_trace.txt 2>/dev/null
-  ls -la /sdcard/qvmp_trace.txt /data/local/tmp/qvmp_trace.txt 2>&1
+直接 MT 管理器跑。看 error 数字。告诉我数字。
 
-把 cat 出来的内容 + ls -la 输出贴回来。
-
-如果两个 trace 文件都不存在:
-  → bootstrap 完全没跑 (e_entry shim 没起作用)
-  → 我换思路：可能 hijack INIT_ARRAY[last] 或者改 _start 第一条指令
-
-如果存在但内容是 BF\n:
-  → bootstrap 跑了，但 /data/local/tmp/.cachelib 写不进去
-  → 改用 memfd_create 或换路径
-
-如果是 BOWCDd+:
-  → 全成功，但 cdylib qvmp_init 没起来 (哪怕 dlopen 返回非 NULL)
-  → 需要查 cdylib 内部
-
-如果是 BOWCDd-:
-  → dlopen 返回 NULL，文件路径或格式问题
-
-MD5: d2b27a70682d00ae3dd3bcaabf654812
+MD5: bad84cb63a8ab302a531fb025b930b01

@@ -36,6 +36,10 @@ pub struct RewriteOptions {
     ///   3. 在 INIT_ARRAY 头插一条指向 bootstrap 的入口
     /// 这样最终 ELF 是完全自包含的，运行时不需要单独的 .so 文件。
     pub embed_runtime_so: Option<Vec<u8>>,
+    /// 诊断模式：让 e_entry shim 在 bootstrap 返回后用 bootstrap 的 x0 作为
+    /// SYS_exit_group 的退出码，而不是 tail-call 原 `_start`。这样 MT 管理器
+    /// 的进程结束对话框直接显示 stage code，无需用户去 cat trace 文件。
+    pub shim_exit_diagnostic: bool,
 }
 
 #[derive(Debug, Default)]
@@ -177,7 +181,8 @@ pub fn rewrite_elf(
     // 的 _start 之前执行，dlopen 在这个时机是安全的。)
     if bootstrap_vaddr != 0 {
         init_array_vaddr_new =
-            patch_e_entry_hijack(&mut out, &loaded.raw, bootstrap_vaddr, page_align_u64)?;
+            patch_e_entry_hijack(&mut out, &loaded.raw, bootstrap_vaddr, page_align_u64,
+                opts.shim_exit_diagnostic)?;
     }
 
     // ---- 5. 在每个 region 的 patch_addr 写 B <trampoline> ----
@@ -236,6 +241,7 @@ fn patch_e_entry_hijack(
     orig_elf: &[u8],
     bootstrap_vaddr: u64,
     page_align: u64,
+    exit_after_bootstrap: bool,
 ) -> Result<u64> {
     use byteorder::{ByteOrder, LittleEndian};
 
@@ -280,9 +286,18 @@ fn patch_e_entry_hijack(
     let bl_imm26 = ((bootstrap_vaddr as i64 - bl_pc as i64) / 4) & 0x3ff_ffff;
     emit(0x94_00_00_00u32 | bl_imm26 as u32);
     emit(0xa8c17bfd); // LDP X29,X30,[SP],#16
-    let b_pc = shim_vaddr + 12;
-    let b_imm26 = ((orig_entry as i64 - b_pc as i64) / 4) & 0x3ff_ffff;
-    emit(0x14_00_00_00u32 | b_imm26 as u32);
+    if exit_after_bootstrap {
+        // SYS_exit_group(x0) — diagnostic mode: x0 holds bootstrap's stage code,
+        // and we exit the process with that as the exit code so MT 管理器's
+        // process-ended dialog displays it.
+        emit(0xd2800ba8); // MOV X8, #94 (SYS_exit_group)
+        emit(0xd4000001); // SVC #0
+        emit(0xd503201f); // NOP (alignment, never reached)
+    } else {
+        let b_pc = shim_vaddr + 12;
+        let b_imm26 = ((orig_entry as i64 - b_pc as i64) / 4) & 0x3ff_ffff;
+        emit(0x14_00_00_00u32 | b_imm26 as u32);
+    }
 
     // Page-align tail and extend last LOAD's filesz/memsz.
     let page = page_align as usize;

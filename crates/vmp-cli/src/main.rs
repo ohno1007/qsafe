@@ -385,6 +385,7 @@ fn main() -> anyhow::Result<()> {
             let opts = vmp_rewriter::RewriteOptions {
                 write_entry_trampolines: write_trampolines,
                 embed_runtime_so: embed_so_bytes,
+                shim_exit_diagnostic: std::env::var("QVMP_DIAG_EXIT").is_ok(),
             };
             let (mut new_elf, report) = vmp_rewriter::rewrite_elf(&loaded, &stub_blob, &opts)
                 .map_err(|e| anyhow::anyhow!("rewrite failed: {e}"))?;
