@@ -1,36 +1,35 @@
-qvmp_test.zip — diagnostic v6
-=============================
+qvmp_test.zip — diagnostic v7 (bootstrap stage bisect)
+======================================================
 
-文件名带数字前缀，方便定位。从 1 跑到 6。
+之前 v6 结果:
+  4_onlytramp        Trap 133 (预期, 无 handler)
+  5_embedonly        SEGV 139 ★ 即使无 armor 也 SEGV
+  6_full             SEGV 139
 
-挂的时候**整段终端输出原样发回来**，特别是有没有 [qvmp] 这种日志行。
+x21/x22 ABI 修复没解决 SEGV 问题。需要再细分 bootstrap 内部哪一步触发。
 
-文件 / 期望结果:
+新增两个梯度版本:
 
-  1_original.bin            原版，能跑 (基线)
-  2_onebyte.hardened        改 1 字节填充字节，能跑 (排除 hash 校验)
-  3_notramp.hardened        加新 LOAD + PHDR id-map，**能跑** (你已确认)
-  4_onlytramp.hardened      + 跳板写入，预期 Trap (133)
-  5_embedonly.hardened      + embed runtime (无 armor)
-  6_full.hardened           完整版
+  7_bootstrap_noop.hardened
+    bootstrap 替换成只有 RET 的 stub。
+    wrapper → bl noop → 立即 ret → wrapper b orig_init
+    完全没做任何 syscall / dlopen。
+    如果 SEGV → wrapper plumbing / INIT_ARRAY hijack 本身有 bug
+    如果 Trap 133 → wrapper 没问题，bug 在 bootstrap 内部 syscall/dlopen
 
-v6 修了什么:
-  bootstrap stub 没 save/restore x21 x22 寄存器 (AAPCS64 callee-saved)。
-  bootstrap 返回后这俩寄存器被搞乱，linker 后续 INIT_ARRAY 跑 C++ 静态
-  初始化时直接 SEGV。修了 stack frame 大小 (32→48 字节)，把 x21/x22
-  也存起来恢复。
+  8_bootstrap_dlopenonly.hardened
+    bootstrap 只做 dlopen("/data/local/tmp/.cachelib", RTLD_NOW) 然后 ret。
+    没 open/write/decrypt syscall，只 dlopen。
+    .cachelib 文件不存在 → dlopen 应返回 NULL，不 crash。
+    如果 SEGV → dlopen 在 INIT_ARRAY 上下文下 crash 是凶手
+    如果 Trap 133 → dlopen 调用 OK，bug 在 bootstrap 的 open+write 路径
 
-  上一轮 5_embedonly / 6_full 都 SEGV 大概率就是这个 bug。
+跑 1-8 顺序，特别看 7 和 8 的结果:
 
-期望结果:
-  1, 2, 3 → 都能跑 GUI
-  4 → Trap 133 (无 handler 接 BRK)
-  5 → 起 GUI 后第一次撞保护函数会触发 BRK，cdylib handler 接住 dispatch，
-       理想情况 GUI 继续跑；如果 dispatch 路径有 bug 会 SEGV
-  6 → 跟 5 类似，多了 armor 链
+  7 → ?
+  8 → ?
 
-如果 5 还 SEGV → bootstrap/cdylib 还有别的 bug
-如果 5 OK 6 SEGV → armor 路径触发 cdylib bug
+把每个 binary 的终端输出原样发回来，特别是有没有 [qvmp] 这种行。
 
 MD5:
   1e33950ddd0f3ca282d638ba92b892ba  1_original.bin
@@ -39,3 +38,5 @@ MD5:
   51041fee2e9f20a1206369d9c78d43cb  4_onlytramp.hardened
   286b4a41e66bba541141fc941348632a  5_embedonly.hardened
   4d621c59a17a315661d3adb8dadedfe5  6_full.hardened
+  f1771a998df01db44c918f2517636d20  7_bootstrap_noop.hardened
+  c8b51a47c07cfc920053f4b93837ddc4  8_bootstrap_dlopenonly.hardened

@@ -37,34 +37,43 @@ pub fn patch_bootstrap(
     xor_key: u64,
 ) -> Result<Vec<u8>, crate::RewriteError> {
     let mut bytes = BOOTSTRAP_BIN.to_vec();
+    let len = bytes.len();
 
-    // BL imm26: opcode 100101 + imm26.  imm26 = (target - pc) / 4, in ±128 MB.
-    let bl_pc = bootstrap_runtime_vaddr.wrapping_add(BL_DLOPEN_OFFSET as u64);
-    let delta = dlopen_plt_vaddr as i64 - bl_pc as i64;
-    if delta % 4 != 0 {
-        return Err(crate::RewriteError::Internal(
-            "dlopen PLT not 4-byte aligned".into(),
-        ));
+    // Patch BL → dlopen if the slot exists in this bootstrap variant.
+    if BL_DLOPEN_OFFSET + 4 <= len {
+        let bl_pc = bootstrap_runtime_vaddr.wrapping_add(BL_DLOPEN_OFFSET as u64);
+        let delta = dlopen_plt_vaddr as i64 - bl_pc as i64;
+        if delta % 4 != 0 {
+            return Err(crate::RewriteError::Internal(
+                "dlopen PLT not 4-byte aligned".into(),
+            ));
+        }
+        let imm26 = delta / 4;
+        if !(-(1 << 25)..(1 << 25)).contains(&imm26) {
+            return Err(crate::RewriteError::BranchTooFar);
+        }
+        let bl_word = 0x94_00_00_00u32 | ((imm26 as u32) & 0x03ff_ffff);
+        LittleEndian::write_u32(
+            &mut bytes[BL_DLOPEN_OFFSET..BL_DLOPEN_OFFSET + 4],
+            bl_word,
+        );
     }
-    let imm26 = delta / 4;
-    if !(-(1 << 25)..(1 << 25)).contains(&imm26) {
-        return Err(crate::RewriteError::BranchTooFar);
-    }
-    let bl_word = 0x94_00_00_00u32 | ((imm26 as u32) & 0x03ff_ffff);
-    LittleEndian::write_u32(
-        &mut bytes[BL_DLOPEN_OFFSET..BL_DLOPEN_OFFSET + 4],
-        bl_word,
-    );
 
-    LittleEndian::write_u64(
-        &mut bytes[SO_ADDR_OFFSET..SO_ADDR_OFFSET + 8],
-        embedded_so_runtime_vaddr,
-    );
-    LittleEndian::write_u64(
-        &mut bytes[SO_LEN_OFFSET..SO_LEN_OFFSET + 8],
-        embedded_so_len,
-    );
-    LittleEndian::write_u64(&mut bytes[KEY_OFFSET..KEY_OFFSET + 8], xor_key);
+    if SO_ADDR_OFFSET + 8 <= len {
+        LittleEndian::write_u64(
+            &mut bytes[SO_ADDR_OFFSET..SO_ADDR_OFFSET + 8],
+            embedded_so_runtime_vaddr,
+        );
+    }
+    if SO_LEN_OFFSET + 8 <= len {
+        LittleEndian::write_u64(
+            &mut bytes[SO_LEN_OFFSET..SO_LEN_OFFSET + 8],
+            embedded_so_len,
+        );
+    }
+    if KEY_OFFSET + 8 <= len {
+        LittleEndian::write_u64(&mut bytes[KEY_OFFSET..KEY_OFFSET + 8], xor_key);
+    }
 
     Ok(bytes)
 }
