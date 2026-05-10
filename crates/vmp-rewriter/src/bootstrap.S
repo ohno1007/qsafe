@@ -34,9 +34,10 @@
 #define CHUNK 256
 
 qvmp_bootstrap:
-    stp     x29, x30, [sp, #-32]!
+    stp     x29, x30, [sp, #-48]!
     mov     x29, sp
     stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]         // AAPCS64: x21/x22 callee-saved, must preserve
     sub     sp, sp, #CHUNK              // stack chunk buffer
 
     // ----- 1. fd = openat(AT_FDCWD=-100, PATH, O_RDWR|O_CREAT|O_TRUNC, 0600) -----
@@ -107,8 +108,9 @@ bl_dlopen:
 
 L_done:
     add     sp, sp, #CHUNK
+    ldp     x21, x22, [sp, #32]
     ldp     x19, x20, [sp, #16]
-    ldp     x29, x30, [sp], #32
+    ldp     x29, x30, [sp], #48
     ret
 
 .balign 8

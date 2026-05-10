@@ -1,46 +1,41 @@
-qvmp_test.zip — diagnostic v5 (post-PHDR-fix bisect for SEGV)
-=============================================================
+qvmp_test.zip — diagnostic v6
+=============================
 
-v4 结果总结 (你已确认):
-  notramp.hardened       ✅ 跑通 (PHDR/LOAD identity-map 修对了)
-  onlytrampolines        Trap 133 (预期: 跳板触发 BRK + 没装 handler)
-  hardened (full)        SEGV 139 (新问题: bootstrap+cdylib 路径有问题)
+文件名带数字前缀，方便定位。从 1 跑到 6。
 
-之前 PIE error 的几个 (no_embed/strip_only/xor_only/rodata_only) 是
-v3 旧文件，现在全部用 v4 重新生成。
+挂的时候**整段终端输出原样发回来**，特别是有没有 [qvmp] 这种日志行。
 
-新增 embed_only.hardened: 只 embed runtime + 跳板，所有 armor 关掉。
-用来分离: SEGV 是 armor 链触发的，还是 embed 本身坏的。
+文件 / 期望结果:
 
-跑 4 个梯度:
-  1. AndroidSurfaceImguiEnhanced              基线 (能跑)
-  2. AndroidSurfaceImguiEnhanced.notramp.hardened  ✅ (你已确认)
-  3. AndroidSurfaceImguiEnhanced.onlytrampolines.hardened  133 SIGTRAP (预期)
-  4. AndroidSurfaceImguiEnhanced.strip_only.hardened
-  5. AndroidSurfaceImguiEnhanced.xor_only.hardened
-  6. AndroidSurfaceImguiEnhanced.rodata_only.hardened
-  7. AndroidSurfaceImguiEnhanced.no_embed.hardened
-  8. AndroidSurfaceImguiEnhanced.embed_only.hardened   ★ 新: embed + 0 armor
-  9. AndroidSurfaceImguiEnhanced.hardened              ★ 完整版
+  1_original.bin            原版，能跑 (基线)
+  2_onebyte.hardened        改 1 字节填充字节，能跑 (排除 hash 校验)
+  3_notramp.hardened        加新 LOAD + PHDR id-map，**能跑** (你已确认)
+  4_onlytramp.hardened      + 跳板写入，预期 Trap (133)
+  5_embedonly.hardened      + embed runtime (无 armor)
+  6_full.hardened           完整版
 
-跑 #8 时**重点看终端有没有 [qvmp] xxx 这种输出**。如果有，cdylib 装上了；
-如果没有，dlopen 失败 (大概率 /data/local/tmp/.cachelib 写不进去)。
+v6 修了什么:
+  bootstrap stub 没 save/restore x21 x22 寄存器 (AAPCS64 callee-saved)。
+  bootstrap 返回后这俩寄存器被搞乱，linker 后续 INIT_ARRAY 跑 C++ 静态
+  初始化时直接 SEGV。修了 stack frame 大小 (32→48 字节)，把 x21/x22
+  也存起来恢复。
 
-预期结果:
-  4-7 应该都 SIGTRAP 133 (跟 onlytrampolines 一样，没 runtime)
-  8: 取决于 dlopen 能不能成。
-     成功 → ImGui 起来后第一次保护函数被调用看是否 SIGSEGV
-     失败 → 跟 SIGTRAP 一样
+  上一轮 5_embedonly / 6_full 都 SEGV 大概率就是这个 bug。
 
-挂的时候终端输出原样发回来。
+期望结果:
+  1, 2, 3 → 都能跑 GUI
+  4 → Trap 133 (无 handler 接 BRK)
+  5 → 起 GUI 后第一次撞保护函数会触发 BRK，cdylib handler 接住 dispatch，
+       理想情况 GUI 继续跑；如果 dispatch 路径有 bug 会 SEGV
+  6 → 跟 5 类似，多了 armor 链
+
+如果 5 还 SEGV → bootstrap/cdylib 还有别的 bug
+如果 5 OK 6 SEGV → armor 路径触发 cdylib bug
 
 MD5:
-  1e33950ddd0f3ca282d638ba92b892ba  AndroidSurfaceImguiEnhanced
-  4710886dd2931faf56ef626d73064a7e  AndroidSurfaceImguiEnhanced.embed_only.hardened
-  bbde1842a8f96fdd81ccbf3a6e5bf852  AndroidSurfaceImguiEnhanced.no_embed.hardened
-  92fca783ef3b1bfa17e59f4f45e57698  AndroidSurfaceImguiEnhanced.notramp.hardened
-  ff98505ec005b03664f03caf7e2882c6  AndroidSurfaceImguiEnhanced.onebyte.hardened
-  51041fee2e9f20a1206369d9c78d43cb  AndroidSurfaceImguiEnhanced.onlytrampolines.hardened
-  b3ac2413e52a4b2a16175b09424a7504  AndroidSurfaceImguiEnhanced.rodata_only.hardened
-  2bc00f366c3a2f3ac6f6d72490bbcafd  AndroidSurfaceImguiEnhanced.strip_only.hardened
-  478d2c5c8469072b1ec48ef9aa0bf17b  AndroidSurfaceImguiEnhanced.xor_only.hardened
+  1e33950ddd0f3ca282d638ba92b892ba  1_original.bin
+  ff98505ec005b03664f03caf7e2882c6  2_onebyte.hardened
+  92fca783ef3b1bfa17e59f4f45e57698  3_notramp.hardened
+  51041fee2e9f20a1206369d9c78d43cb  4_onlytramp.hardened
+  286b4a41e66bba541141fc941348632a  5_embedonly.hardened
+  4d621c59a17a315661d3adb8dadedfe5  6_full.hardened

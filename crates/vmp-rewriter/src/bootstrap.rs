@@ -19,13 +19,13 @@ pub const BOOTSTRAP_BIN: &[u8] = include_bytes!("bootstrap.bin");
 /// Offset within BOOTSTRAP_BIN of the `BL` instruction that should call
 /// dlopen. At assembly time it's a NOP. We rewrite the 4 bytes to a
 /// `BL imm26` whose target lands on dlopen's PLT entry.
-const BL_DLOPEN_OFFSET: usize = 0xB8;
+const BL_DLOPEN_OFFSET: usize = 0xBC;
 /// Offset of the .quad cell to fill with the runtime vaddr of the embedded .so.
-const SO_ADDR_OFFSET: usize = 0xE0;
+const SO_ADDR_OFFSET: usize = 0xE8;
 /// Offset of the .quad cell to fill with the embedded .so byte count.
-const SO_LEN_OFFSET: usize = 0xE8;
+const SO_LEN_OFFSET: usize = 0xF0;
 /// Offset of the 8-byte rotating XOR key used to decrypt the embedded .so.
-const KEY_OFFSET: usize = 0xF0;
+const KEY_OFFSET: usize = 0xF8;
 
 /// Patch the bootstrap stub for a specific runtime layout. Returns the
 /// finished byte sequence ready to embed.
