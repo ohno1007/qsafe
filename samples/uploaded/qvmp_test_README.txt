@@ -1,34 +1,46 @@
-qvmp_test.zip — diagnostic v4 (identity-mapped PHDR fix)
-========================================================
+qvmp_test.zip — diagnostic v5 (post-PHDR-fix bisect for SEGV)
+=============================================================
 
-上一轮发现:
-  onebyte 能跑 → 启动器没做 hash 校验
-  notramp 挂  → ELF 结构改动本身坏，不是跳板的事
+v4 结果总结 (你已确认):
+  notramp.hardened       ✅ 跑通 (PHDR/LOAD identity-map 修对了)
+  onlytrampolines        Trap 133 (预期: 跳板触发 BRK + 没装 handler)
+  hardened (full)        SEGV 139 (新问题: bootstrap+cdylib 路径有问题)
 
-定位到原因: 之前重定位 PHDR 后，PT_PHDR.p_offset != p_vaddr (相差 0x14000)。
-原版是 identity mapping (offset == vaddr == 0x40)。某些 Android kernel/linker
-路径用 `load_bias + e_phoff` 算 AT_PHDR (走 PT_PHDR 失败的回退分支)，
-就读到错位置。
+之前 PIE error 的几个 (no_embed/strip_only/xor_only/rodata_only) 是
+v3 旧文件，现在全部用 v4 重新生成。
 
-这版改成: 把文件 pad 到 vaddr 0x2ac000 处再追加新 LOAD 内容，
-强制 file_offset == vaddr (identity mapping)。文件多 ~85KB 零填充。
+新增 embed_only.hardened: 只 embed runtime + 跳板，所有 armor 关掉。
+用来分离: SEGV 是 armor 链触发的，还是 embed 本身坏的。
 
-  PHDR off=0x31c000 va=0x31c000  (id-map)
-  LOAD off=0x2ac000 va=0x2ac000  (id-map)
+跑 4 个梯度:
+  1. AndroidSurfaceImguiEnhanced              基线 (能跑)
+  2. AndroidSurfaceImguiEnhanced.notramp.hardened  ✅ (你已确认)
+  3. AndroidSurfaceImguiEnhanced.onlytrampolines.hardened  133 SIGTRAP (预期)
+  4. AndroidSurfaceImguiEnhanced.strip_only.hardened
+  5. AndroidSurfaceImguiEnhanced.xor_only.hardened
+  6. AndroidSurfaceImguiEnhanced.rodata_only.hardened
+  7. AndroidSurfaceImguiEnhanced.no_embed.hardened
+  8. AndroidSurfaceImguiEnhanced.embed_only.hardened   ★ 新: embed + 0 armor
+  9. AndroidSurfaceImguiEnhanced.hardened              ★ 完整版
 
-按之前方法跑 4 个梯度:
-  1. AndroidSurfaceImguiEnhanced              原版 (基线)
-  2. AndroidSurfaceImguiEnhanced.onebyte.hardened     1 字节改动
-  3. AndroidSurfaceImguiEnhanced.notramp.hardened     新 LOAD + PHDR (id-map)
-  4. AndroidSurfaceImguiEnhanced.onlytrampolines.hardened   + 跳板
-  5. AndroidSurfaceImguiEnhanced.hardened              完整版
+跑 #8 时**重点看终端有没有 [qvmp] xxx 这种输出**。如果有，cdylib 装上了；
+如果没有，dlopen 失败 (大概率 /data/local/tmp/.cachelib 写不进去)。
 
-如果 #3 (notramp) 这次能跑 → identity mapping 修对了，往下叠
-如果 #3 还是挂 → PHDR 重定位还有别的问题，继续查
+预期结果:
+  4-7 应该都 SIGTRAP 133 (跟 onlytrampolines 一样，没 runtime)
+  8: 取决于 dlopen 能不能成。
+     成功 → ImGui 起来后第一次保护函数被调用看是否 SIGSEGV
+     失败 → 跟 SIGTRAP 一样
+
+挂的时候终端输出原样发回来。
 
 MD5:
   1e33950ddd0f3ca282d638ba92b892ba  AndroidSurfaceImguiEnhanced
-  ff98505ec005b03664f03caf7e2882c6  AndroidSurfaceImguiEnhanced.onebyte.hardened
+  4710886dd2931faf56ef626d73064a7e  AndroidSurfaceImguiEnhanced.embed_only.hardened
+  bbde1842a8f96fdd81ccbf3a6e5bf852  AndroidSurfaceImguiEnhanced.no_embed.hardened
   92fca783ef3b1bfa17e59f4f45e57698  AndroidSurfaceImguiEnhanced.notramp.hardened
+  ff98505ec005b03664f03caf7e2882c6  AndroidSurfaceImguiEnhanced.onebyte.hardened
   51041fee2e9f20a1206369d9c78d43cb  AndroidSurfaceImguiEnhanced.onlytrampolines.hardened
-  5731f7b9541e4a769fa4c2468479b04e  AndroidSurfaceImguiEnhanced.hardened
+  b3ac2413e52a4b2a16175b09424a7504  AndroidSurfaceImguiEnhanced.rodata_only.hardened
+  2bc00f366c3a2f3ac6f6d72490bbcafd  AndroidSurfaceImguiEnhanced.strip_only.hardened
+  478d2c5c8469072b1ec48ef9aa0bf17b  AndroidSurfaceImguiEnhanced.xor_only.hardened
