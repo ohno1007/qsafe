@@ -1,42 +1,40 @@
-qvmp_test.zip — diagnostic v7 (bootstrap stage bisect)
-======================================================
+qvmp_test.zip — diagnostic v8 (dlopen-during-INIT_ARRAY narrow bisect)
+=====================================================================
 
-之前 v6 结果:
-  4_onlytramp        Trap 133 (预期, 无 handler)
-  5_embedonly        SEGV 139 ★ 即使无 armor 也 SEGV
-  6_full             SEGV 139
+v7 结果:
+  7_bootstrap_noop      Trap 133 (wrapper / hijack 都正常)
+  8_bootstrap_dlopenonly  stack corruption detected (-fstack-protector) Aborted
+                          → dlopen 在 INIT_ARRAY 上下文里调用就会触发栈保护
 
-x21/x22 ABI 修复没解决 SEGV 问题。需要再细分 bootstrap 内部哪一步触发。
+定位到根本问题: 在 main exec 的 INIT_ARRAY 期间调 dlopen() 导致 bionic
+__stack_chk_fail. 可能是 dlopen 内部的栈使用方式跟我们这个 frame 不兼容。
 
-新增两个梯度版本:
+新增两个变体进一步细分:
 
-  7_bootstrap_noop.hardened
-    bootstrap 替换成只有 RET 的 stub。
-    wrapper → bl noop → 立即 ret → wrapper b orig_init
-    完全没做任何 syscall / dlopen。
-    如果 SEGV → wrapper plumbing / INIT_ARRAY hijack 本身有 bug
-    如果 Trap 133 → wrapper 没问题，bug 在 bootstrap 内部 syscall/dlopen
+  9_dlopen_null.hardened
+    bootstrap 调 dlopen(NULL, RTLD_NOW)。
+    NULL path → 返回主可执行的 handle，理论上不可能失败。
+    如果 9 也 abort → dlopen 调用本身在 INIT_ARRAY 里就有问题，跟 path 无关
+    如果 9 正常 → 是路径不存在导致的栈问题
 
-  8_bootstrap_dlopenonly.hardened
-    bootstrap 只做 dlopen("/data/local/tmp/.cachelib", RTLD_NOW) 然后 ret。
-    没 open/write/decrypt syscall，只 dlopen。
-    .cachelib 文件不存在 → dlopen 应返回 NULL，不 crash。
-    如果 SEGV → dlopen 在 INIT_ARRAY 上下文下 crash 是凶手
-    如果 Trap 133 → dlopen 调用 OK，bug 在 bootstrap 的 open+write 路径
+  10_dlopen_libc.hardened
+    bootstrap 调 dlopen("libc.so", RTLD_NOW)。
+    libc 已经加载，dlopen 应该只是增加引用计数。
+    如果 10 正常 → 通过 dlopen 是 OK 的，只是某些路径状态会出问题
+    如果 10 也 abort → 任何 dlopen 在 INIT_ARRAY 都会炸
 
-跑 1-8 顺序，特别看 7 和 8 的结果:
+可能的结果矩阵:
 
-  7 → ?
-  8 → ?
+  9 abort & 10 abort → dlopen 在 INIT_ARRAY 上下文完全不能用，要换思路
+                       (比如改 e_entry 让 bootstrap 在 INIT_ARRAY 之前跑)
+  9 OK & 10 OK     → dlopen OK，是 .cachelib 路径状态搞坏栈
+                     可以调整 path 或写法让 dlopen 找到合法 .so
+  9 abort & 10 OK  → 特定状态，可定位 fix
 
-把每个 binary 的终端输出原样发回来，特别是有没有 [qvmp] 这种行。
+跑 9 和 10，看哪个 abort 哪个 OK。
 
 MD5:
-  1e33950ddd0f3ca282d638ba92b892ba  1_original.bin
-  ff98505ec005b03664f03caf7e2882c6  2_onebyte.hardened
-  92fca783ef3b1bfa17e59f4f45e57698  3_notramp.hardened
-  51041fee2e9f20a1206369d9c78d43cb  4_onlytramp.hardened
-  286b4a41e66bba541141fc941348632a  5_embedonly.hardened
-  4d621c59a17a315661d3adb8dadedfe5  6_full.hardened
   f1771a998df01db44c918f2517636d20  7_bootstrap_noop.hardened
   c8b51a47c07cfc920053f4b93837ddc4  8_bootstrap_dlopenonly.hardened
+  9be275a99e85744e0c2292eb86b9ca51  9_dlopen_null.hardened
+  b35c190f160859be90020e39df0e0fe6  10_dlopen_libc.hardened
