@@ -115,6 +115,18 @@ pub fn rewrite_elf(
             )
         })?;
 
+        // Derive a per-build XOR key from ELF header bytes — keeps `strings`
+        // / `grep` over the embedded runtime silent and the key trivially
+        // recoverable from the live process (since it's stored in the
+        // bootstrap stub literal).
+        let mut key_bytes = [0u8; 8];
+        for i in 0..8 {
+            key_bytes[i] =
+                loaded.raw[i] ^ loaded.raw.get(0x18 + i).copied().unwrap_or(0) ^ (0xA5 ^ i as u8);
+        }
+        let xor_key = u64::from_le_bytes(key_bytes);
+        let so_encrypted = crate::bootstrap::xor_runtime(so_bytes, xor_key);
+
         // 8-byte align before bootstrap so its u64 literals load fine.
         while out.len() % 8 != 0 {
             out.push(0);
@@ -123,7 +135,6 @@ pub fn rewrite_elf(
         let bootstrap_vaddr_local =
             new_segment_vaddr + (bootstrap_file_off - new_segment_off) as u64;
 
-        // Embedded .so goes right after the bootstrap stub (its size is fixed).
         let stub_len = crate::bootstrap::BOOTSTRAP_BIN.len();
         let embedded_so_file_off = bootstrap_file_off + stub_len;
         let embedded_so_vaddr_local =
@@ -132,14 +143,15 @@ pub fn rewrite_elf(
         let stub_bytes = crate::bootstrap::patch_bootstrap(
             bootstrap_vaddr_local,
             embedded_so_vaddr_local,
-            so_bytes.len() as u64,
+            so_encrypted.len() as u64,
             dlopen_plt,
+            xor_key,
         )?;
         out.extend_from_slice(&stub_bytes);
-        out.extend_from_slice(so_bytes);
+        out.extend_from_slice(&so_encrypted);
 
         embedded_so_vaddr = embedded_so_vaddr_local;
-        embedded_so_len = so_bytes.len() as u64;
+        embedded_so_len = so_encrypted.len() as u64;
         bootstrap_vaddr = bootstrap_vaddr_local;
     }
 
