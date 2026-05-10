@@ -93,16 +93,16 @@ enum Cmd {
         #[arg(short, long)]
         output: PathBuf,
         /// 是否在原 .text 写跳板（默认开；仅嵌入 blob 不写跳板时关闭）
-        #[arg(long, default_value_t = true)]
+        #[arg(long, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_value_t = true, default_missing_value = "true")]
         write_trampolines: bool,
         /// 段名 / 符号名剥离 (.shstrtab / .strtab 置 0)
-        #[arg(long, default_value_t = true)]
+        #[arg(long, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_value_t = true, default_missing_value = "true")]
         strip_names: bool,
         /// payload 二次加密（依赖 ELF header 派生 key）
-        #[arg(long, default_value_t = true)]
+        #[arg(long, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_value_t = true, default_missing_value = "true")]
         xor_payload: bool,
         /// 加密 .rodata（运行时由 libqvmp_runtime.so 在 .init_array 解密）
-        #[arg(long, default_value_t = true)]
+        #[arg(long, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_value_t = true, default_missing_value = "true")]
         encrypt_rodata: bool,
         /// 烧录日志开关 (--log on / --log off)；运行时直接读 QVMP 头字节，无 env var
         #[arg(long, default_value = "off")]
