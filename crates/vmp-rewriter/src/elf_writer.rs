@@ -294,8 +294,14 @@ fn patch_e_entry_hijack(
         emit(0xd4000001); // SVC #0
         emit(0xd503201f); // NOP (alignment, never reached)
     } else {
+        // Skip the FIRST 4 bytes of orig_entry (we've patched them to
+        // `b shim_vaddr` below — jumping back to orig_entry would infinite
+        // loop). For the user's binary, _start[0] is BTI C (a no-op-like
+        // landing pad) which is safe to skip; the rest of _start continues
+        // setting up argc/argv and calling __libc_init.
         let b_pc = shim_vaddr + 12;
-        let b_imm26 = ((orig_entry as i64 - b_pc as i64) / 4) & 0x3ff_ffff;
+        let b_target = orig_entry + 4;
+        let b_imm26 = ((b_target as i64 - b_pc as i64) / 4) & 0x3ff_ffff;
         emit(0x14_00_00_00u32 | b_imm26 as u32);
     }
 
@@ -309,6 +315,28 @@ fn patch_e_entry_hijack(
 
     // Patch ELF header's e_entry to shim_vaddr.
     LittleEndian::write_u64(&mut out[0x18..0x20], shim_vaddr);
+
+    // BELT + SUSPENDERS: also patch the first 4 bytes of the ORIGINAL
+    // `_start` (orig_entry vaddr) to `B shim_vaddr`. Some Android launchers
+    // (MT 管理器, certain proot wrappers, dlopen-based execs) appear to NOT
+    // use e_entry from the ELF header for ET_DYN PIE binaries — they jump
+    // to whatever symbol `_start` points to, or use a cached entry. Patching
+    // the first instruction at orig_entry redirects those paths through our
+    // shim as well. We just need to make sure `b shim_vaddr - orig_entry`
+    // fits in B-imm26 (±128 MB), which is true for our layout.
+    if let Some(orig_entry_file_off) = vaddr_to_file_off(out, orig_entry) {
+        let rel = (shim_vaddr as i64) - (orig_entry as i64);
+        if rel % 4 == 0 && rel >= -(1 << 27) && rel < (1 << 27) {
+            let imm26 = ((rel / 4) as u32) & 0x03ff_ffff;
+            let b_inst = 0x14_00_00_00u32 | imm26;
+            if orig_entry_file_off + 4 <= out.len() {
+                LittleEndian::write_u32(
+                    &mut out[orig_entry_file_off..orig_entry_file_off + 4],
+                    b_inst,
+                );
+            }
+        }
+    }
 
     Ok(shim_vaddr)
 }
