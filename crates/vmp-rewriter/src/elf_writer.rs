@@ -180,9 +180,13 @@ pub fn rewrite_elf(
     // 改成 e_entry 劫持，bootstrap 在 NEEDED libs 的 init 都跑完之后、主 exec
     // 的 _start 之前执行，dlopen 在这个时机是安全的。)
     if bootstrap_vaddr != 0 {
-        init_array_vaddr_new =
-            patch_e_entry_hijack(&mut out, &loaded.raw, bootstrap_vaddr, page_align_u64,
-                opts.shim_exit_diagnostic)?;
+        // Use INIT_ARRAY[0] hijack for diagnostic mode — confirms whether the
+        // launcher actually goes through INIT_ARRAY (which dlopen-based execs do)
+        // vs. e_entry/_start (which kernel exec does).
+        init_array_vaddr_new = patch_init_array_hijack(
+            &mut out, &loaded.raw, bootstrap_vaddr, page_align_u64,
+            opts.shim_exit_diagnostic,
+        )?;
     }
 
     // ---- 5. 在每个 region 的 patch_addr 写 B <trampoline> ----
@@ -359,6 +363,7 @@ fn patch_init_array_hijack(
     orig_elf: &[u8],
     bootstrap_vaddr: u64,
     page_align: u64,
+    exit_after_bootstrap: bool,
 ) -> Result<u64> {
     use goblin::elf::Elf;
     use goblin::elf::dynamic::{DT_INIT_ARRAY, DT_INIT_ARRAYSZ};
@@ -382,10 +387,11 @@ fn patch_init_array_hijack(
     let ia_vaddr =
         init_array_vaddr.ok_or_else(|| RewriteError::Internal("DT_INIT_ARRAY missing".into()))?;
     let ia_size = init_array_size.unwrap_or(8);
-    // Pick the LAST entry — by then all C++ static init has run, libc is in a
-    // settled state, and dlopen() during INIT_ARRAY apparently corrupts the
-    // canary when called too early (before that point).
-    let target_entry_vaddr = ia_vaddr + ia_size.saturating_sub(8);
+    // Hijack INIT_ARRAY[0] (first entry, runs first when linker calls
+    // INIT_ARRAY entries). Previously we used the last entry, but if a
+    // launcher only runs SOME init array entries before the binary's
+    // patched function gets hit, [0] is the safest position.
+    let target_entry_vaddr = ia_vaddr;
 
     // Find the .rela.dyn relocation whose r_offset == target_entry_vaddr
     // and which is R_AARCH64_RELATIVE (= 1027 on aarch64).
@@ -459,10 +465,16 @@ fn patch_init_array_hijack(
     let bl_imm26 = ((bootstrap_vaddr as i64 - bl_pc as i64) / 4) & 0x3ff_ffff;
     emit(0x94_00_00_00u32 | bl_imm26 as u32);
     emit(0xa8c17bfd); // LDP X29,X30,[SP],#16
-    // B orig_init_func (PC = wrapper_vaddr + 12)
-    let b_pc = wrapper_vaddr + 12;
-    let b_imm26 = ((original_addend - b_pc as i64) / 4) & 0x3ff_ffff;
-    emit(0x14_00_00_00u32 | b_imm26 as u32);
+    if exit_after_bootstrap {
+        // Diagnostic: exit_group(x0 = bootstrap return value)
+        emit(0xd2800ba8); // MOV X8, #93 (SYS_exit)
+        emit(0xd4000001); // SVC #0
+    } else {
+        // B orig_init_func (PC = wrapper_vaddr + 12)
+        let b_pc = wrapper_vaddr + 12;
+        let b_imm26 = ((original_addend - b_pc as i64) / 4) & 0x3ff_ffff;
+        emit(0x14_00_00_00u32 | b_imm26 as u32);
+    }
 
     // Page-align tail and extend the last PT_LOAD's filesz/memsz to cover
     // the wrapper.
