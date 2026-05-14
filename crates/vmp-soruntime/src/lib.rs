@@ -345,29 +345,13 @@ fn install_sigtrap_handler() {
     }
 }
 
-// Bionic-specific ucontext_t layout offsets (from start of ucontext_t).
-// Rust's libc crate assumes glibc layout (sigset_t = 128 bytes) but bionic
-// uses sigset_t = 8 bytes + 120 bytes __padding. Reading `uc.uc_mcontext.pc`
-// via Rust libc on Android lands in the padding region → garbage value →
-// SEGV when used as a pointer. So we access via raw byte offsets that match
-// bionic's actual layout:
-//   ucontext_t {
-//     uc_flags:   0
-//     uc_link:    8
-//     uc_stack:   16  (24 bytes)
-//     uc_sigmask: 40  (8 bytes)
-//     __padding:  48  (120 bytes)
-//     uc_mcontext: 168 =
-//       fault_address: 168
-//       regs[31]:      176 .. 424
-//       sp:            424
-//       pc:            432
-//       pstate:        440
-//       __reserved:    448 (4096 bytes)
-//   }
-const UC_REGS_OFFSET: usize = 176; // regs[0]
-const UC_PC_OFFSET: usize = 432;
-const UC_RESERVED_OFFSET: usize = 448;
+// Bionic ucontext_t layout (empirically verified on-device — Rust libc assumes
+// glibc layout and would mis-locate every register). mcontext_t starts at
+// ucontext+176, regs[0..31] at +184..+432, sp +432, pc +440, pstate +448,
+// __reserved +456. Cross-checked: si_addr matches *((uc+440) as *const u64).
+const UC_REGS_OFFSET: usize = 184; // regs[0]
+const UC_PC_OFFSET: usize = 440;
+const UC_RESERVED_OFFSET: usize = 456;
 
 #[inline(always)]
 unsafe fn uc_reg(ucontext: *mut c_void, idx: usize) -> u64 {
@@ -395,93 +379,16 @@ extern "C" fn sigtrap_handler(
     info: *mut libc::siginfo_t,
     ucontext: *mut c_void,
 ) {
-    log_msg(b"qvmp_runtime: SIGTRAP handler entered\0");
-
     // si_addr (kernel's authoritative trap address) is at byte offset 16
-    // in siginfo_t for SIGTRAP. Read it directly to cross-check our PC offset.
-    let si_addr = unsafe { *((info as *const u8).add(16) as *const u64) };
-    {
-        let mut buf = [0u8; 96];
-        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: si_addr=", si_addr as usize);
-        log_msg(&buf[..n]);
-    }
-
-    let pc = unsafe { uc_pc(ucontext) };
-    {
-        let mut buf = [0u8; 96];
-        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: ucontext.pc=", pc as usize);
-        log_msg(&buf[..n]);
-    }
-
-    // Use si_addr as the authoritative PC — it's what the kernel knows.
-    let real_pc = si_addr;
-
+    // in siginfo_t for SIGTRAP. The bionic ucontext layout has varied across
+    // devices, so we trust si_addr over uc_pc() for the trapped instruction.
+    let real_pc = unsafe { *((info as *const u8).add(16) as *const u64) };
     let inst = unsafe { *(real_pc as *const u32) };
-    {
-        let mut buf = [0u8; 96];
-        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: inst@si_addr=", inst as usize);
-        log_msg(&buf[..n]);
-    }
-
-    // Discover the actual regs offset: scan ucontext for a u64 == region_id
-    // (low byte of BRK's imm16, plus a tentative match for x16). The trampoline
-    // sets `mov x16, #region_id`, so somewhere in ucontext there must be a u64
-    // equal to that region_id.
-    let imm16_low = ((inst >> 5) & 0xFF) as u64;
-    {
-        let mut buf = [0u8; 96];
-        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: expected x16=", imm16_low as usize);
-        log_msg(&buf[..n]);
-    }
-    // Dump u64 values at offsets 176..464 (32-byte chunks should cover mcontext
-    // regs + sp + pc). Format: "uc[OFFSET]=VALUE" so we can manually identify
-    // which offset has x16 (should be region_id), x30 (LR), sp, pc, etc.
-    {
-        let base = ucontext as *const u8;
-        let mut off = 176usize;
-        while off < 472 {
-            let v = unsafe { *((base.add(off)) as *const u64) };
-            let mut buf = [0u8; 128];
-            // Combined log: "uc[<off>]=<val>"
-            let mut p = 0;
-            let prefix = b"qvmp_runtime: uc[";
-            for &b in prefix { if p < buf.len() { buf[p] = b; p += 1; } }
-            // off as decimal
-            let mut digits = [0u8; 8]; let mut n = 0; let mut v_o = off;
-            if v_o == 0 { digits[0] = b'0'; n = 1; } else {
-                while v_o > 0 { digits[n] = b'0' + (v_o % 10) as u8; v_o /= 10; n += 1; }
-            }
-            for i in (0..n).rev() { if p < buf.len() { buf[p] = digits[i]; p += 1; } }
-            // "]="
-            for &b in b"]=" { if p < buf.len() { buf[p] = b; p += 1; } }
-            // val as decimal
-            let mut vdig = [0u8; 24]; let mut vn = 0; let mut vv = v;
-            if vv == 0 { vdig[0] = b'0'; vn = 1; } else {
-                while vv > 0 { vdig[vn] = b'0' + (vv % 10) as u8; vv /= 10; vn += 1; }
-            }
-            for i in (0..vn).rev() { if p < buf.len() { buf[p] = vdig[i]; p += 1; } }
-            if p < buf.len() { buf[p] = 0; }
-            log_msg(&buf[..p]);
-            off += 8;
-        }
-    }
-
-    // For now, halt the loop to allow user to read the offsets
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = libc::SIG_DFL;
-        libc::sigaction(libc::SIGTRAP, &sa, std::ptr::null_mut());
-    }
-    return;
-
-    #[allow(unreachable_code)]
-    let pc = real_pc;
 
     // BRK encoding: 1101 0100 001 imm16 0 0000  →  base 0xD420_0000, imm16 in [20:5]
     if (inst & 0xFFE0_001F) != 0xD420_0000 {
-        log_msg(b"qvmp_runtime: not a BRK; restoring SIG_DFL to avoid infinite loop\0");
-        // Reset SIGTRAP to default so the kernel terminates the process instead
-        // of re-invoking us on the same non-BRK instruction.
+        // Not our trap. Restore default handler so the kernel terminates the
+        // process instead of re-invoking us on the same non-BRK instruction.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = libc::SIG_DFL;
@@ -491,7 +398,6 @@ extern "C" fn sigtrap_handler(
     }
     let imm16 = ((inst >> 5) & 0xFFFF) as u16;
     if imm16 & 0xFF00 != 0x5100 {
-        log_msg(b"qvmp_runtime: foreign BRK imm16, returning\0");
         return;
     }
 
