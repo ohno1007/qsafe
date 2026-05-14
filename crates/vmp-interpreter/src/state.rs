@@ -10,7 +10,10 @@ pub const REG_COUNT: usize = 64;
 /// 32 个 128-bit 浮点 / NEON 寄存器（对应 ARM64 V0..V31 / Q0..Q31）。
 /// 标量 FP 取低 32/64 bit，向量取整 128 bit（向量算术目前未实现，留扩展点）。
 pub const FREG_COUNT: usize = 32;
-pub const STACK_SIZE: usize = 64 * 1024;
+/// VM 内部 call/branch 栈深度上限（Push/Pop 操作）。
+/// 不再用 `Vec<u64>` —— signal handler 路径上 malloc 是 POSIX 未定义行为，
+/// 容易跟主线程 malloc 共用 mutex 死锁/破坏堆。改用固定大小栈数组。
+pub const VM_BC_STACK_DEPTH: usize = 256;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Flags {
@@ -66,8 +69,10 @@ pub struct VmState {
     pub fregs: [u128; FREG_COUNT],
     pub flags: Flags,
     pub pc: u64,
-    pub stack: Vec<u64>,
-    pub max_stack: usize,
+    /// VM 内部 call/branch 栈 (push 返回 PC, pop 用于 ret 嵌套). 固定数组避免
+    /// signal handler 路径走 malloc.
+    pub stack: [u64; VM_BC_STACK_DEPTH],
+    pub stack_len: usize,
 }
 
 impl Default for VmState {
@@ -83,21 +88,30 @@ impl VmState {
             fregs: [0u128; FREG_COUNT],
             flags: Flags::default(),
             pc: 0,
-            stack: Vec::with_capacity(256),
-            max_stack: STACK_SIZE,
+            stack: [0u64; VM_BC_STACK_DEPTH],
+            stack_len: 0,
         }
     }
 
     pub fn push(&mut self, v: u64) -> Result<()> {
-        if self.stack.len() >= self.max_stack {
+        if self.stack_len >= self.stack.len() {
             return Err(Error::vm("E4"));
         }
-        self.stack.push(v);
+        self.stack[self.stack_len] = v;
+        self.stack_len += 1;
         Ok(())
     }
 
     pub fn pop(&mut self) -> Result<u64> {
-        self.stack.pop().ok_or_else(|| Error::vm("E5"))
+        if self.stack_len == 0 {
+            return Err(Error::vm("E5"));
+        }
+        self.stack_len -= 1;
+        Ok(self.stack[self.stack_len])
+    }
+
+    pub fn stack_is_empty(&self) -> bool {
+        self.stack_len == 0
     }
 }
 

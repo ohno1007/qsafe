@@ -175,23 +175,34 @@ impl<'a> Interpreter<'a> {
     }
 
     /// 主循环；返回 VExit 时携带的值（约定放入 R0）。
+    /// 旧入口 —— 通过堆分配字节码 scratch. 仅用于 host-side 模拟器/测试,
+    /// 不要在 signal handler 路径上调用 (malloc 不可重入).
     pub fn run(&mut self) -> Result<u64> {
+        let mut scratch = vec![0u8; self.bytecode.len()];
+        self.run_with_scratch(&mut scratch)
+    }
+
+    /// signal-safe 入口：调用方提供 `bytecode.len()` 字节的 scratch buffer
+    /// (栈数组 / mmap 池 / 等任何非 malloc 内存). 不再做堆分配.
+    pub fn run_with_scratch(&mut self, bc_scratch: &mut [u8]) -> Result<u64> {
+        if bc_scratch.len() < self.bytecode.len() {
+            return Err(Error::vm("bc scratch 太小"));
+        }
         // PIE 重定位：V62 = 运行时 load_bias。lifter 把 ADRP/ADR/LDR-literal
         // 都展开成 `Add rd, V62, vaddr_offset` 形式。
         self.state.regs[VM_REG_LOAD_BIAS] =
             MAIN_EXEC_LOAD_BIAS.load(Ordering::Relaxed);
-        let bc = if self.spec.encrypt {
-            let mut tmp = self.bytecode.to_vec();
+        let bc_view = &mut bc_scratch[..self.bytecode.len()];
+        bc_view.copy_from_slice(self.bytecode);
+        if self.spec.encrypt {
             vmp_codegen::stream::decrypt_in_place_salted(
-                &mut tmp,
+                bc_view,
                 &self.spec.stream_key,
                 &self.spec.stream_iv,
                 self.iv_salt,
             );
-            tmp
-        } else {
-            self.bytecode.to_vec()
-        };
+        }
+        let bc: &[u8] = bc_view;
         loop {
             // V63 = XZR：每周期重置为 0，保证它在 source 位置永远读 0、
             // 在 destination 位置充当"丢弃"槽位。
@@ -298,7 +309,7 @@ impl<'a> Interpreter<'a> {
                 VOp::Ret => {
                     // 函数入口的 Ret：栈空 ⇒ 视作 VExit（返回 R0）。
                     // 嵌套调用情况下栈不空 ⇒ 弹出真实返回 PC。
-                    if self.state.stack.is_empty() {
+                    if self.state.stack_is_empty() {
                         return Ok(self.state.regs[0]);
                     }
                     self.state.pc = self.state.pop()?;

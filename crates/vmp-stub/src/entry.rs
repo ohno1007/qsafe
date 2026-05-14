@@ -7,10 +7,114 @@
 //!
 //! 当前实现是 **加壳器内的功能性测试** 路径，用于验证 lift→encode→interpret 闭环。
 
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use thiserror::Error;
 use vmp_core::Result as CoreResult;
 use vmp_interpreter::{HostBridge, Interpreter, VmState};
 use vmp_isa::Width;
+
+// =============================================================================
+// signal-handler-safe scratch pool
+// =============================================================================
+//
+// `dispatch_vm_fp` 在 SIGTRAP handler 里被调用. POSIX 明确说 malloc/free 是
+// async-signal-unsafe —— bionic malloc 内部有 mutex, 主线程 malloc 中途被
+// SIGTRAP 打断后再 malloc 会重入同一 mutex, 死锁或堆损坏. 触发足够多次后
+// 整个进程的堆状态都乱了. 这是 v37/v38/v40 三套不同 region 子集都在大致相同
+// 位置挂的根因.
+//
+// 改成: qvmp_init 时 mmap 一块匿名内存 (1MB), 用 atomic bump-down allocator
+// 给每次 dispatch 切出 64KB 的 VM stack + 16KB 的 bytecode scratch. 递归
+// dispatch (vm_call_region_fp) 再切下一片, 退出时归还. 完全不走 malloc.
+//
+// 1MB / 80KB ≈ 12 层递归, 远够 ImGui / C++ 容器/迭代场景.
+const POOL_SIZE: usize = 1024 * 1024;
+const VM_STACK_BYTES: usize = 64 * 1024;
+const BC_SCRATCH_BYTES: usize = 16 * 1024;
+const FRAME_BYTES: usize = VM_STACK_BYTES + BC_SCRATCH_BYTES;
+
+static POOL_BASE: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static POOL_USED: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn ensure_pool() -> *mut u8 {
+    let cur = POOL_BASE.load(Ordering::Acquire);
+    if !cur.is_null() {
+        return cur;
+    }
+    unsafe {
+        let p = libc::mmap(
+            core::ptr::null_mut(),
+            POOL_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if p == libc::MAP_FAILED {
+            return core::ptr::null_mut();
+        }
+        // CAS so concurrent initializers don't leak. If another thread won,
+        // unmap ours.
+        let p_u8 = p as *mut u8;
+        match POOL_BASE.compare_exchange(
+            core::ptr::null_mut(),
+            p_u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => p_u8,
+            Err(existing) => {
+                libc::munmap(p as *mut _, POOL_SIZE);
+                existing
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn ensure_pool() -> *mut u8 {
+    // Off-target builds (host CLI): fall back to a leaked Box. CLI doesn't
+    // run inside a signal handler so the malloc concern doesn't apply.
+    let cur = POOL_BASE.load(Ordering::Acquire);
+    if !cur.is_null() {
+        return cur;
+    }
+    let buf = vec![0u8; POOL_SIZE].into_boxed_slice();
+    let p = Box::leak(buf).as_mut_ptr();
+    match POOL_BASE.compare_exchange(
+        core::ptr::null_mut(),
+        p,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => p,
+        Err(existing) => existing,
+    }
+}
+
+/// Reserve a (vm_stack, bc_scratch) frame from the pool. Returns (stack_slice,
+/// scratch_slice, prev_used) where `prev_used` must be restored on the way out.
+unsafe fn alloc_frame() -> Option<(*mut u8, *mut u8, usize)> {
+    let base = ensure_pool();
+    if base.is_null() {
+        return None;
+    }
+    let prev = POOL_USED.fetch_add(FRAME_BYTES, Ordering::AcqRel);
+    if prev + FRAME_BYTES > POOL_SIZE {
+        // Out of pool — undo and bail.
+        POOL_USED.fetch_sub(FRAME_BYTES, Ordering::AcqRel);
+        return None;
+    }
+    let frame = base.add(prev);
+    Some((frame, frame.add(VM_STACK_BYTES), prev))
+}
+
+unsafe fn free_frame(prev: usize) {
+    let now = POOL_USED.load(Ordering::Acquire);
+    debug_assert_eq!(now, prev + FRAME_BYTES, "VM frame stack imbalance");
+    POOL_USED.store(prev, Ordering::Release);
+}
 
 #[derive(Debug, Error)]
 pub enum StubError {
@@ -44,30 +148,48 @@ pub fn dispatch_vm_fp(
     let r = blob.regions.get(region_id).ok_or(StubError::NoRegion(region_id))?;
     let bc = &blob.bytecode_pool[r.bc_offset as usize..(r.bc_offset + r.bc_len) as usize];
 
-    const VM_STACK_BYTES: usize = 64 * 1024;
-    let mut vm_stack: Vec<u64> = vec![0u64; VM_STACK_BYTES / 8];
-    let stack_base = vm_stack.as_mut_ptr() as u64;
+    if bc.len() > BC_SCRATCH_BYTES {
+        return Err(StubError::Blob(format!(
+            "region {} bytecode {} bytes exceeds BC_SCRATCH_BYTES {}",
+            region_id,
+            bc.len(),
+            BC_SCRATCH_BYTES
+        )));
+    }
+    let (stack_ptr, scratch_ptr, prev_used) = unsafe {
+        alloc_frame().ok_or_else(|| {
+            StubError::Blob("VM frame pool exhausted (recursion too deep?)".into())
+        })?
+    };
+
+    let stack_base = stack_ptr as u64;
     let stack_top = stack_base + VM_STACK_BYTES as u64;
     let initial_sp = stack_top & !0xFu64;
 
-    let mut nested = NestedDispatchHost { blob, inner: host };
+    let scratch =
+        unsafe { core::slice::from_raw_parts_mut(scratch_ptr, BC_SCRATCH_BYTES) };
 
-    let mut interp = Interpreter::new(&blob.spec, bc)
-        .with_host(&mut nested)
-        .with_iv_salt(region_id as u64);
-    interp.state.regs[31] = initial_sp;
-    interp.state.regs[63] = 0;
-    for (i, v) in gpr_args.iter().enumerate() {
-        interp.state.regs[i] = *v;
-    }
-    for (i, v) in fpr_args.iter().enumerate() {
-        interp.state.fregs[i] = *v as u128;
-    }
-    interp.run()?;
-    let gpr_ret = interp.state.regs[0];
-    let fpr_ret = interp.state.fregs[0] as u64;
-    core::hint::black_box(vm_stack.as_ptr());
-    Ok((gpr_ret, fpr_ret))
+    let result = (|| {
+        let mut nested = NestedDispatchHost { blob, inner: host };
+        let mut interp = Interpreter::new(&blob.spec, bc)
+            .with_host(&mut nested)
+            .with_iv_salt(region_id as u64);
+        interp.state.regs[31] = initial_sp;
+        interp.state.regs[63] = 0;
+        for (i, v) in gpr_args.iter().enumerate() {
+            interp.state.regs[i] = *v;
+        }
+        for (i, v) in fpr_args.iter().enumerate() {
+            interp.state.fregs[i] = *v as u128;
+        }
+        interp.run_with_scratch(scratch)?;
+        let gpr_ret = interp.state.regs[0];
+        let fpr_ret = interp.state.fregs[0] as u64;
+        Ok::<_, StubError>((gpr_ret, fpr_ret))
+    })();
+
+    unsafe { free_frame(prev_used) };
+    result
 }
 
 pub fn dispatch_vm(
@@ -92,29 +214,42 @@ pub fn dispatch_vm(
     let r = blob.regions.get(region_id).ok_or(StubError::NoRegion(region_id))?;
     let bc = &blob.bytecode_pool[r.bc_offset as usize..(r.bc_offset + r.bc_len) as usize];
 
-    // 给 VM 分配 64KB 真实栈：原 native 代码会做 `sub sp, sp, #N` 然后 `str/ldr [sp, #off]`，
-    // 这些在解释器里走 HostBridge.store/load → 必须落到一块合法可读写的宿主内存上。
-    const VM_STACK_BYTES: usize = 64 * 1024;
-    let mut vm_stack: Vec<u64> = vec![0u64; VM_STACK_BYTES / 8];
-    let stack_base = vm_stack.as_mut_ptr() as u64;
+    if bc.len() > BC_SCRATCH_BYTES {
+        return Err(StubError::Blob(format!(
+            "region {} bytecode {} bytes exceeds BC_SCRATCH_BYTES {}",
+            region_id,
+            bc.len(),
+            BC_SCRATCH_BYTES
+        )));
+    }
+    let (stack_ptr, scratch_ptr, prev_used) = unsafe {
+        alloc_frame().ok_or_else(|| {
+            StubError::Blob("VM frame pool exhausted (recursion too deep?)".into())
+        })?
+    };
+
+    let stack_base = stack_ptr as u64;
     let stack_top = stack_base + VM_STACK_BYTES as u64;
     let initial_sp = stack_top & !0xFu64;
 
-    // 给 host 包一层 NestedDispatchHost：让 VOp::CallRegion 触发的 vm_call_region
-    // 自动递归 dispatch_vm，从而支持「跨 region BL」。
-    let mut nested = NestedDispatchHost { blob, inner: host };
+    let scratch =
+        unsafe { core::slice::from_raw_parts_mut(scratch_ptr, BC_SCRATCH_BYTES) };
 
-    let mut interp = Interpreter::new(&blob.spec, bc)
-        .with_host(&mut nested)
-        .with_iv_salt(region_id as u64);
-    interp.state.regs[31] = initial_sp;
-    interp.state.regs[63] = 0;
-    for (i, v) in args.iter().take(8).enumerate() {
-        interp.state.regs[i] = *v;
-    }
-    let ret = interp.run()?;
-    core::hint::black_box(vm_stack.as_ptr());
-    Ok(ret)
+    let result = (|| {
+        let mut nested = NestedDispatchHost { blob, inner: host };
+        let mut interp = Interpreter::new(&blob.spec, bc)
+            .with_host(&mut nested)
+            .with_iv_salt(region_id as u64);
+        interp.state.regs[31] = initial_sp;
+        interp.state.regs[63] = 0;
+        for (i, v) in args.iter().take(8).enumerate() {
+            interp.state.regs[i] = *v;
+        }
+        interp.run_with_scratch(scratch).map_err(StubError::Vm)
+    })();
+
+    unsafe { free_frame(prev_used) };
+    result
 }
 
 /// 让 `VOp::CallRegion` 落到 `dispatch_vm` 的递归调用上。

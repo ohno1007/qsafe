@@ -1,39 +1,50 @@
-qvmp_test.zip — v40 三连定位包 (全 standard 强度, 三种保护子集对照)
-======================================================================
+qvmp_test.zip — v41 全量 standard：去掉 signal handler 路径上所有 malloc
+=========================================================================
 
-v39 出 UI 确认 bug 在 trampoline + VM, 不在基础设施.
-v38 leaf-only 同样位置挂确认 bug 不在间接调用.
+v40 三个完全不重叠的 region 子集都挂同位置 → bug 跟具体哪个 region
+被保护无关, 是机制层面的问题.
 
-audit 444 个 leaf region 的 VOp 频率, 高度怀疑两类:
-  - FP 操作 (FLoad/FStore/FCmp/FAdd/FSub/FMul/FCvtZS/FMovR 等): 累计~30 region
-  - CSel (条件选择): 6 region
+ROOT CAUSE (终于):
 
-v40 出三个全 standard 强度的对照包:
-  - 40A_no_fp.hardened: 全 standard, 但 **不保护任何用 FP 的 region**
-    (499 regions, dropped FP-using = 35 个)
-  - 40B_first_half.hardened: 只保护 region 0..250
-  - 40C_second_half.hardened: 只保护 region 250..534
+  dispatch_vm_fp 在 SIGTRAP handler 里被反复调用. 每次都:
+    let mut vm_stack: Vec<u64> = vec![0u64; 64*1024 / 8];   ← 64KB malloc
+    let mut tmp = self.bytecode.to_vec();                    ← bytecode malloc
+    let mut state.stack: Vec<u64> = Vec::with_capacity(256); ← push/pop vec
 
-测试顺序:
-  1. 先跑 **40A_no_fp**. 如果出 UI → bug 锁定在 FP 操作的 VM 实现.
-     下一步我专门去 audit FP lifter + interpreter.
-  2. 再跑 **40B_first_half**. 出 UI / 挂同位置 → 二分到一半区间.
-  3. 再跑 **40C_second_half** (跟 40B 互斥). 必有一个挂.
+  POSIX 明确说 **malloc/free 是 async-signal-unsafe**. bionic malloc
+  内部有 mutex. 主线程 malloc 中途被 SIGTRAP 打断, handler 再调
+  malloc → 同 mutex 重入 → 死锁或堆元数据损坏. 跑几百几千次 SIGTRAP
+  后整个进程堆状态都乱了, 后续任何分配/free 都可能蹦.
 
-报告格式 (3 行就行):
-  40A: 出 UI 了 / 挂在 SIGSEGV
-  40B: 出 UI 了 / 挂在 SIGSEGV
-  40C: 出 UI 了 / 挂在 SIGSEGV
+  这跟"哪个 region 被保护"完全无关, 只跟"VM dispatch 总次数"有关.
+  解释了为什么 v37/v38/v40 三种完全不同 region 集合都挂在大致相同
+  位置 —— 都是堆累积破坏到某个 ImGui/Vulkan 内部分配触发.
 
-不用粘日志, 我下一步基于这三个结果做更精确定位.
+v41 修复 (crates/vmp-stub/src/entry.rs + crates/vmp-interpreter/src/state.rs):
 
-部署 (每个包都用同一份 .so):
-  1. libqvmp_runtime.so → /data/local/tmp/  (沿用之前的, md5 不重要)
-  2. 40A_no_fp.hardened / 40B_first_half.hardened / 40C_second_half.hardened
-     选一个放 /data/ 双击, 测完再换下一个
-  3. 报告结果
+1. **mmap 池替代 Vec<u64>**: qvmp_init 第一次 dispatch 时 mmap 1MB
+   匿名内存, 用原子 bump-down allocator 给每次 dispatch 切 64KB VM
+   stack + 16KB bytecode scratch. 退出时恢复指针. **完全不走 malloc**.
+
+2. **VmState.stack 改固定数组**: `[u64; 256]` + `stack_len: usize`,
+   不再 Vec<u64>. push/pop 走数组索引.
+
+3. **Interpreter 加 run_with_scratch(bc_scratch: &mut [u8])**:
+   调用方提供字节码解密用的 scratch buffer (从 mmap 池切的), 不再
+   `self.bytecode.to_vec()`.
+
+整个 SIGTRAP handler → dispatch_vm_fp → Interpreter 路径上现在
+**零 malloc/free**. 字节码 / VM 栈 / state 栈全部 signal-safe.
+
+部署:
+  1. libqvmp_runtime.so → /data/local/tmp/  (**.so 必须更新**)
+  2. 41_no_malloc.hardened → 任意位置
+  3. MT 双击
+
+预期: 出 ImGui UI. 这是修了真正的 root cause, 应该一次性通过.
+如果还挂, 把日志全粘 — 那就是另一个机制层 bug (signal stack 大小,
+SA_NODEFER 副作用等), 我继续修.
 
 MD5:
-  40A_no_fp.hardened          c7c09aa7ea1e3fa9229051a8d66acf80
-  40B_first_half.hardened     360b044b7cd46471f8e556b3704a041f
-  40C_second_half.hardened    e6cdfa0abe938521dd79380850213c9e
+  41_no_malloc.hardened  7e12b735c4fcdc3a33012025d8eb3473
+  libqvmp_runtime.so     4c519682c10a8a7abd71086b7e2c9dbd  (必须更新)
