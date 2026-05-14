@@ -1,42 +1,40 @@
-qvmp_test.zip — diagnostic v16 (SIGTRAP handler install probe)
-==============================================================
+qvmp_test.zip — diagnostic v17 (handler dlopens cdylib)
+========================================================
 
-v15 = error 99 ✓ INIT_ARRAY[0] hijack 起作用, launcher 真的走 INIT_ARRAY.
+v16 = error 200 ✓ raw rt_sigaction 装 SIGTRAP handler 成功. BRK 触发后
+handler 接住, exit_group(200).
 
-下一步避开"在 INIT_ARRAY 里调 dlopen 触发栈金丝雀"的问题. 思路:
+v17 让 handler 真的 dlopen cdylib, 在 signal handler context 里调
+(不在 INIT_ARRAY 里), 看能不能绕开栈金丝雀问题.
 
-  1. INIT_ARRAY[0] wrapper 通过 raw rt_sigaction syscall 装一个最小
-     SIGTRAP handler (没调 libc, 没 dlopen)
-  2. wrapper 然后正常 tail-call 原 INIT_ARRAY[0] 函数
-  3. 其他 INIT_ARRAY entries 跑下去, 总会有个调到保护函数 → BRK
-  4. 我们的 SIGTRAP handler 接住, 处理
+流程:
 
-v16 是"测试 handler 安装路径能不能起作用"的诊断版. handler 不做正经
-活, 接到 BRK 就 exit_group(200).
-
-  bootstrap:
-      在栈上 build sigaction 结构 (handler=&handler_exit_200, flags=SA_SIGINFO|RESTORER|RESTART)
-      rt_sigaction(SIGTRAP, &sa, NULL, 8)
-      ret with x0 = 99
-  wrapper:
-      bl bootstrap
-      b orig_first_init  ; 这个会触发被保护函数的 trampoline → BRK
-  handler:
-      mov x0, #200
-      SYS_exit_group
-      svc #0
+  INIT_ARRAY[0] wrapper
+   → bl bootstrap
+       bootstrap:
+         1. write /data/local/tmp/.cachelib (解密 + raw syscall write)
+         2. rt_sigaction(SIGTRAP, our_handler)
+         3. ret 99
+   → b orig_first_init  (这个是 patched 的 → trampoline → BRK)
+   → kernel 调用 our_handler
+       handler:
+         1. dlopen("/data/local/tmp/.cachelib", RTLD_NOW)
+         2. cbz x0 → if NULL exit 202
+         3. else exit 201
+         (没用 sigreturn 回去, 因为我们没装完整 dispatch, 直接拿结果)
 
 期望:
 
-  error 200  → ★ raw syscall 装 SIGTRAP handler 成功, BRK 被我们接住.
-              下一步在 handler 里 dlopen cdylib (signal context, 不在
-              INIT_ARRAY 里, 应该避开金丝雀).
-  error 133  → handler 没装上 (rt_sigaction syscall 失败) 或者没被调用.
-              需要 debug rt_sigaction 参数.
-  error 99   → wrapper 跑完 bootstrap, b orig_init 没触发 BRK?? 不可能,
-              orig_init 已经 patched, 必定 BRK.
-  其他       → 告诉我具体数字
+  error 201  → ★ dlopen 从 signal handler context 成功! cdylib 加载成功.
+              下一步: handler 不 exit 而是返回 (走 sa_restorer → sigreturn),
+              让 BRK 再次 fire 进 cdylib 装好的 SIGTRAP handler.
+  error 202  → dlopen 返回 NULL. 可能 .so 写坏了 (decrypt 错) 或路径问题.
+              下一步检查写入的 .so 是不是完整.
+  error 134  → 栈金丝雀又触发. 即使在 signal handler 里 dlopen 也不行.
+              得想别的办法 (比如 fork 子进程 dlopen).
+  error 133  → handler 没被调用 (跟 v16 200 ≠ 133 矛盾, 不可能)
+  其他       → 告诉我数字
 
-直接 MT 管理器双击 20_sigtrap_install.hardened, 看 error N.
+直接 MT 管理器双击 21_handler_dlopen.hardened, 看 error N.
 
-MD5: ece825bab204f8e33475578050542b16
+MD5: c84a0dd4c2dbc8bedb9f02c465142618
