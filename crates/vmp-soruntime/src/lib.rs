@@ -311,6 +311,9 @@ fn discover_and_decrypt_blob() -> Option<StubBlob> {
     }
     let f = find?;
     LOG_FLAG.store(f.log_flag, std::sync::atomic::Ordering::Relaxed);
+    // Same flag also enables per-BLR diagnostic emission inside the VM.
+    vmp_interpreter::TRACE_NATIVE_CALLS
+        .store(f.log_flag, std::sync::atomic::Ordering::Relaxed);
 
     // Decrypt rodata FIRST — must happen before any code that references its
     // bytes runs. Our .init_array entry is invoked before the main binary's
@@ -365,7 +368,6 @@ extern "C" fn sigsegv_handler(
 ) {
     let fault_addr = unsafe { *((info as *const u8).add(16) as *const u64) };
     let pc = unsafe { uc_pc(ucontext) };
-    let lr = unsafe { uc_reg(ucontext, 30) };
     {
         let mut buf = [0u8; 96];
         let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: SIGSEGV sig=", sig as usize);
@@ -381,9 +383,44 @@ extern "C" fn sigsegv_handler(
         let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: SIGSEGV addr=", fault_addr as usize);
         log_msg(&buf[..n]);
     }
-    {
+    // Dump x0..x30 + sp at fault — pinpoint which arg/this-ptr was bogus.
+    for i in 0..31usize {
+        let v = unsafe { uc_reg(ucontext, i) };
         let mut buf = [0u8; 96];
-        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: SIGSEGV lr=", lr as usize);
+        let mut prefix = [0u8; 32];
+        let mut p = 0usize;
+        for &b in b"qvmp_runtime: x" {
+            prefix[p] = b;
+            p += 1;
+        }
+        let mut digits = [0u8; 4];
+        let mut n = 0usize;
+        let mut v_i = i;
+        if v_i == 0 {
+            digits[0] = b'0';
+            n = 1;
+        } else {
+            while v_i > 0 {
+                digits[n] = b'0' + (v_i % 10) as u8;
+                v_i /= 10;
+                n += 1;
+            }
+        }
+        for j in (0..n).rev() {
+            prefix[p] = digits[j];
+            p += 1;
+        }
+        prefix[p] = b'=';
+        p += 1;
+        let n2 = format_dispatch_msg(&mut buf, &prefix[..p], v as usize);
+        log_msg(&buf[..n2]);
+    }
+    {
+        let sp = unsafe {
+            *((ucontext as *const u8).add(UC_PC_OFFSET - 8) as *const u64)
+        };
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: sp=", sp as usize);
         log_msg(&buf[..n]);
     }
     // Hand back to default action — process will terminate with SIGSEGV.

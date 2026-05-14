@@ -13,5 +13,6 @@ crate-type = ["cdylib"]
 [dependencies]
 vmp-stub.workspace = true
 vmp-core.workspace = true
+vmp-interpreter.workspace = true
 libc = "0.2"
 log = "0.4"

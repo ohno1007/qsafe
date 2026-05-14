@@ -11,10 +11,88 @@
 pub mod state;
 
 use log::trace;
+use std::sync::atomic::{AtomicBool, Ordering};
 use vmp_core::{Error, Result};
 use vmp_isa::{decode_instr, Cond, IsaSpec, VOp, Width};
 
 pub use state::{HostBridge, VmState};
+
+/// Diagnostic flag: when set (typically by the on-device cdylib's qvmp_init
+/// when the rewrite-time `--log on` flag is baked into the QVMP header),
+/// every VOp::NativeCall logs "BLR xN target=0x… x0..x7=…" to fd 2 before
+/// crossing into the host. Silent on the protect-side CLI by default.
+pub static TRACE_NATIVE_CALLS: AtomicBool = AtomicBool::new(false);
+
+extern "C" {
+    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+}
+
+fn trace_native_call(rd: u8, target: u64, args: &[u64]) {
+    if !TRACE_NATIVE_CALLS.load(Ordering::Relaxed) {
+        return;
+    }
+    // Stack-only formatting, signal-safe: "[qvmp] vm: BLR xRD target=0xHEX
+    // x0=… x1=… … x7=…\n"
+    let mut buf = [0u8; 384];
+    let mut pos = 0usize;
+    fn push(buf: &mut [u8], pos: &mut usize, s: &[u8]) {
+        for &b in s {
+            if *pos < buf.len() {
+                buf[*pos] = b;
+                *pos += 1;
+            }
+        }
+    }
+    fn push_hex(buf: &mut [u8], pos: &mut usize, v: u64) {
+        push(buf, pos, b"0x");
+        let mut started = false;
+        for i in (0..16).rev() {
+            let nib = ((v >> (i * 4)) & 0xF) as u8;
+            if nib != 0 || started || i == 0 {
+                started = true;
+                let c = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+                if *pos < buf.len() {
+                    buf[*pos] = c;
+                    *pos += 1;
+                }
+            }
+        }
+    }
+    fn push_dec(buf: &mut [u8], pos: &mut usize, v: u64) {
+        if v == 0 {
+            push(buf, pos, b"0");
+            return;
+        }
+        let mut digits = [0u8; 20];
+        let mut n = 0;
+        let mut v = v;
+        while v > 0 {
+            digits[n] = b'0' + (v % 10) as u8;
+            v /= 10;
+            n += 1;
+        }
+        for i in (0..n).rev() {
+            if *pos < buf.len() {
+                buf[*pos] = digits[i];
+                *pos += 1;
+            }
+        }
+    }
+    push(&mut buf, &mut pos, b"[qvmp] vm: BLR x");
+    push_dec(&mut buf, &mut pos, rd as u64);
+    push(&mut buf, &mut pos, b" target=");
+    push_hex(&mut buf, &mut pos, target);
+    for (i, v) in args.iter().take(8).enumerate() {
+        push(&mut buf, &mut pos, b" x");
+        push_dec(&mut buf, &mut pos, i as u64);
+        push(&mut buf, &mut pos, b"=");
+        push_hex(&mut buf, &mut pos, *v);
+    }
+    push(&mut buf, &mut pos, b"\n");
+    unsafe {
+        let _ = write(2, buf.as_ptr(), pos);
+    }
+}
 
 pub struct Interpreter<'a> {
     pub spec: &'a IsaSpec,
@@ -177,6 +255,7 @@ impl<'a> Interpreter<'a> {
                     // the target lives in the live VM register, not in imm.
                     let rd = instr.rd;
                     let target_ptr = self.state.regs[rd as usize];
+                    trace_native_call(rd, target_ptr, &self.state.regs[..8]);
                     let ret = match self.host.as_deref_mut() {
                         Some(h) => h
                             .native_call(target_ptr, &self.state.regs[..8])

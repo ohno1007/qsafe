@@ -1,51 +1,44 @@
-qvmp_test.zip — v30 native_call 鲁棒化 + SIGSEGV 抓诊断
-============================================================
+qvmp_test.zip — v31 加 NativeCall pre-trace + SEGV 全 GPR dump
+================================================================
 
-v29 反馈:
-  [qvmp] dispatching region=124
-  Segmentation fault  ← 静默 SEGV
+v30 反馈:
+  [qvmp] SIGSEGV sig=11
+  [qvmp] SIGSEGV pc=536060413072      = 0x7CD8D33490   (库代码段)
+  [qvmp] SIGSEGV addr=158712          = 0x26C78        (null + 大偏移?)
+  [qvmp] SIGSEGV lr=536060395512      = 0x7CD8D2EFF8   (同库内)
 
-意思是 native_call 拿到了 target，但 target 指向不合法/未映射的代码区，
-直接 jump 过去就 SEGV。"兼容写好点" 这一版做三层防御:
+意思是 VM 把控制转给某库的 native 函数，函数立刻去解引用一个低地址，
+像是 x0 装的不是真 "this/struct"。要分清是 VM 传给 BLR 的 x0..x7 已
+经错了还是 native 函数自身实现问题。v31 加两组数据:
 
-1. **native_call 校验 target** (crates/vmp-stub/src/linux.rs)
-   - target == 0 → "空指针"
-   - target & 3 != 0 → "未对齐"
-   - target < 0x1000 → "落在低地址"
-   - 不在 /proc/self/maps 任何 r-x 段内 → "不在可执行映射"
-   首次 miss 时刷新一次 cache（应对 dlopen 之后新映射的库）。
+1. **NativeCall pre-trace** (crates/vmp-interpreter/src/lib.rs)
+   即将走 BLR 时先打:
+     [qvmp] vm: BLR x16 target=0x7c... x0=0x... x1=... ... x7=...
+   告诉你 VM 实际传出去的是什么. 如果 x0=0 / x0=0x... 像不像 this，
+   一眼就能看出来 lifter 是否漏译了 BLR 前面的 mov x0, ...
 
-2. **F8 全 8 参数** (之前最多 F6，丢了 args[6..8])
-   ARM64 AAPCS64 整数参数 x0..x7，全传过去更兼容。
+2. **SIGSEGV 全 GPR dump** (crates/vmp-soruntime/src/lib.rs)
+   SEGV 时把 x0..x30 + sp 全打出来 (31 行 + 1 行 sp). 这是 native
+   函数在崩溃瞬间的寄存器状态，能看到它在用什么作 base 算出 0x26C78
+   (例: 如果某 xN = 0x26C78 - <offset>，那条 ldr/str 就是元凶).
 
-3. **interpreter 包装错误带 rd** (crates/vmp-interpreter/src/lib.rs)
-   原来只报 "空指针"，现在打成 "BLR x16 target=0x...: <原因>"，
-   一眼能知道哪条 BLR、用的哪个寄存器、寄存器里装的什么。
-
-4. **cdylib 装 SIGSEGV/SIGBUS handler** (crates/vmp-soruntime/src/lib.rs)
-   SEGV 不再静默。会先打 4 行:
-     [qvmp] SIGSEGV sig=11
-     [qvmp] SIGSEGV pc=<崩溃指令地址>
-     [qvmp] SIGSEGV addr=<触发的内存地址>
-     [qvmp] SIGSEGV lr=<返回地址>
-   再 SIG_DFL + return 让内核终结 (exit 139)。
-   这样不管 SEGV 是 VM 内部还是 native_call 跳到坏地址，都有迹可循。
-
-DT_NEEDED: /data/local/tmp/libqvmp_runtime.so（同 v28/v29）
-cascade drop: 同 v28（534/867 保护）
+NativeCall trace 默认跟 --log on 联动（QVMP 头日志位打开就一起打开）.
 
 部署:
   1. libqvmp_runtime.so → /data/local/tmp/
-  2. 30_segv_diag.hardened → 任意位置
+  2. 31_segv_gpr_dump.hardened → 任意位置
   3. MT 双击
 
-可能出现的几种结果（粘回来 + 上下文）:
-  - VM ERR ... BLR xN target=0xXX: ... → 把整行粘。target 是 0 / 低地址 /
-    未对齐 / 不在 exec 映射，提示 lifter 漏了前置的 ADRP/LDR 翻译。
-  - SIGSEGV pc=0x... addr=0x... → pc 是崩溃 native 函数的指令；addr 是
-    它访问的非法地址。把 4 行 SIGSEGV 全粘。
-  - 出 ImGui → 万事大吉。
+把 dispatching region=124 之后开始的所有 [qvmp] 日志全粘回来. 数量
+会比之前多 (BLR trace 一行 + SEGV 一堆 GPR), 但全是有用诊断信息.
+
+可能的发现:
+  - "[qvmp] vm: BLR x16 target=0x... x0=0x0 x1=0x0 ..." → VM 没给函
+    数准备 args，lifter 漏了。
+  - "[qvmp] vm: BLR x16 target=0x... x0=0x7c..." 看起来合理 → 但
+    SEGV 时 x0 已变 → native 函数被传入的某指针其实是悬空 / 早释放.
+  - target=0x0 → BLR 寄存器没填好，前面 ADRP/LDR 没翻译.
 
 MD5:
-  30_segv_diag.hardened  d5772ccabd2becae7c1d9edc5f5eb71a
-  libqvmp_runtime.so     89e08e5da5253ecdf4bec8474e38172b
+  31_segv_gpr_dump.hardened  d5772ccabd2becae7c1d9edc5f5eb71a
+  libqvmp_runtime.so         32d05e8f82b282214ee54ef5eea91ef0
