@@ -375,11 +375,15 @@ fn decode_branch(raw: u32, pc: u64) -> Result<Vec<Instr>, &'static str> {
         let rn = ((raw >> 5) & 0x1F) as u8;
         match opc {
             0b0000 => {
-                // BR Rn → 我们当前不实现间接跳转的 VM 内部跳板，标 NativeCall 占位
-                return Ok(vec![Instr { op: VOp::NativeCall, rd: rn, ..Default::default() }]);
+                // BR Rn → tail-call: 调函数指针 + 把它的 return 当本 region 的 return.
+                // 没补 Ret 的话 NativeCall 之后 PC 继续往下走，越过 IR 末尾就抛 E6.
+                return Ok(vec![
+                    Instr { op: VOp::NativeCall, rd: rn, ..Default::default() },
+                    Instr { op: VOp::Ret, ..Default::default() },
+                ]);
             }
             0b0001 => {
-                // BLR Rn
+                // BLR Rn → 正常调用，落回下一条 IR.
                 return Ok(vec![Instr { op: VOp::NativeCall, rd: rn, ..Default::default() }]);
             }
             0b0010 => {
