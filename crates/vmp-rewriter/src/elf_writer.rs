@@ -40,6 +40,12 @@ pub struct RewriteOptions {
     /// SYS_exit_group 的退出码，而不是 tail-call 原 `_start`。这样 MT 管理器
     /// 的进程结束对话框直接显示 stage code，无需用户去 cat trace 文件。
     pub shim_exit_diagnostic: bool,
+    /// 添加 DT_NEEDED dependency 到 .dynamic。Android linker 在跑 main exec 的
+    /// INIT_ARRAY 之前就先加载这个 .so（安全的 dlopen 时机），避开"在 INIT_ARRAY
+    /// 或 signal handler 里 dlopen 触发栈金丝雀"的问题。需要用户把对应 .so
+    /// 放在这个路径下。实现方式：把 DT_DEBUG 条目替换成 DT_NEEDED，把字符串
+    /// 加到新 .dynstr 末尾，更新 DT_STRTAB/DT_STRSZ。
+    pub dt_needed_path: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -218,6 +224,14 @@ pub fn rewrite_elf(
         }
     }
 
+    // ---- 4c. Add DT_NEEDED via DT_DEBUG slot replacement + .dynstr extension ----
+    // (alternative to embed-runtime mode; lets the linker auto-load
+    // libqvmp_runtime.so BEFORE main exec INIT_ARRAY runs, avoiding all
+    // dlopen-from-INIT_ARRAY canary issues.)
+    if let Some(dt_path) = &opts.dt_needed_path {
+        add_dt_needed(&mut out, dt_path)?;
+    }
+
     Ok((
         out,
         RewriteReport {
@@ -232,6 +246,105 @@ pub fn rewrite_elf(
             new_segment_size: new_segment_size as u64,
         },
     ))
+}
+
+/// Add a `DT_NEEDED` dependency on `path` by:
+///   1. Copying the current `.dynstr` into the new LOAD segment + appending
+///      `path` + NUL terminator. New strtab is in RX mapped memory (linker
+///      only reads strings, never writes).
+///   2. Updating `DT_STRTAB` to point at the new strtab vaddr and `DT_STRSZ`
+///      to the new size.
+///   3. Repurposing the existing `DT_DEBUG` entry (tag=0x15, always present
+///      in PIEs, optional / debugger-only) to `DT_NEEDED` (tag=0x01) with
+///      value = offset of `path` within the new strtab.
+/// This avoids relocating `.dynamic` itself (it stays in its original RW
+/// LOAD where the linker can still write to it).
+fn add_dt_needed(out: &mut Vec<u8>, needed_path: &str) -> Result<()> {
+    use byteorder::{ByteOrder, LittleEndian};
+    use goblin::elf::Elf;
+    use goblin::elf::dynamic::{DT_DEBUG, DT_NEEDED, DT_STRSZ, DT_STRTAB};
+
+    // Parse and clone needed values, then drop the parse so `out` is freely mutable.
+    let (strtab_vaddr, strsz, dyn_off, dyn_size) = {
+        let elf = Elf::parse(out).map_err(|e| RewriteError::Parse(e.to_string()))?;
+        let dynamic = elf
+            .dynamic
+            .as_ref()
+            .ok_or_else(|| RewriteError::Internal("missing PT_DYNAMIC".into()))?;
+        let mut strtab_val: Option<u64> = None;
+        let mut strsz_val: Option<u64> = None;
+        for d in &dynamic.dyns {
+            if d.d_tag == DT_STRTAB {
+                strtab_val = Some(d.d_val);
+            } else if d.d_tag == DT_STRSZ {
+                strsz_val = Some(d.d_val);
+            }
+        }
+        let strtab_vaddr =
+            strtab_val.ok_or_else(|| RewriteError::Internal("DT_STRTAB missing".into()))?;
+        let strsz = strsz_val.ok_or_else(|| RewriteError::Internal("DT_STRSZ missing".into()))?
+            as usize;
+        let dyn_ph = elf
+            .program_headers
+            .iter()
+            .find(|ph| ph.p_type == goblin::elf::program_header::PT_DYNAMIC)
+            .ok_or_else(|| RewriteError::Internal("PT_DYNAMIC not found".into()))?;
+        let dyn_off = dyn_ph.p_offset as usize;
+        let dyn_size = dyn_ph.p_filesz as usize;
+        (strtab_vaddr, strsz, dyn_off, dyn_size)
+    };
+
+    // Read existing .dynstr bytes from the file (identity-mapped in LOAD #2)
+    let strtab_file_off = vaddr_to_file_off(out, strtab_vaddr)
+        .ok_or_else(|| RewriteError::Internal("DT_STRTAB vaddr not in PT_LOAD".into()))?;
+    if strtab_file_off + strsz > out.len() {
+        return Err(RewriteError::Internal(".dynstr bounds invalid".into()));
+    }
+    let original_strtab = out[strtab_file_off..strtab_file_off + strsz].to_vec();
+
+    // Append new strtab to file in the new LOAD segment area (identity-mapped),
+    // 8-byte aligned. New string goes at offset (old strsz) within new strtab.
+    while out.len() % 8 != 0 {
+        out.push(0);
+    }
+    let new_strtab_file_off = out.len();
+    let new_string_offset_in_strtab = original_strtab.len();
+    out.extend_from_slice(&original_strtab);
+    out.extend_from_slice(needed_path.as_bytes());
+    out.push(0);
+    let new_strsz = original_strtab.len() + needed_path.len() + 1;
+    let new_strtab_vaddr = new_strtab_file_off as u64; // identity-mapped
+
+    // Page-align + extend last LOAD's filesz/memsz so the new strtab is mapped.
+    let page = 0x4000usize;
+    let aligned = (out.len() + page - 1) & !(page - 1);
+    while out.len() < aligned {
+        out.push(0);
+    }
+    extend_last_load_to_file_end(out)?;
+
+    // Walk .dynamic, patch DT_STRTAB and DT_STRSZ, and repurpose DT_DEBUG.
+    let mut replaced_debug = false;
+    let mut i = 0;
+    while i + 16 <= dyn_size {
+        let p = dyn_off + i;
+        let tag = LittleEndian::read_u64(&out[p..p + 8]);
+        if tag == DT_STRTAB {
+            LittleEndian::write_u64(&mut out[p + 8..p + 16], new_strtab_vaddr);
+        } else if tag == DT_STRSZ {
+            LittleEndian::write_u64(&mut out[p + 8..p + 16], new_strsz as u64);
+        } else if tag == DT_DEBUG && !replaced_debug {
+            LittleEndian::write_u64(&mut out[p..p + 8], DT_NEEDED);
+            LittleEndian::write_u64(&mut out[p + 8..p + 16], new_string_offset_in_strtab as u64);
+            replaced_debug = true;
+        }
+        i += 16;
+    }
+    if !replaced_debug {
+        return Err(RewriteError::Internal("DT_DEBUG slot not found".into()));
+    }
+
+    Ok(())
 }
 
 /// Hijack ELF `e_entry` to point at a freshly-emitted shim that calls

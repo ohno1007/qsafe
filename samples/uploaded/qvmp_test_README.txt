@@ -1,27 +1,34 @@
-qvmp_test.zip — diagnostic v18 (handler dlopens "libc.so" — already loaded)
-============================================================================
+qvmp_test.zip — v19 DT_NEEDED 方案
+====================================
 
-v17 = error 139 (SIGSEGV). 在 SIGTRAP handler 里 dlopen 我们的 cdylib 崩了.
-不确定是 dlopen 调用本身崩, 还是 cdylib 的 qvmp_init (在 dlopen 内部跑的)
-崩了.
+之前所有 dlopen 路径都触发栈金丝雀 (134). 换完全不同的方案:
 
-v18 用 dlopen("libc.so") 测最简单情况: libc 已经加载, dlopen 只是
-bump refcount, 不跑任何 init_array.
+  - 在 .dynamic 里加 DT_NEEDED 条目, 让 Android linker 自动加载
+    libqvmp_runtime.so, 时机是 main exec 的 INIT_ARRAY 跑之前.
+  - 这是个"安全的 dlopen 时机", 跟我们手动 dlopen 完全不同.
+  - libqvmp_runtime.so 的 qvmp_init 在 linker setup 阶段跑, 在那里装
+    SIGTRAP handler.
+  - 然后 main exec INIT_ARRAY 跑, 撞到保护函数 BRK, handler dispatch.
 
-  bootstrap: 装 SIGTRAP handler, ret 99
-  wrapper:   bl bootstrap; b orig_init → BRK
-  handler:   dlopen("libc.so", RTLD_NOW)
-             成功 → exit 203
-             返回 NULL → exit 204
+部署要求 (★ 两个文件):
+
+  1. 把 libqvmp_runtime.so 放到 /data/local/tmp/libqvmp_runtime.so
+     (绝对路径写在 binary 里了, 必须是这个位置)
+  2. 把 23_dt_needed.hardened 放到任意位置 (你目前 /data/ 也行)
+  3. MT 管理器双击 23_dt_needed.hardened
+
+  Android linker 启动时看到 DT_NEEDED, 去加载
+  /data/local/tmp/libqvmp_runtime.so. 它的 init_array 跑 qvmp_init.
+  装好 SIGTRAP handler. 然后主 exec 继续, INIT_ARRAY 撞到保护函数,
+  handler 接住, dispatch VM, ImGui GUI 起来.
 
 期望:
 
-  error 203  → ★ dlopen from signal handler 路径成功. 那 v17 SEGV 就
-              是 cdylib 的 qvmp_init 内部崩. 下一步需要 debug cdylib init.
-  error 134  → 即使最简单 dlopen 也触发栈金丝雀. 整个 dlopen-from-handler
-              方案不可行, 得换思路.
-  error 139  → dlopen 自己崩了, 跟 cdylib 无关. 也得换思路.
-  error 204  → dlopen 返回 NULL (即使是 libc.so) - 极端罕见
-  其他       → 告诉我数字
+  ImGui GUI 起来       → ★ 完全跑通
+  CANNOT LINK 找不到 .so → 你忘了放 libqvmp_runtime.so 到 /data/local/tmp/
+  CANNOT LINK 其他错误 → 告诉我具体错误文本
+  SIGTRAP/SEGV         → 告诉我 error code
 
-MD5: 6b93d42fbbd0d3c2a796618781467b78
+MD5:
+  23_dt_needed.hardened   38c462247de8c6810b8862608b638d3a
+  libqvmp_runtime.so      f840ec8a5f5ac492ff8a4335efb6f074
