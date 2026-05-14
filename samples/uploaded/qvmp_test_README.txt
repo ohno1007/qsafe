@@ -1,43 +1,48 @@
-qvmp_test.zip — v33 BR Rn (tail-call) 后面补 Ret
-==================================================
+qvmp_test.zip — v34 junk 寄存器跟 lifter SCRATCH 冲突修复
+============================================================
 
-v32 反馈:
-  [qvmp] dispatching region=124
-  [qvmp] vm: BLR x20 target=0x55... x0=0x55...      ← PIE 重定位生效了
-  [qvmp] vm: BLR x20 ...        (三次)
-  [qvmp] VM returned region=124                      ← region 124 通了
-  [qvmp] dispatching region=8
-  [qvmp] vm: BLR x2 target=0x55dfccd180 ...
-  [qvmp] VM ERR region=8 err=Eb2:E:E6                ← E6 = PC 超出字节码
+v33 反馈:
+  dispatching region=124
+  BLR x20 ... x0=0x5c4a2debf9  ← 1st (load_bias + 0x26bf9 ✓)
+  BLR x20 ... x0=0x5c4a2d3228  ← 2nd (load_bias + 0x1b228 ✓)
+  BLR x20 ... x0=0x5c4a2d5000  ← 3rd 应该是 +0x1d8e3, 但只有 +0x1d000
+  VM returned region=124
+  ... 后续 region 调 malloc/free 几轮 ...
+  SIGSEGV pc=0 (空函数指针)
 
-region 8 (vaddr 0x108278) 是 5 条指令的 tail-call 蹦床:
-  adrp x8, ...
-  adrp x9, ...
-  ldr  x1, [x8, #N]
-  ldr  x2, [x9, #M]
-  br   x2          ← BR (没 link), tail-call
+复现成功！本地 sim 改用 standard preset (junk=25%, duplication=2) 后
+跟 device 一样, 第 3 个 BLR x0 差 0x8e3.
 
-lifter 之前把 BR 编成跟 BLR 一样的 `NativeCall { rd: rn }`. NativeCall
-执行完 PC 继续往下走 IR, 但 BR 是函数末尾的 tail-call, 后面没指令了, PC
-越过末尾就抛 E6.
+ROOT CAUSE:
+  arm64 lifter 把 `add x0, x0, #0x8e3` 展开成两条 IR:
+    [N]   MovI SCRATCH=0x8e3        (lifter scratch V32)
+    [N+1] Add  x0, x0, SCRATCH
 
-v33 修 (vmp-arch/src/arm64/decode.rs):
-  - BR Rn:
-      NativeCall rd: rn
-      Ret                    ← 新增, 把 NativeCall 的返回值当当前 region 的返回
-  - BLR Rn 不变 (正常调用, 继续执行)
+  codegen 在每条 IR 前以 25% 概率插 junk. junk kind 4 是
+    Xor SC1, SC1, SC1               (SC1 = V32, 跟 lifter SCRATCH 同号!)
+  插到 [N] 和 [N+1] 之间, 把 SCRATCH 清零 → Add x0 += 0 → 立即数蒸发.
 
-Ret 已有的语义: 栈空时返回 regs[0] (会被 dispatch_vm_fp 当 region 返回值).
-Tail-call 语义完全对上.
+  另一个 latent bug: junk kind 4/5 (Xor/Tst, Cmp) 改 NZCV, 插到
+  Tst+BCond 之间会让 CBZ 误判.
+
+修 (crates/vmp-codegen/src/junk.rs):
+  - SC1: 32→60, SC2: 33→61   (lifter 只到 V32/33/34, V62=load_bias,
+    V63=XZR, V60/61 没人碰)
+  - 删掉 kind 4 (Xor self → 0; Tst SC1) 和 kind 5 (Cmp SC1)
+    —— Tst/Cmp 都改 flags, 在 IR 边界插入不安全
+  - 留 4 种 safe junk: Junk / Nop / Obfuscate / "MovI SC2=0; Add SC1+=SC2"
+
+本地 sim 跑 region 124 用 standard preset: 第 3 个 BLR x0=0x5c4a2d58e3 ✓.
 
 部署:
-  1. libqvmp_runtime.so → /data/local/tmp/  (跟 v32 同一份, MD5 一样可不更新)
-  2. 33_br_tailret.hardened → 任意位置
+  1. libqvmp_runtime.so → /data/local/tmp/  (跟 v33 同份)
+  2. 34_junk_safe.hardened → 任意位置
   3. MT 双击
 
-期望 region 124 + region 8 都通过, 后续 region 继续 dispatch. 如果出
-新错就把日志整段粘.
+预期: region 124 之后该跑的 region 都能跑过, 不再出现 "立即数蒸发" 类
+的灵异 bug. ImGui 应该能起来 (这一类是会扩散到整个 VM 执行的系统性
+问题, 修完通常能放行大量原本"莫名其妙"的 crash).
 
 MD5:
-  33_br_tailret.hardened  f301e2f92f65f0fd6e4d650ade424c3b
-  libqvmp_runtime.so      ae803cacd1d87aaa0eb1be3687e3ad41  (跟 v32 同)
+  34_junk_safe.hardened  7e12b735c4fcdc3a33012025d8eb3473
+  libqvmp_runtime.so     ae803cacd1d87aaa0eb1be3687e3ad41  (同 v32/v33)
