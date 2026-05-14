@@ -15,7 +15,7 @@ use std::fs;
 use std::path::PathBuf;
 use vmp_codegen::{resolve_program, CodeGen, FunctionRegion};
 use vmp_core::{ProtectConfig, ProtectLevel};
-use vmp_isa::IsaRandomizer;
+use vmp_isa::{IsaRandomizer, VOp};
 use vmp_stub::{pack_blob, unpack_blob, StubBlob, StubRegion};
 
 #[derive(Debug, Parser)]
@@ -263,12 +263,42 @@ fn main() -> anyhow::Result<()> {
 
             // 第二遍：全局多函数解析 —— BL <另一个被保护函数> 转为 CallRegion，
             // 函数内部分支转 IR 索引，无法解析的目标占位 Trap。
-            let resolve_report = resolve_program(&mut funcs);
+            //
+            // 含 Trap 的 region 在 VM 跑会直接 Err("E8"). 级联剔除：每轮丢掉含
+            // Trap 的 region，重建 entry 表，再 resolve 一遍 (从原始 IR 副本)
+            // —— 之前 CallRegion 到现在不在的目标会变成 Trap，下一轮继续丢。
+            let pristine_funcs = funcs.clone();
+            let mut dropped: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let resolve_report = loop {
+                funcs = pristine_funcs
+                    .iter()
+                    .filter(|f| !dropped.contains(&f.name))
+                    .cloned()
+                    .collect();
+                let r = resolve_program(&mut funcs);
+                let bad: Vec<String> = funcs
+                    .iter()
+                    .filter(|f| f.ir.iter().any(|i| i.op == VOp::Trap))
+                    .map(|f| f.name.clone())
+                    .collect();
+                if bad.is_empty() {
+                    break r;
+                }
+                log::info!(
+                    "dropping {} region(s) with unresolved branches (cascade)",
+                    bad.len()
+                );
+                for n in bad {
+                    dropped.insert(n);
+                }
+            };
             log::info!(
-                "branch resolve: intra={} cross_region={} unresolved={}",
+                "branch resolve: intra={} cross_region={} unresolved={} dropped_total={}",
                 resolve_report.intra_branches,
                 resolve_report.cross_region_calls,
-                resolve_report.unresolved
+                resolve_report.unresolved,
+                dropped.len()
             );
 
             // 第三遍：每个 region 独立 codegen，用 region_idx 作 IV salt。

@@ -1,37 +1,48 @@
-qvmp_test.zip — v27 修复 VM ERROR 死循环 + 打详细错误（DT_NEEDED 路径）
-=========================================================================
+qvmp_test.zip — v28 级联剔除含 Trap 的 region（resolve 后 cascade drop）
+==========================================================================
 
-v26 反馈：
+v27 反馈：
   [qvmp] dispatching region=19
-  [qvmp] VM ERROR for region=19    ← 重复无限次
-  ...
-
-两个 bug：
-  1. v26 我 rewrite 用了 `--embed-runtime`（旧 bootstrap+dlopen，撞栈金丝雀）
-     而不是 DT_NEEDED 路径。v27 改回 DT_NEEDED：可执行文件跟
-     libqvmp_runtime.so 放同目录即可。
-  2. handler 在 VM ERROR 时只 `return`，PC 没动，内核又触发同一 BRK →
-     handler 又 return → 死循环。v27 改成 SIG_DFL + return：让内核以
-     默认 SIGTRAP 处理把进程结束（exit 133），并把单次错误的详细 message
-     带出来。
-
-期望 v27 日志（按顺序）：
-  [qvmp] rodata decrypted in place
-  [qvmp] blob loaded, SIGTRAP handler installed
-  [qvmp] dispatching region=19
-  [qvmp] VM ERR region=19 err=Eb2:E:<具体原因>
+  [qvmp] VM ERR region=19 err=Eb2:E:E8
   Trap (exit 133)
 
-把上面的 `err=...` 那段完整粘回来 — 这才是真正诊断 region 19 失败的关键。
-可能形态：
-  - Eb2:E:Lift 失败 @ 0x... : ...    （lifter 没翻译出来）
-  - Eb2:E:unknown opcode XXX          （interpreter 没实现某个 op）
-  - Eb2:E:host bridge error: ...      （helper 调用失败）
+`E8` = vmp-interpreter `VOp::Trap` 占位符。resolve 阶段遇到 BL 目标
+既不在自己 region 内、也不是别的被保护函数入口（多半是 libc PLT），
+就塞 VOp::Trap. region 19 里有这种指令 → 跑到那条就抛 E8.
 
-部署：
-  把 27_vm_err_log.hardened 和 libqvmp_runtime.so 放同一目录，
-  双击 27_vm_err_log.hardened。
+`--skip-traps` 只过滤 lift 阶段不会动 resolve 阶段加的 Trap.
+
+v28 修：在 protect 里 resolve 之后跑级联剔除循环 ——
+  1. resolve 整张表
+  2. 把 IR 里含 VOp::Trap 的 region 加入丢弃集
+  3. 从 pristine IR 副本里去掉这些 region, 重新 resolve
+  4. 直到没有 region 含 Trap
+
+本次 binary:
+  - 候选函数 3315
+  - lift kept 867 (skipped_traps=2448)
+  - cascade drop: 238 + 94 + 1 = 333 个 region 被踢
+  - 最终保护 534 个 region (unresolved=0)
+  - 被踢掉的 333 个函数原样跑 (没插跳板)
+
+DT_NEEDED 还是绝对路径 `/data/local/tmp/libqvmp_runtime.so`.
+
+部署:
+  1. libqvmp_runtime.so → /data/local/tmp/
+  2. 28_no_traps.hardened → 任意位置
+  3. MT 双击运行
+
+期望:
+  [qvmp] rodata decrypted in place
+  [qvmp] blob loaded, SIGTRAP handler installed
+  [qvmp] dispatching region=N
+  (多次)
+  <ImGui 窗口出来>
+
+如果还挂:
+  - 出现 VM ERR 把 err= 完整粘回来 (理论上不该再出 E8)
+  - SEGV 把所有 dispatching region=N 的最后一个 N 粘回来
 
 MD5:
-  27_vm_err_log.hardened  02a83bcc699b4b54e28a77213bd8022c
+  28_no_traps.hardened    d5772ccabd2becae7c1d9edc5f5eb71a
   libqvmp_runtime.so      e5ed8ecefb06df456c8ddb18aea4552b
