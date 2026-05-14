@@ -427,6 +427,42 @@ extern "C" fn sigsegv_handler(
         let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: sp=", sp as usize);
         log_msg(&buf[..n]);
     }
+
+    // Frame-pointer chain walk: AAPCS64 every prologue stores
+    //   [fp+0] = saved fp, [fp+8] = saved lr.
+    // Hand-walk up to 12 frames to give a poor-man's backtrace. Reads through
+    // raw pointers — if a frame is corrupt we'll re-fire SEGV; the kernel will
+    // then default-terminate (SA_NODEFER is *not* set on SIGSEGV).
+    let mut fp = unsafe { uc_reg(ucontext, 29) };
+    for i in 0..12 {
+        if fp == 0 || fp & 0x7 != 0 || fp < 0x1000 {
+            break;
+        }
+        let saved_fp = unsafe { *(fp as *const u64) };
+        let saved_lr = unsafe { *((fp + 8) as *const u64) };
+        {
+            let mut prefix = [0u8; 64];
+            let mut p = 0;
+            for &b in b"qvmp_runtime: frame[" {
+                prefix[p] = b; p += 1;
+            }
+            let mut dig = [0u8; 4]; let mut dn = 0; let mut v_i = i;
+            if v_i == 0 { dig[0] = b'0'; dn = 1; } else {
+                while v_i > 0 { dig[dn] = b'0' + (v_i % 10) as u8; v_i /= 10; dn += 1; }
+            }
+            for j in (0..dn).rev() { prefix[p] = dig[j]; p += 1; }
+            for &b in b"] lr=" { prefix[p] = b; p += 1; }
+            let mut buf = [0u8; 96];
+            let n = format_dispatch_msg(&mut buf, &prefix[..p], saved_lr as usize);
+            log_msg(&buf[..n]);
+        }
+        if saved_fp <= fp {
+            // FP must grow upward; stop on inversion or loop.
+            break;
+        }
+        fp = saved_fp;
+    }
+
     // Hand back to default action — process will terminate with SIGSEGV.
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();

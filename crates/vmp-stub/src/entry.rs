@@ -132,25 +132,24 @@ impl<'a> HostBridge for NestedDispatchHost<'a> {
         self.inner.store(addr, v, w)
     }
     fn native_call(&mut self, target: u64, args: &[u64]) -> vmp_core::Result<u64> {
-        // BLR Rn 时 target 可能恰好指向另一个被保护函数的 trampoline 入口。
-        // 直接调 native 会执行 trampoline 里的 BRK → 嵌套 SIGTRAP；若 handler
-        // 没装 SA_NODEFER，信号被 mask，内核 SIGTRAP 默认动作 = 终止 (exit 133).
-        // 改成识别 target == load_bias + region.patch_addr 时在 VM 里递归
-        // 调度，绕开嵌套信号 + 省掉两次上下文切换。
+        // BLR Rn 时 target 可能直接是另一个被保护函数的 trampoline 入口,
+        // 或是 `B <trampoline>` 之类的单指令蹦床. 直接调 native 会撞嵌套
+        // SIGTRAP; 即便靠 SA_NODEFER 撑住, 多两次信号上下文不便宜.
+        // 改成: 第一层匹配 patch_addr; 第二层尝试 decode target 处的 B 指令
+        // 看它跳哪 (单条 b xxx 蹦床很常见).
         let load_bias = vmp_interpreter::MAIN_EXEC_LOAD_BIAS
             .load(core::sync::atomic::Ordering::Relaxed);
         if load_bias != 0 {
-            for (idx, region) in self.blob.regions.iter().enumerate() {
-                if target == load_bias + region.patch_addr as u64 {
-                    let mut gpr = [0u64; 8];
-                    let mut fpr = [0u64; 8];
-                    for (i, v) in args.iter().take(8).enumerate() {
-                        gpr[i] = *v;
-                    }
-                    return self
-                        .vm_call_region_fp(idx as u64, &gpr, &fpr)
-                        .map(|(g, _)| g);
+            let resolved = resolve_to_region(self.blob, load_bias, target);
+            if let Some(region_id) = resolved {
+                let mut gpr = [0u64; 8];
+                let mut fpr = [0u64; 8];
+                for (i, v) in args.iter().take(8).enumerate() {
+                    gpr[i] = *v;
                 }
+                return self
+                    .vm_call_region_fp(region_id as u64, &gpr, &fpr)
+                    .map(|(g, _)| g);
             }
         }
         self.inner.native_call(target, args)
@@ -180,6 +179,51 @@ impl<'a> HostBridge for NestedDispatchHost<'a> {
             Err(StubError::Blob(s)) => Err(vmp_core::Error::vm(s)),
         }
     }
+}
+
+/// 将 target 解析为某个 region_id，否则返回 None。
+///
+/// 两层匹配:
+///   1. target == load_bias + region.patch_addr —— 直接是 trampoline 入口。
+///   2. target 处是一条 ARM64 `B imm26` 指令 —— 单条蹦床, 解出真实目标后再
+///      跟 patch_addr 比对 (rewriter 不会在 binary 里放 trampoline 的 thunk,
+///      但被保护函数之间互相 `b region_entry` 这种 tail-call 蹦床很常见).
+fn resolve_to_region(
+    blob: &super::StubBlob,
+    load_bias: u64,
+    target: u64,
+) -> Option<usize> {
+    // Layer 1
+    for (idx, region) in blob.regions.iter().enumerate() {
+        if target == load_bias + region.patch_addr as u64 {
+            return Some(idx);
+        }
+    }
+    // Layer 2: decode single B at target
+    if target & 0x3 != 0 || target < 0x1000 {
+        return None;
+    }
+    // Read with the assumption target is mapped executable (caller already
+    // gates by validation in LinuxHost.native_call). We're optimistic here;
+    // a wrong read would SEGV which the parent handler would catch.
+    let raw = unsafe { core::ptr::read_volatile(target as *const u32) };
+    // B imm26: bits 31:26 = 0b000101
+    if raw >> 26 != 0b000101 {
+        return None;
+    }
+    let imm26 = (raw & 0x03FF_FFFF) as i64;
+    let off = if imm26 & (1 << 25) != 0 {
+        imm26 | !((1 << 26) - 1)
+    } else {
+        imm26
+    } * 4;
+    let branched = (target as i64).wrapping_add(off) as u64;
+    for (idx, region) in blob.regions.iter().enumerate() {
+        if branched == load_bias + region.patch_addr as u64 {
+            return Some(idx);
+        }
+    }
+    None
 }
 
 /// 默认 host bridge：禁用所有外部调用 / 内存访问，仅适合纯逻辑测试。
