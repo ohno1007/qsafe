@@ -175,9 +175,17 @@ impl<'a> Interpreter<'a> {
                 VOp::NativeCall => {
                     // arm64 decode emits NativeCall { rd: Rn } for BLR/BR Rn —
                     // the target lives in the live VM register, not in imm.
-                    let target_ptr = self.state.regs[instr.rd as usize];
+                    let rd = instr.rd;
+                    let target_ptr = self.state.regs[rd as usize];
                     let ret = match self.host.as_deref_mut() {
-                        Some(h) => h.native_call(target_ptr, &self.state.regs[..8])?,
+                        Some(h) => h
+                            .native_call(target_ptr, &self.state.regs[..8])
+                            .map_err(|e| {
+                                Error::vm(format!(
+                                    "BLR x{} target={:#x}: {}",
+                                    rd, target_ptr, e
+                                ))
+                            })?,
                         None => return Err(Error::vm("E2")),
                     };
                     self.state.regs[0] = ret;

@@ -44,7 +44,8 @@ extern "C" fn qvmp_init() {
     if let Some(blob) = discover_and_decrypt_blob() {
         let _ = BLOB.set(blob);
         install_sigtrap_handler();
-        log_msg(b"qvmp_runtime: blob loaded, SIGTRAP handler installed\0");
+        install_sigsegv_logger();
+        log_msg(b"qvmp_runtime: blob loaded, SIGTRAP+SIGSEGV handlers installed\0");
     } else {
         log_msg(b"qvmp_runtime: no QVMP payload found in any loaded ELF\0");
     }
@@ -340,6 +341,56 @@ fn sig_dfl_sigtrap() {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = libc::SIG_DFL;
         libc::sigaction(libc::SIGTRAP, &sa, std::ptr::null_mut());
+    }
+}
+
+/// Catch SEGVs (typically from a VM-issued native call landing on a bad
+/// function pointer) and log pc + fault address before letting the kernel
+/// terminate. Without this, MT 管理器 just shows a bare "Segmentation fault".
+fn install_sigsegv_logger() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigsegv_handler as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
+    }
+}
+
+extern "C" fn sigsegv_handler(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    ucontext: *mut c_void,
+) {
+    let fault_addr = unsafe { *((info as *const u8).add(16) as *const u64) };
+    let pc = unsafe { uc_pc(ucontext) };
+    let lr = unsafe { uc_reg(ucontext, 30) };
+    {
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: SIGSEGV sig=", sig as usize);
+        log_msg(&buf[..n]);
+    }
+    {
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: SIGSEGV pc=", pc as usize);
+        log_msg(&buf[..n]);
+    }
+    {
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: SIGSEGV addr=", fault_addr as usize);
+        log_msg(&buf[..n]);
+    }
+    {
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: SIGSEGV lr=", lr as usize);
+        log_msg(&buf[..n]);
+    }
+    // Hand back to default action — process will terminate with SIGSEGV.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        libc::sigaction(sig, &sa, std::ptr::null_mut());
     }
 }
 

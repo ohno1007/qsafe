@@ -11,6 +11,8 @@ pub struct LinuxHost {
     pub allow_raw_memory: bool,
     /// dispatch_vm 总耗时基准（new 时刻），用于在 sys_exit 时打印 VMP 总损耗
     pub start: std::time::Instant,
+    /// 缓存 /proc/self/maps 中的可执行段区间，懒加载。
+    exec_ranges: Vec<(u64, u64)>,
 }
 
 impl Default for LinuxHost {
@@ -21,7 +23,38 @@ impl Default for LinuxHost {
 
 impl LinuxHost {
     pub fn new() -> Self {
-        Self { allow_raw_memory: true, start: std::time::Instant::now() }
+        Self {
+            allow_raw_memory: true,
+            start: std::time::Instant::now(),
+            exec_ranges: Vec::new(),
+        }
+    }
+
+    /// 解析 /proc/self/maps，重建可执行段表。失败静默 —— 后续校验会降级为
+    /// "不在 cache 内即不允许"，但调用方可选择忽略不校验。
+    fn refresh_exec_ranges(&mut self) {
+        let Ok(s) = std::fs::read_to_string("/proc/self/maps") else { return };
+        let mut v: Vec<(u64, u64)> = Vec::new();
+        for line in s.lines() {
+            // 行格式: addr-addr perms offset dev inode path
+            let mut it = line.split_whitespace();
+            let Some(range) = it.next() else { continue };
+            let Some(perms) = it.next() else { continue };
+            if perms.len() < 3 || perms.as_bytes().get(2) != Some(&b'x') {
+                continue;
+            }
+            let Some((a, b)) = range.split_once('-') else { continue };
+            let (Ok(start), Ok(end)) = (
+                u64::from_str_radix(a, 16),
+                u64::from_str_radix(b, 16),
+            ) else { continue };
+            v.push((start, end));
+        }
+        self.exec_ranges = v;
+    }
+
+    fn target_in_exec(&self, t: u64) -> bool {
+        self.exec_ranges.iter().any(|&(s, e)| t >= s && t < e)
     }
 }
 
@@ -57,30 +90,47 @@ impl HostBridge for LinuxHost {
     }
 
     fn native_call(&mut self, target: u64, args: &[u64]) -> Result<u64> {
+        // 第一道防线：基本健全性。
         if target == 0 {
-            return Err(Error::vm("LinuxHost.native_call: 空指针"));
+            return Err(Error::vm("native_call: 空指针 target=0"));
         }
-        // 通过函数指针直接调用，最多 6 个 u64 参数（与 SysV / AAPCS64 对齐）
-        unsafe {
-            type F0 = extern "C" fn() -> u64;
-            type F1 = extern "C" fn(u64) -> u64;
-            type F2 = extern "C" fn(u64, u64) -> u64;
-            type F3 = extern "C" fn(u64, u64, u64) -> u64;
-            type F4 = extern "C" fn(u64, u64, u64, u64) -> u64;
-            type F5 = extern "C" fn(u64, u64, u64, u64, u64) -> u64;
-            type F6 = extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64;
-            let p = target as *const ();
-            let r = match args.len() {
-                0 => (core::mem::transmute::<_, F0>(p))(),
-                1 => (core::mem::transmute::<_, F1>(p))(args[0]),
-                2 => (core::mem::transmute::<_, F2>(p))(args[0], args[1]),
-                3 => (core::mem::transmute::<_, F3>(p))(args[0], args[1], args[2]),
-                4 => (core::mem::transmute::<_, F4>(p))(args[0], args[1], args[2], args[3]),
-                5 => (core::mem::transmute::<_, F5>(p))(args[0], args[1], args[2], args[3], args[4]),
-                _ => (core::mem::transmute::<_, F6>(p))(args[0], args[1], args[2], args[3], args[4], args[5]),
-            };
-            Ok(r)
+        if target & 3 != 0 {
+            return Err(Error::vm(format!(
+                "native_call: target 未对齐 {:#x}",
+                target
+            )));
         }
+        if target < 0x1000 {
+            return Err(Error::vm(format!(
+                "native_call: target 落在低地址（疑似垃圾） {:#x}",
+                target
+            )));
+        }
+
+        // 第二道：必须落在某个 r-x 段。第一次未命中时刷新一次 cache，
+        // 应对 dlopen 之后新映射的库。
+        if !self.target_in_exec(target) {
+            self.refresh_exec_ranges();
+            if !self.target_in_exec(target) {
+                return Err(Error::vm(format!(
+                    "native_call: target {:#x} 不在任何可执行映射内",
+                    target
+                )));
+            }
+        }
+
+        // ARM64 AAPCS64 支持 x0..x7 全部为整数参数。固定走 F8 即可，
+        // 多出的参数在被调函数侧会被忽略 —— 比 F6 截断更兼容。
+        type F8 = extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+        let mut a = [0u64; 8];
+        for (i, v) in args.iter().take(8).enumerate() {
+            a[i] = *v;
+        }
+        let p = target as *const ();
+        let r = unsafe {
+            (core::mem::transmute::<_, F8>(p))(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7])
+        };
+        Ok(r)
     }
 
     fn syscall(&mut self, no: u64, args: &[u64]) -> Result<u64> {
