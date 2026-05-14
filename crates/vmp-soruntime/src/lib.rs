@@ -392,29 +392,50 @@ unsafe fn uc_set_pc(ucontext: *mut c_void, val: u64) {
 
 extern "C" fn sigtrap_handler(
     _sig: libc::c_int,
-    _info: *mut libc::siginfo_t,
+    info: *mut libc::siginfo_t,
     ucontext: *mut c_void,
 ) {
     log_msg(b"qvmp_runtime: SIGTRAP handler entered\0");
 
+    // si_addr (kernel's authoritative trap address) is at byte offset 16
+    // in siginfo_t for SIGTRAP. Read it directly to cross-check our PC offset.
+    let si_addr = unsafe { *((info as *const u8).add(16) as *const u64) };
+    {
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: si_addr=", si_addr as usize);
+        log_msg(&buf[..n]);
+    }
+
     let pc = unsafe { uc_pc(ucontext) };
-
     {
         let mut buf = [0u8; 96];
-        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: PC=", pc as usize);
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: ucontext.pc=", pc as usize);
         log_msg(&buf[..n]);
     }
 
-    let inst = unsafe { *(pc as *const u32) };
+    // Use si_addr as the authoritative PC — it's what the kernel knows.
+    let real_pc = si_addr;
+
+    let inst = unsafe { *(real_pc as *const u32) };
     {
         let mut buf = [0u8; 96];
-        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: PC inst=0x", inst as usize);
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: inst@si_addr=", inst as usize);
         log_msg(&buf[..n]);
     }
+
+    // For the rest of the handler, use si_addr as PC.
+    let pc = real_pc;
 
     // BRK encoding: 1101 0100 001 imm16 0 0000  →  base 0xD420_0000, imm16 in [20:5]
     if (inst & 0xFFE0_001F) != 0xD420_0000 {
-        log_msg(b"qvmp_runtime: not a BRK, returning\0");
+        log_msg(b"qvmp_runtime: not a BRK; restoring SIG_DFL to avoid infinite loop\0");
+        // Reset SIGTRAP to default so the kernel terminates the process instead
+        // of re-invoking us on the same non-BRK instruction.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = libc::SIG_DFL;
+            libc::sigaction(libc::SIGTRAP, &sa, std::ptr::null_mut());
+        }
         return;
     }
     let imm16 = ((inst >> 5) & 0xFFFF) as u16;
