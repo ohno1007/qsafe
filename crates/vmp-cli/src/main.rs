@@ -318,6 +318,43 @@ fn main() -> anyhow::Result<()> {
                 );
             }
 
+            // QVMP_REGION_RANGE=start,end (after all other filters)：保留索引区
+            // 间 [start, end) 内的 region. 用于二分定位坏 region.
+            if let Ok(range) = std::env::var("QVMP_REGION_RANGE") {
+                if let Some((s, e)) = range.split_once(',') {
+                    let s: usize = s.parse().unwrap_or(0);
+                    let e: usize = e.parse().unwrap_or(usize::MAX);
+                    let before = funcs.len();
+                    funcs = funcs.into_iter().enumerate()
+                        .filter(|(i, _)| *i >= s && *i < e)
+                        .map(|(_, f)| f)
+                        .collect();
+                    log::info!(
+                        "QVMP_REGION_RANGE={}..{}: kept {} regions (was {})",
+                        s, e, funcs.len(), before
+                    );
+                }
+            }
+
+            // QVMP_DROP_FP=1: drop any region whose IR uses floating-point ops.
+            // ARM64 FP/NEON 的 lifter 覆盖窄, 也是 leaf-only 后剩下最可疑的指令类.
+            if std::env::var("QVMP_DROP_FP").is_ok() {
+                let before = funcs.len();
+                funcs.retain(|f| {
+                    !f.ir.iter().any(|i| matches!(
+                        i.op,
+                        VOp::FLoad | VOp::FStore | VOp::FMovR | VOp::FMovFromGpr
+                        | VOp::FMovToGpr | VOp::FAdd | VOp::FSub | VOp::FMul
+                        | VOp::FDiv | VOp::FCmp | VOp::FCvtZS | VOp::SCvtF
+                    ))
+                });
+                log::info!(
+                    "QVMP_DROP_FP: kept {} regions (dropped {} FP-using)",
+                    funcs.len(),
+                    before - funcs.len()
+                );
+            }
+
             // 第三遍：每个 region 独立 codegen，用 region_idx 作 IV salt。
             let mut pool: Vec<u8> = Vec::new();
             let mut regions: Vec<StubRegion> = Vec::new();
