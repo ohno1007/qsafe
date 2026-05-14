@@ -433,28 +433,36 @@ extern "C" fn sigtrap_handler(
         let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: expected x16=", imm16_low as usize);
         log_msg(&buf[..n]);
     }
-    // Scan ucontext bytes from offset 0 to 1024 looking for u64 == imm16_low
+    // Dump u64 values at offsets 176..464 (32-byte chunks should cover mcontext
+    // regs + sp + pc). Format: "uc[OFFSET]=VALUE" so we can manually identify
+    // which offset has x16 (should be region_id), x30 (LR), sp, pc, etc.
     {
         let base = ucontext as *const u8;
-        for off in (0..1024).step_by(8) {
+        let mut off = 176usize;
+        while off < 472 {
             let v = unsafe { *((base.add(off)) as *const u64) };
-            if v == imm16_low {
-                let mut buf = [0u8; 96];
-                let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: found x16 candidate at offset=", off);
-                log_msg(&buf[..n]);
+            let mut buf = [0u8; 128];
+            // Combined log: "uc[<off>]=<val>"
+            let mut p = 0;
+            let prefix = b"qvmp_runtime: uc[";
+            for &b in prefix { if p < buf.len() { buf[p] = b; p += 1; } }
+            // off as decimal
+            let mut digits = [0u8; 8]; let mut n = 0; let mut v_o = off;
+            if v_o == 0 { digits[0] = b'0'; n = 1; } else {
+                while v_o > 0 { digits[n] = b'0' + (v_o % 10) as u8; v_o /= 10; n += 1; }
             }
-        }
-    }
-    // Also scan for si_addr (= PC) value
-    {
-        let base = ucontext as *const u8;
-        for off in (0..1024).step_by(8) {
-            let v = unsafe { *((base.add(off)) as *const u64) };
-            if v == si_addr {
-                let mut buf = [0u8; 96];
-                let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: found pc candidate at offset=", off);
-                log_msg(&buf[..n]);
+            for i in (0..n).rev() { if p < buf.len() { buf[p] = digits[i]; p += 1; } }
+            // "]="
+            for &b in b"]=" { if p < buf.len() { buf[p] = b; p += 1; } }
+            // val as decimal
+            let mut vdig = [0u8; 24]; let mut vn = 0; let mut vv = v;
+            if vv == 0 { vdig[0] = b'0'; vn = 1; } else {
+                while vv > 0 { vdig[vn] = b'0' + (vv % 10) as u8; vv /= 10; vn += 1; }
             }
+            for i in (0..vn).rev() { if p < buf.len() { buf[p] = vdig[i]; p += 1; } }
+            if p < buf.len() { buf[p] = 0; }
+            log_msg(&buf[..p]);
+            off += 8;
         }
     }
 

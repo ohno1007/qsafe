@@ -1,39 +1,30 @@
-qvmp_test.zip — v24 ucontext 偏移自动定位
-==========================================
+qvmp_test.zip — v25 dump ucontext bytes 176..472
+==================================================
 
-v23 关键发现:
-  si_addr = 0x5805EDC134       (kernel 说的真 PC)
-  ucontext.pc(我读) = 0x7FD4D22330  (跟 si_addr 完全不同!)
-  inst@si_addr = 0xD42A2AE0    (★ 是 BRK! imm16 高字节 0x51='Q' ✓)
-  imm16 低字节 0x57 = region_id 87
+v24 找到了 pc 在 offset 440 (而不是我猜的 432, 差 8 字节). 但没找到
+x16=87 在任何位置. 怪.
 
-确认: SIGTRAP 真的从我们的 trampoline 触发, kernel 也正确告诉我 PC.
-但我读 ucontext 的偏移错了 (差 120 字节左右), 所以读 regs[16] 拿到
-垃圾, region_id OOB.
+这版直接 dump ucontext[176..472] 范围内所有 u64 值, 一个偏移一行,
+让我们肉眼挑出谁是 x16 (= 87), 谁是 x30 (= LR, 大地址), 谁是 sp.
 
-v24 自动扫描 ucontext 找到正确偏移:
+期望日志格式 (大量):
+  [qvmp] qvmp_runtime: uc[176]=<v>     ← 应该是 fault_address (从 sigcontext 看)
+  [qvmp] qvmp_runtime: uc[184]=<v>     ← 应该是 regs[0]
+  [qvmp] qvmp_runtime: uc[192]=<v>     ← regs[1]
+  ...
+  [qvmp] qvmp_runtime: uc[312]=<v>     ← 标准 layout 下应该是 regs[16] = 87
+  ...
+  [qvmp] qvmp_runtime: uc[424]=<v>     ← regs[30] = LR
+  [qvmp] qvmp_runtime: uc[432]=<v>     ← sp
+  [qvmp] qvmp_runtime: uc[440]=<v>     ← pc (已确认)
+  [qvmp] qvmp_runtime: uc[448]=<v>     ← pstate
 
-  - 扫 0..1024 字节, 看哪个 u64 == 87 (region_id, 我们知道这个值)
-  - 扫 0..1024 字节, 看哪个 u64 == si_addr (kernel 给我们的 PC)
-  - 找到的偏移就是 x16 / pc 实际所在位置
+我们找:
+  - 哪个 offset 的 u64 等于 87 (region_id) → x16 真实偏移
+  - 哪个 offset 的 u64 是 PC 附近的某值 → LR
 
-打印两类候选位置, 然后还原 SIG_DFL 自杀退出 (不死循环).
-
-跑完贴日志:
-  [qvmp] qvmp_runtime: SIGTRAP handler entered
-  [qvmp] qvmp_runtime: si_addr=...
-  [qvmp] qvmp_runtime: ucontext.pc=...
-  [qvmp] qvmp_runtime: inst@si_addr=...
-  [qvmp] qvmp_runtime: expected x16=87
-  [qvmp] qvmp_runtime: found x16 candidate at offset=N1   ← 关键
-  [qvmp] qvmp_runtime: found x16 candidate at offset=N2 (可能多个)
-  [qvmp] qvmp_runtime: found pc candidate at offset=M     ← 关键
-  Segmentation fault / Trap
-
-拿到 N (x16 偏移) 和 M (pc 偏移) 我就能写对所有 ucontext 访问.
-
-只换 libqvmp_runtime.so. MT 双击 hardened.
+把全部 uc[N]=V 行都贴回来. 数据很多但有规律, 我能从中识别字段位置.
 
 MD5:
   23_dt_needed.hardened   38c462247de8c6810b8862608b638d3a
-  libqvmp_runtime.so      47f8a7b0b2e55a0860c9e2d02faaf8e8
+  libqvmp_runtime.so      2298906c67d659faf8271d9b1a9eda02
