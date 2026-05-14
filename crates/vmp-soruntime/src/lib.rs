@@ -423,7 +423,50 @@ extern "C" fn sigtrap_handler(
         log_msg(&buf[..n]);
     }
 
-    // For the rest of the handler, use si_addr as PC.
+    // Discover the actual regs offset: scan ucontext for a u64 == region_id
+    // (low byte of BRK's imm16, plus a tentative match for x16). The trampoline
+    // sets `mov x16, #region_id`, so somewhere in ucontext there must be a u64
+    // equal to that region_id.
+    let imm16_low = ((inst >> 5) & 0xFF) as u64;
+    {
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: expected x16=", imm16_low as usize);
+        log_msg(&buf[..n]);
+    }
+    // Scan ucontext bytes from offset 0 to 1024 looking for u64 == imm16_low
+    {
+        let base = ucontext as *const u8;
+        for off in (0..1024).step_by(8) {
+            let v = unsafe { *((base.add(off)) as *const u64) };
+            if v == imm16_low {
+                let mut buf = [0u8; 96];
+                let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: found x16 candidate at offset=", off);
+                log_msg(&buf[..n]);
+            }
+        }
+    }
+    // Also scan for si_addr (= PC) value
+    {
+        let base = ucontext as *const u8;
+        for off in (0..1024).step_by(8) {
+            let v = unsafe { *((base.add(off)) as *const u64) };
+            if v == si_addr {
+                let mut buf = [0u8; 96];
+                let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: found pc candidate at offset=", off);
+                log_msg(&buf[..n]);
+            }
+        }
+    }
+
+    // For now, halt the loop to allow user to read the offsets
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        libc::sigaction(libc::SIGTRAP, &sa, std::ptr::null_mut());
+    }
+    return;
+
+    #[allow(unreachable_code)]
     let pc = real_pc;
 
     // BRK encoding: 1101 0100 001 imm16 0 0000  →  base 0xD420_0000, imm16 in [20:5]

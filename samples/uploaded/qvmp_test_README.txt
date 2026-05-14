@@ -1,49 +1,39 @@
-qvmp_test.zip — v23 si_addr 比对 + 死循环止血
-==============================================
+qvmp_test.zip — v24 ucontext 偏移自动定位
+==========================================
 
-v22 出现 SIGTRAP 死循环: handler 接到 SIGTRAP, PC=高地址 (0x7FD14E5A30),
-PC 上的指令是 ADR X3 (0x30D19763), 不是 BRK, 我们 return, kernel 重复
-fire SIGTRAP. 永远不会触发我们的 trampoline.
+v23 关键发现:
+  si_addr = 0x5805EDC134       (kernel 说的真 PC)
+  ucontext.pc(我读) = 0x7FD4D22330  (跟 si_addr 完全不同!)
+  inst@si_addr = 0xD42A2AE0    (★ 是 BRK! imm16 高字节 0x51='Q' ✓)
+  imm16 低字节 0x57 = region_id 87
 
-可能原因:
-  1. 我读的 PC offset 错了 (Rust libc 跟 bionic 不一致),
-     高地址值是其它字段被误读
-  2. PC offset 对的, 但 SIGTRAP 真的从那个非-BRK 地址触发的
-     (硬件断点 / ptrace single-step / 你那 launcher 的某种监控)
+确认: SIGTRAP 真的从我们的 trampoline 触发, kernel 也正确告诉我 PC.
+但我读 ucontext 的偏移错了 (差 120 字节左右), 所以读 regs[16] 拿到
+垃圾, region_id OOB.
 
-v23 加两件事:
+v24 自动扫描 ucontext 找到正确偏移:
 
-A. 同时读 siginfo_t.si_addr (kernel 写的"trap 地址") 和 ucontext.pc.
-   两者应该一致. 如果差很多 → 我的 PC offset 错.
-   用 si_addr 作为权威 PC 来读指令字.
+  - 扫 0..1024 字节, 看哪个 u64 == 87 (region_id, 我们知道这个值)
+  - 扫 0..1024 字节, 看哪个 u64 == si_addr (kernel 给我们的 PC)
+  - 找到的偏移就是 x16 / pc 实际所在位置
 
-B. 死循环止血: 如果不是 BRK, 还原 SIGTRAP 为默认 (SIG_DFL), kernel 接下来
-   把进程杀掉, 至少不会卡死.
+打印两类候选位置, 然后还原 SIG_DFL 自杀退出 (不死循环).
 
-期望日志:
+跑完贴日志:
+  [qvmp] qvmp_runtime: SIGTRAP handler entered
+  [qvmp] qvmp_runtime: si_addr=...
+  [qvmp] qvmp_runtime: ucontext.pc=...
+  [qvmp] qvmp_runtime: inst@si_addr=...
+  [qvmp] qvmp_runtime: expected x16=87
+  [qvmp] qvmp_runtime: found x16 candidate at offset=N1   ← 关键
+  [qvmp] qvmp_runtime: found x16 candidate at offset=N2 (可能多个)
+  [qvmp] qvmp_runtime: found pc candidate at offset=M     ← 关键
+  Segmentation fault / Trap
 
-  [qvmp] ... rodata decrypted in place
-  [qvmp] ... blob loaded, SIGTRAP handler installed
-  [qvmp] ... SIGTRAP handler entered
-  [qvmp] ... si_addr=<X>            ← kernel 说的 trap 地址
-  [qvmp] ... ucontext.pc=<Y>        ← 我读的 PC
-  [qvmp] ... inst@si_addr=<I>       ← si_addr 指向的指令字
-  -- 然后看 inst 是不是 BRK --
-  if BRK: [qvmp] ... dispatching region=N ...
-  if NOT: [qvmp] ... not a BRK; restoring SIG_DFL...
-  -- 然后进程死, 不再死循环 --
+拿到 N (x16 偏移) 和 M (pc 偏移) 我就能写对所有 ucontext 访问.
 
-关键看:
-  X == Y? 如果一样 → 我的 PC offset 对的, SIGTRAP 真从那地址触发
-  X != Y? 数差多少 → 算出正确 offset
-
-X 是真 PC. 如果 X 在主 exec 范围内 (= load_bias + 主 binary vaddr),
-inst 应该是 BRK (0xD42...), 那我们就能 dispatch.
-如果 X 在 high address (cdylib 或其它 .so 范围), 那 SIGTRAP 来源不是我们
-的 trampoline, 是别的什么东西.
-
-只换 libqvmp_runtime.so, MT 双击 23_dt_needed.hardened, 把前几条日志贴回来.
+只换 libqvmp_runtime.so. MT 双击 hardened.
 
 MD5:
   23_dt_needed.hardened   38c462247de8c6810b8862608b638d3a
-  libqvmp_runtime.so      11167db729f9f81ea6184c35ae3c3513
+  libqvmp_runtime.so      47f8a7b0b2e55a0860c9e2d02faaf8e8
