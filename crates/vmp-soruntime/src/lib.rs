@@ -350,26 +350,40 @@ extern "C" fn sigtrap_handler(
     _info: *mut libc::siginfo_t,
     ucontext: *mut c_void,
 ) {
+    // Unconditional entry log — proves handler is being invoked.
+    log_msg(b"qvmp_runtime: SIGTRAP handler entered\0");
+
     // SAFETY: the kernel populates ucontext_t for the trapping thread; we only
     // mutate the mcontext_t::regs / pc of *this* signal frame, which is the
     // standard handoff pattern (e.g. JITs use this for guard pages).
     let uc = unsafe { &mut *(ucontext as *mut libc::ucontext_t) };
     let pc = uc.uc_mcontext.pc;
 
-    // Verify this is one of our trampoline BRKs.
+    // Log PC and the instruction word at PC
     let inst = unsafe { *(pc as *const u32) };
+    {
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: PC inst=0x", inst as usize);
+        log_msg(&buf[..n]);
+    }
+
     // BRK encoding: 1101 0100 001 imm16 0 0000  →  base 0xD420_0000, imm16 in [20:5]
     if (inst & 0xFFE0_001F) != 0xD420_0000 {
+        log_msg(b"qvmp_runtime: not a BRK, returning\0");
         return;
     }
     let imm16 = ((inst >> 5) & 0xFFFF) as u16;
     if imm16 & 0xFF00 != 0x5100 {
-        return; // BRK with foreign imm16 (debugger / ASAN), not ours
+        log_msg(b"qvmp_runtime: foreign BRK imm16, returning\0");
+        return;
     }
 
     let blob = match BLOB.get() {
         Some(b) => b,
-        None => return,
+        None => {
+            log_msg(b"qvmp_runtime: BLOB not set, returning\0");
+            return;
+        }
     };
 
     // X16 carries the full region_id (the trampoline `mov x16, #N` is the

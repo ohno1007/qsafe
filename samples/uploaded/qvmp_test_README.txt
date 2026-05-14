@@ -1,38 +1,41 @@
-qvmp_test.zip — v20 dispatch_vm logging
-========================================
+qvmp_test.zip — v21 handler entry tracing
+==========================================
 
-v19 进展: cdylib qvmp_init 全部跑通, SIGTRAP handler 装好. 然后 SEGV.
-说明 SEGV 在 dispatch_vm 内部 (VM 解释器跑某个 region 时崩).
+v20 没看到 "dispatching region=" 日志 → handler 要么没被调用，要么早期 return。
+这版 handler 一进来就 log 一行无条件标记，并且每个 return 分支都加 log，
+告诉我们 handler 是否被调用、走到哪个分支。
 
-v20 给 cdylib 加了详细日志:
+期望日志(顺序):
 
-  [qvmp] qvmp_runtime: dispatching region=N
-  [qvmp] qvmp_runtime: VM returned region=N      (成功)
-  [qvmp] qvmp_runtime: VM ERROR for region=N    (dispatch_vm 返回 Err)
+  [qvmp] qvmp_runtime: rodata decrypted in place
+  [qvmp] qvmp_runtime: blob loaded, SIGTRAP handler installed
+  -- 然后 main exec INIT_ARRAY 开始跑 --
+  [qvmp] qvmp_runtime: SIGTRAP handler entered           ★ 第一个 BRK
+  [qvmp] qvmp_runtime: PC inst=0x<指令字>               ★ 触发的指令
+  [qvmp] qvmp_runtime: dispatching region=N             ★ 进入 dispatch
+  [qvmp] qvmp_runtime: VM returned region=N             ★ dispatch 成功返回
+  -- 后面 N 个类似的循环 --
+
+可能的结果:
+
+  情景 A — 看不到 "SIGTRAP handler entered"
+           → handler 完全没被调用. SEGV 来源不是 BRK 而是其他原因
+             (比如 cdylib 加载完后 main exec INIT_ARRAY 的 C++ static
+              init 内部访问坏内存, 跟我们的修改有关).
   
-  如果 dispatch 中间 SEGV, 我们会看到 "dispatching" 但没有 "returned/ERROR"
-  → 知道是哪个 region_id 触发的崩, 后面能定位.
-
-部署 (跟 v19 一样, 两个文件):
+  情景 B — 看到 entered + PC inst, 然后看到 "not a BRK" 或 "foreign BRK"
+           → 触发的不是我们的 trampoline BRK. PC 上的指令 word 能告诉
+             我们触发了什么. 然后 handler return, SIGTRAP 默认 kill (133).
+             但你看到 139, 那这种情况 SEGV 应该来自后续.
   
-  /data/local/tmp/libqvmp_runtime.so   (★ 这版新)
-  23_dt_needed.hardened                 (可以原地址,没改)
+  情景 C — 看到 entered + PC inst (是 0xd42a... BRK), 看到 dispatching
+           然后 SEGV → 我们已经知道，dispatch_vm 内部崩, 需要更细 log
   
-  MT 管理器双击 hardened, 看输出.
+  情景 D — 看到 entered, 然后 SEGV (没看到 PC inst log)
+           → handler 在读 PC 指令时崩 (PC 不可读)
 
-我希望看到的:
-
-  情景 A — 多条 dispatching/returned 配对, ImGui GUI 起来
-           → ★ 全部跑通, region 都顺序处理
-  情景 B — 单条 "dispatching region=X" 然后 SEGV
-           → region X 内部某个 VOp 崩, 我可以加更细 log 进 dispatch_vm
-  情景 C — 多条 dispatching/returned 然后 SEGV
-           → 某个 region 跑完后才崩, 可能 PC=LR 跳到错地方
-  情景 D — 一条 dispatching 都没看到, 直接 SEGV
-           → handler 自己崩 (FPSIMD 偏移、ucontext 解析等)
+只换 libqvmp_runtime.so, 不动 hardened. 跑完把整段 [qvmp] 日志贴回来.
 
 MD5:
   23_dt_needed.hardened   38c462247de8c6810b8862608b638d3a
-  libqvmp_runtime.so      6e07c5c5e0d66b2d8c930cdeef38af9e
-
-把整段 [qvmp] 日志 + 后面的错误一起贴回来.
+  libqvmp_runtime.so      2354b5f445773f17f5f026a57a392340
