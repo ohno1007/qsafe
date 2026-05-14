@@ -1,29 +1,42 @@
-qvmp_test.zip — diagnostic v15 (INIT_ARRAY[0] + exit_group)
-============================================================
+qvmp_test.zip — diagnostic v16 (SIGTRAP handler install probe)
+==============================================================
 
-v14 双 hook 还是 error 133. 即 launcher 既不走 e_entry 也不走 _start[0].
-最可能的解释: **launcher 把 binary 当 shared lib 用 dlopen 加载**, 这种
-情况下 dlopen 只会跑 INIT_ARRAY, 不调用 _start / e_entry.
+v15 = error 99 ✓ INIT_ARRAY[0] hijack 起作用, launcher 真的走 INIT_ARRAY.
 
-这次劫持 INIT_ARRAY[0] 的 R_AARCH64_RELATIVE 重定位, 让它指向我们的
-wrapper. wrapper 内部:
+下一步避开"在 INIT_ARRAY 里调 dlopen 触发栈金丝雀"的问题. 思路:
 
-  stp x29,x30,[sp,#-16]!
-  bl bootstrap         ; bootstrap 还是 mov x0,#99; ret
-  ldp x29,x30,[sp],#16
-  mov x8, #93          ; SYS_exit
-  svc #0               ; exit_group(x0) — x0 = 99 from bootstrap
+  1. INIT_ARRAY[0] wrapper 通过 raw rt_sigaction syscall 装一个最小
+     SIGTRAP handler (没调 libc, 没 dlopen)
+  2. wrapper 然后正常 tail-call 原 INIT_ARRAY[0] 函数
+  3. 其他 INIT_ARRAY entries 跑下去, 总会有个调到保护函数 → BRK
+  4. 我们的 SIGTRAP handler 接住, 处理
+
+v16 是"测试 handler 安装路径能不能起作用"的诊断版. handler 不做正经
+活, 接到 BRK 就 exit_group(200).
+
+  bootstrap:
+      在栈上 build sigaction 结构 (handler=&handler_exit_200, flags=SA_SIGINFO|RESTORER|RESTART)
+      rt_sigaction(SIGTRAP, &sa, NULL, 8)
+      ret with x0 = 99
+  wrapper:
+      bl bootstrap
+      b orig_first_init  ; 这个会触发被保护函数的 trampoline → BRK
+  handler:
+      mov x0, #200
+      SYS_exit_group
+      svc #0
 
 期望:
 
-  error 99   → ★ launcher 走 INIT_ARRAY! 我们终于找到正确的 hook 点.
-              下一步换回 full bootstrap (但不调 dlopen during INIT_ARRAY,
-              避免栈金丝雀问题) — install SIGTRAP handler via raw syscall,
-              handler 自己负责后续 dlopen.
-  error 133  → launcher 连 INIT_ARRAY 都不调... 那它在干啥? 直接读取并
-              解码 binary 字节执行某个特定符号? 比如 main? __libc_init?
+  error 200  → ★ raw syscall 装 SIGTRAP handler 成功, BRK 被我们接住.
+              下一步在 handler 里 dlopen cdylib (signal context, 不在
+              INIT_ARRAY 里, 应该避开金丝雀).
+  error 133  → handler 没装上 (rt_sigaction syscall 失败) 或者没被调用.
+              需要 debug rt_sigaction 参数.
+  error 99   → wrapper 跑完 bootstrap, b orig_init 没触发 BRK?? 不可能,
+              orig_init 已经 patched, 必定 BRK.
   其他       → 告诉我具体数字
 
-直接 MT 管理器双击 19_init_array_99.hardened, 看 error N.
+直接 MT 管理器双击 20_sigtrap_install.hardened, 看 error N.
 
-MD5: 8c49a99ac96c854e5f97e5c47978d751
+MD5: ece825bab204f8e33475578050542b16
