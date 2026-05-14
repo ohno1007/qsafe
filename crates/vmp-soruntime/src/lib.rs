@@ -345,21 +345,66 @@ fn install_sigtrap_handler() {
     }
 }
 
+// Bionic-specific ucontext_t layout offsets (from start of ucontext_t).
+// Rust's libc crate assumes glibc layout (sigset_t = 128 bytes) but bionic
+// uses sigset_t = 8 bytes + 120 bytes __padding. Reading `uc.uc_mcontext.pc`
+// via Rust libc on Android lands in the padding region → garbage value →
+// SEGV when used as a pointer. So we access via raw byte offsets that match
+// bionic's actual layout:
+//   ucontext_t {
+//     uc_flags:   0
+//     uc_link:    8
+//     uc_stack:   16  (24 bytes)
+//     uc_sigmask: 40  (8 bytes)
+//     __padding:  48  (120 bytes)
+//     uc_mcontext: 168 =
+//       fault_address: 168
+//       regs[31]:      176 .. 424
+//       sp:            424
+//       pc:            432
+//       pstate:        440
+//       __reserved:    448 (4096 bytes)
+//   }
+const UC_REGS_OFFSET: usize = 176; // regs[0]
+const UC_PC_OFFSET: usize = 432;
+const UC_RESERVED_OFFSET: usize = 448;
+
+#[inline(always)]
+unsafe fn uc_reg(ucontext: *mut c_void, idx: usize) -> u64 {
+    let p = (ucontext as *const u8).add(UC_REGS_OFFSET + idx * 8) as *const u64;
+    *p
+}
+#[inline(always)]
+unsafe fn uc_set_reg(ucontext: *mut c_void, idx: usize, val: u64) {
+    let p = (ucontext as *mut u8).add(UC_REGS_OFFSET + idx * 8) as *mut u64;
+    *p = val;
+}
+#[inline(always)]
+unsafe fn uc_pc(ucontext: *mut c_void) -> u64 {
+    let p = (ucontext as *const u8).add(UC_PC_OFFSET) as *const u64;
+    *p
+}
+#[inline(always)]
+unsafe fn uc_set_pc(ucontext: *mut c_void, val: u64) {
+    let p = (ucontext as *mut u8).add(UC_PC_OFFSET) as *mut u64;
+    *p = val;
+}
+
 extern "C" fn sigtrap_handler(
     _sig: libc::c_int,
     _info: *mut libc::siginfo_t,
     ucontext: *mut c_void,
 ) {
-    // Unconditional entry log — proves handler is being invoked.
     log_msg(b"qvmp_runtime: SIGTRAP handler entered\0");
 
-    // SAFETY: the kernel populates ucontext_t for the trapping thread; we only
-    // mutate the mcontext_t::regs / pc of *this* signal frame, which is the
-    // standard handoff pattern (e.g. JITs use this for guard pages).
-    let uc = unsafe { &mut *(ucontext as *mut libc::ucontext_t) };
-    let pc = uc.uc_mcontext.pc;
+    let pc = unsafe { uc_pc(ucontext) };
 
-    // Log PC and the instruction word at PC
+    {
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: PC=", pc as usize);
+        log_msg(&buf[..n]);
+    }
+
     let inst = unsafe { *(pc as *const u32) };
     {
         let mut buf = [0u8; 96];
@@ -388,25 +433,25 @@ extern "C" fn sigtrap_handler(
 
     // X16 carries the full region_id (the trampoline `mov x16, #N` is the
     // authoritative source; imm16 only encodes the low byte).
-    let region_id = uc.uc_mcontext.regs[16] as usize;
+    let region_id = unsafe { uc_reg(ucontext, 16) } as usize;
     if region_id >= blob.regions.len() {
+        log_msg(b"qvmp_runtime: region_id OOB, returning\0");
         return;
     }
 
     let mut gpr_args = [0u64; 8];
     let mut fpr_args = [0u64; 8];
     for i in 0..8 {
-        gpr_args[i] = uc.uc_mcontext.regs[i];
+        gpr_args[i] = unsafe { uc_reg(ucontext, i) };
     }
-    // FP args: D0..D7 = low 64 bits of V0..V7. ucontext exposes them via
-    // fpsimd_context — bionic stores it inside mcontext.__reserved.
-    if let Some(vregs) = read_fpsimd(uc) {
+    // FP args via fpsimd_context inside reserved area
+    if let Some(vregs) = read_fpsimd_raw(ucontext) {
         for i in 0..8 {
             fpr_args[i] = vregs[i] as u64;
         }
     }
 
-    let lr = uc.uc_mcontext.regs[30];
+    let lr = unsafe { uc_reg(ucontext, 30) };
 
     // Log the region we're about to dispatch (helps diagnose SEGV during VM run)
     {
@@ -439,12 +484,41 @@ extern "C" fn sigtrap_handler(
         log_msg(&buf[..n]);
     }
 
-    if let Some(vregs) = read_fpsimd_mut(uc) {
-        let upper = vregs[0] & !((1u128 << 64) - 1);
-        vregs[0] = upper | (fpr_ret as u128);
+    if let Some(vregs_off) = find_fpsimd_offset_raw(ucontext) {
+        unsafe {
+            let p = (ucontext as *mut u8).add(vregs_off + FPSIMD_VREGS_OFFSET) as *mut u128;
+            let upper = *p & !((1u128 << 64) - 1);
+            *p = upper | (fpr_ret as u128);
+        }
     }
-    uc.uc_mcontext.regs[0] = gpr_ret;
-    uc.uc_mcontext.pc = lr;
+    unsafe {
+        uc_set_reg(ucontext, 0, gpr_ret);
+        uc_set_pc(ucontext, lr);
+    }
+}
+
+fn find_fpsimd_offset_raw(ucontext: *mut c_void) -> Option<usize> {
+    // Scan reserved area for FPSIMD_MAGIC. reserved starts at UC_RESERVED_OFFSET.
+    let base = ucontext as *const u8;
+    for off in (UC_RESERVED_OFFSET..UC_RESERVED_OFFSET + 4096).step_by(16) {
+        let p = unsafe { base.add(off) as *const u32 };
+        let m = unsafe { p.read_unaligned() };
+        if m == FPSIMD_MAGIC {
+            return Some(off);
+        }
+    }
+    None
+}
+
+fn read_fpsimd_raw(ucontext: *mut c_void) -> Option<[u128; 32]> {
+    let off = find_fpsimd_offset_raw(ucontext)?;
+    let base = (ucontext as *const u8).wrapping_add(off + FPSIMD_VREGS_OFFSET);
+    let mut out = [0u128; 32];
+    for i in 0..32 {
+        let p = base.wrapping_add(i * 16) as *const u128;
+        out[i] = unsafe { p.read_unaligned() };
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
