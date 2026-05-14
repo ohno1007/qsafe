@@ -132,6 +132,27 @@ impl<'a> HostBridge for NestedDispatchHost<'a> {
         self.inner.store(addr, v, w)
     }
     fn native_call(&mut self, target: u64, args: &[u64]) -> vmp_core::Result<u64> {
+        // BLR Rn 时 target 可能恰好指向另一个被保护函数的 trampoline 入口。
+        // 直接调 native 会执行 trampoline 里的 BRK → 嵌套 SIGTRAP；若 handler
+        // 没装 SA_NODEFER，信号被 mask，内核 SIGTRAP 默认动作 = 终止 (exit 133).
+        // 改成识别 target == load_bias + region.patch_addr 时在 VM 里递归
+        // 调度，绕开嵌套信号 + 省掉两次上下文切换。
+        let load_bias = vmp_interpreter::MAIN_EXEC_LOAD_BIAS
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if load_bias != 0 {
+            for (idx, region) in self.blob.regions.iter().enumerate() {
+                if target == load_bias + region.patch_addr as u64 {
+                    let mut gpr = [0u64; 8];
+                    let mut fpr = [0u64; 8];
+                    for (i, v) in args.iter().take(8).enumerate() {
+                        gpr[i] = *v;
+                    }
+                    return self
+                        .vm_call_region_fp(idx as u64, &gpr, &fpr)
+                        .map(|(g, _)| g);
+                }
+            }
+        }
         self.inner.native_call(target, args)
     }
     fn syscall(&mut self, no: u64, args: &[u64]) -> vmp_core::Result<u64> {

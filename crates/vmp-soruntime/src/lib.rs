@@ -439,7 +439,11 @@ fn install_sigtrap_handler() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = sigtrap_handler as *const () as usize;
-        sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+        // SA_NODEFER: 允许嵌套 SIGTRAP。VM 内 BLR 到另一个被保护 region
+        // 的 trampoline 时会触发二次 BRK，没这个 flag 内核会 mask 信号 →
+        // 默认动作终止进程 (exit 133). NestedDispatchHost.native_call 已尽量
+        // 在 VM 内直接调度，本 flag 作 fallback 防御。
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART | libc::SA_NODEFER;
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGTRAP, &sa, std::ptr::null_mut());
     }
