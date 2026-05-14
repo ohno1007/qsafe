@@ -1,43 +1,41 @@
-qvmp_test.zip — v38 leaf-only 包：只保护无 BLR/CallRegion 的"叶子函数"
+qvmp_test.zip — v39 终极 A/B：no-trampolines 包，不动 .text 看是否还挂
 ========================================================================
 
-v37 反馈:
-  light 跟 standard 在完全一样的位置挂. 说明 root cause 不在 junk 或
-  handler_duplication, 而在 VM 核心机制. SEGV 时 pc=0x781A0AC8E0
-  这种地址跟之前 region 9 (free thunk) 返回的 heap 指针 (0xb40000781a...)
-  高位匹配 — 程序把 **heap 数据当函数指针调用** 了, 最典型的就是
-  vtable 损坏 (虚函数 dispatch 拿到野指针).
+v38 反馈:
+  leaf-only (无 BLR/CallRegion 的 region) 也挂同样位置. SEGV 时寄存器
+  pattern 跟 v37 高度一致: x4=128, x6=0x8000000000000000, x11≈0xFFFFFFFF,
+  x13≈20416, x15=32, x25=8. 多次复现都是这套. 说明同一行 native 代码
+  在跑, 拒绝 "VM 间接调用是元凶" 的假说.
 
-继续往下查难度很大: 没符号 + ImGui 的 C++ 代码大量 -fomit-frame-pointer
-让 fp-chain 走不动 + bug 在不带 BLR trace 的某个 region 内部.
+最关键的结论是 **bug 跟我们改了多少 VM 行为无关**. 三个变体都同位置挂.
 
-v38 做隔离实验: 加 `QVMP_LEAF_ONLY=1` env, protect 时丢掉所有含 BLR
-(NativeCall) 或跨 region 调用 (CallRegion) 的 region. 这一类是最可能
-踩 VM 间接调用相关 bug 的. 90 个 region 被丢, 剩 444 个纯叶子.
+v39 做终极对照: `--write-trampolines false`. 完全不动 .text 任何字节,
+不装任何跳板. 但保留:
+  - rodata XOR 加密 + 运行时由 cdylib 在 .init_array 解
+  - QVMP blob 嵌入 (734KB payload)
+  - DT_NEEDED 加载 libqvmp_runtime.so
+  - cdylib 的 SIGTRAP/SIGSEGV handler 安装
 
-被丢的包括:
-  - region 124 (Vulkan loader, 70+ BLR)
-  - region 145 (vtable dispatch)
-  - region 127 (operator new wrapper, br x2 tail call)
-  - region 8/9 (malloc/free thunks)
-  - 各种 indirect call helper
+protect 还是 standard, 但 patched_entries=0. 整个 .text 跟原 binary
+字节相同, 所有函数都纯 native 跑.
 
-剩下的都是无间接调用的纯计算函数 — getter, setter, simple math, 各种
-小 helper. 这类 VM 翻译风险最低.
-
-A/B 实验方向:
-  - 如果 38_leaf_only.hardened 能起 ImGui UI → 残留 bug 100% 锁定在
-    含间接调用的 region. 下一步针对 NativeCall + VM 状态做更深入修.
-  - 如果还是同样位置挂 → root cause 更深 (rodata 解密? FP 寄存器没传?
-    syscall 缺翻译?), 我得换思路.
+A/B 实验:
+  - 如果 39_no_trampolines.hardened **能起 ImGui UI**:
+    \-> 残留 bug 在 trampoline 写入 / VM 执行. 加密 + .so loading 是
+       清白的. 下一步: 用 protect --only / --exclude 二分法定位坏的
+       那个具体 region.
+  - 如果 39_no_trampolines.hardened **同样位置挂**:
+    \-> 残留 bug 在 rodata 加密 / .so loading / mprotect 引发的页权限
+       变化. 我得换更核心的角度 (e.g. mprotect 4K vs 16K 对齐, .so 加
+       载顺序破坏 C++ 全局构造顺序).
 
 部署:
-  1. libqvmp_runtime.so → /data/local/tmp/  (沿用 v37 那份, 没换 .so)
-  2. 38_leaf_only.hardened → 任意位置
+  1. libqvmp_runtime.so → /data/local/tmp/  (沿用上一份 .so 不用换)
+  2. 39_no_trampolines.hardened → 任意位置
   3. MT 双击
 
-把日志全粘回来. 即使挂了也好, log 的形状会比之前更稀, 信噪比更高.
+把日志全粘. 如果出 UI 就告诉我 "出 UI 了" 就行, 不用粘日志.
 
 MD5:
-  38_leaf_only.hardened  e8a0b7e7722b0a5477894499e5895b8d
-  libqvmp_runtime.so     (跟 v37 standard 同, f06a1ee8de96935d7ea8740eb3b874db)
+  39_no_trampolines.hardened  59702b0737c55b5d8ea25239cc0fc437
+  libqvmp_runtime.so          f06a1ee8de96935d7ea8740eb3b874db (跟之前同)
