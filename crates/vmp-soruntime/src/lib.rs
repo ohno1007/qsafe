@@ -335,6 +335,14 @@ fn discover_and_decrypt_blob() -> Option<StubBlob> {
 // SIGTRAP handler
 // ---------------------------------------------------------------------------
 
+fn sig_dfl_sigtrap() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        libc::sigaction(libc::SIGTRAP, &sa, std::ptr::null_mut());
+    }
+}
+
 fn install_sigtrap_handler() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
@@ -389,22 +397,22 @@ extern "C" fn sigtrap_handler(
     if (inst & 0xFFE0_001F) != 0xD420_0000 {
         // Not our trap. Restore default handler so the kernel terminates the
         // process instead of re-invoking us on the same non-BRK instruction.
-        unsafe {
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = libc::SIG_DFL;
-            libc::sigaction(libc::SIGTRAP, &sa, std::ptr::null_mut());
-        }
+        sig_dfl_sigtrap();
         return;
     }
     let imm16 = ((inst >> 5) & 0xFFFF) as u16;
     if imm16 & 0xFF00 != 0x5100 {
+        // Foreign BRK — restore SIG_DFL so the kernel terminates rather than
+        // re-firing SIGTRAP on the same BRK in an infinite loop.
+        sig_dfl_sigtrap();
         return;
     }
 
     let blob = match BLOB.get() {
         Some(b) => b,
         None => {
-            log_msg(b"qvmp_runtime: BLOB not set, returning\0");
+            log_msg(b"qvmp_runtime: BLOB not set\0");
+            sig_dfl_sigtrap();
             return;
         }
     };
@@ -413,7 +421,10 @@ extern "C" fn sigtrap_handler(
     // authoritative source; imm16 only encodes the low byte).
     let region_id = unsafe { uc_reg(ucontext, 16) } as usize;
     if region_id >= blob.regions.len() {
-        log_msg(b"qvmp_runtime: region_id OOB, returning\0");
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: region_id OOB, id=", region_id);
+        log_msg(&buf[..n]);
+        sig_dfl_sigtrap();
         return;
     }
 
@@ -447,10 +458,34 @@ extern "C" fn sigtrap_handler(
         &mut host,
     ) {
         Ok(v) => v,
-        Err(_) => {
-            let mut buf = [0u8; 96];
-            let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: VM ERROR for region=", region_id);
-            log_msg(&buf[..n]);
+        Err(e) => {
+            // Format the error via a stack buffer (no heap, signal-safe).
+            use std::fmt::Write;
+            struct StackBuf<'a> { buf: &'a mut [u8], pos: usize }
+            impl<'a> std::fmt::Write for StackBuf<'a> {
+                fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                    for &b in s.as_bytes() {
+                        if self.pos < self.buf.len() {
+                            self.buf[self.pos] = b;
+                            self.pos += 1;
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            let mut sbuf = [0u8; 256];
+            let mut w = StackBuf { buf: &mut sbuf, pos: 0 };
+            let _ = write!(
+                w,
+                "qvmp_runtime: VM ERR region={} err={}",
+                region_id, e
+            );
+            let n = w.pos;
+            log_msg(&sbuf[..n]);
+
+            // Avoid infinite re-trap loop: restore SIG_DFL so the kernel
+            // terminates on the next BRK (PC hasn't moved) with code 133.
+            sig_dfl_sigtrap();
             return;
         }
     };

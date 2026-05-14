@@ -1,44 +1,37 @@
-qvmp_test.zip — v26 真正 dispatch（用上 v25 找到的正确 ucontext 偏移）
-======================================================================
+qvmp_test.zip — v27 修复 VM ERROR 死循环 + 打详细错误（DT_NEEDED 路径）
+=========================================================================
 
-v25 的 dump 给出了答案：
-
-  uc[184] = regs[0]            （我之前猜 176，差 8 字节）
-  uc[312] = regs[16] = 19       ← 真实 region_id，不是 BRK imm16 解出来的 87
-  uc[424] = regs[30] = LR
-  uc[432] = sp
-  uc[440] = pc                  ← 跟 si_addr 完全一致
-  uc[456] = __reserved 起点
-
-`patcher.rs` 里 BRK imm16 = 0x5156 | (region_id & 0xFF) 用的是 OR，
-所以多个 region_id 会撞到同一个 imm16。region 19 (0x13) 跟 region 87 (0x57)
-都解出 0x57 → 这是 v25 看到 "expected x16=87 但实际是 19" 的原因。
-现在 handler 直接信 x16（由 mov x16, #region_id 写入的全值），不再用
-imm16 去算 region_id。
-
-这版改动：
-  1. UC_REGS_OFFSET 176 → 184
-  2. UC_PC_OFFSET   432 → 440
-  3. UC_RESERVED_OFFSET 448 → 456
-  4. 砍掉 v25 的 dump 代码 + 早退 SIG_DFL
-  5. handler 真的走到 dispatch_vm_fp，写回 x0/d0 + PC := LR
-
-期望日志（按顺序）：
-  [qvmp] qvmp_runtime: rodata decrypted in place
-  [qvmp] qvmp_runtime: blob loaded, SIGTRAP handler installed
-  [qvmp] qvmp_runtime: dispatching region=19
-  [qvmp] qvmp_runtime: VM returned region=19
-  [qvmp] qvmp_runtime: dispatching region=<next>
+v26 反馈：
+  [qvmp] dispatching region=19
+  [qvmp] VM ERROR for region=19    ← 重复无限次
   ...
-  <ImGui 窗口应该出来>
 
-如果挂了：
-  - "dispatching region=N" 之后没 "VM returned" → 第 N 个 region 在 VM 里
-    SEGV 或越界，把 N 报回来。
-  - "VM ERROR for region=N" → VM 自己抛错，把 N 报回来。
-  - 完全没 dispatching → handler 没识别成 QVMP BRK，把日志全贴。
-  - error 134 stack corruption → bionic canary，回报启动点。
+两个 bug：
+  1. v26 我 rewrite 用了 `--embed-runtime`（旧 bootstrap+dlopen，撞栈金丝雀）
+     而不是 DT_NEEDED 路径。v27 改回 DT_NEEDED：可执行文件跟
+     libqvmp_runtime.so 放同目录即可。
+  2. handler 在 VM ERROR 时只 `return`，PC 没动，内核又触发同一 BRK →
+     handler 又 return → 死循环。v27 改成 SIG_DFL + return：让内核以
+     默认 SIGTRAP 处理把进程结束（exit 133），并把单次错误的详细 message
+     带出来。
+
+期望 v27 日志（按顺序）：
+  [qvmp] rodata decrypted in place
+  [qvmp] blob loaded, SIGTRAP handler installed
+  [qvmp] dispatching region=19
+  [qvmp] VM ERR region=19 err=Eb2:E:<具体原因>
+  Trap (exit 133)
+
+把上面的 `err=...` 那段完整粘回来 — 这才是真正诊断 region 19 失败的关键。
+可能形态：
+  - Eb2:E:Lift 失败 @ 0x... : ...    （lifter 没翻译出来）
+  - Eb2:E:unknown opcode XXX          （interpreter 没实现某个 op）
+  - Eb2:E:host bridge error: ...      （helper 调用失败）
+
+部署：
+  把 27_vm_err_log.hardened 和 libqvmp_runtime.so 放同一目录，
+  双击 27_vm_err_log.hardened。
 
 MD5:
-  26_dispatch.hardened   5b587b82d1fe3f37a6f4b0501794db3e
-  libqvmp_runtime.so     177690030ed9401363d0fd228e380396
+  27_vm_err_log.hardened  02a83bcc699b4b54e28a77213bd8022c
+  libqvmp_runtime.so      e5ed8ecefb06df456c8ddb18aea4552b
