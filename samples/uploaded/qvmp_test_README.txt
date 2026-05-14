@@ -1,45 +1,43 @@
-qvmp_test.zip — v37 加 BLR 返回值 trace + 同时出 light/standard 两个包对照
-============================================================================
+qvmp_test.zip — v38 leaf-only 包：只保护无 BLR/CallRegion 的"叶子函数"
+========================================================================
 
-v36 反馈:
-  region 124 70+ BLR 全过, malloc/free 多轮, region 8/9/12/25/3/13/6/2
-  /105/127/183/161/178/233/326/344/151/396/401/353/145 等等都通了.
-  挂在 region 127 返回后. SEGV pc=addr=0x6EF06E5520 (exec fault).
-  FP-chain 走 12 层但 lr vaddr (0xf54cc, 0x739bc 等) 都落在 .eh_frame
-  范围 — 数据当代码, 不是真 frame.
+v37 反馈:
+  light 跟 standard 在完全一样的位置挂. 说明 root cause 不在 junk 或
+  handler_duplication, 而在 VM 核心机制. SEGV 时 pc=0x781A0AC8E0
+  这种地址跟之前 region 9 (free thunk) 返回的 heap 指针 (0xb40000781a...)
+  高位匹配 — 程序把 **heap 数据当函数指针调用** 了, 最典型的就是
+  vtable 损坏 (虚函数 dispatch 拿到野指针).
 
-  意思是: fp chain 在 SEGV 那一刻已经被踩烂, 或者那个函数没按 AAPCS
-  保留 fp. Backtrace 没法直接反推调用栈.
+继续往下查难度很大: 没符号 + ImGui 的 C++ 代码大量 -fomit-frame-pointer
+让 fp-chain 走不动 + bug 在不带 BLR trace 的某个 region 内部.
 
-v37 不改修复路径, 加两手诊断:
+v38 做隔离实验: 加 `QVMP_LEAF_ONLY=1` env, protect 时丢掉所有含 BLR
+(NativeCall) 或跨 region 调用 (CallRegion) 的 region. 这一类是最可能
+踩 VM 间接调用相关 bug 的. 90 个 region 被丢, 剩 444 个纯叶子.
 
-1. **VOp::NativeCall 多打一行 return 值** (crates/vmp-interpreter/src/lib.rs)
-   每次 BLR 完都打:
-     [qvmp] vm: <- ret=0x... (from target=0x...)
-   能让我顺着 ret 看哪次 native call 返回的不像正经指针 — 比如返回 0
-   或低地址或不在任何 r-x 映射, 早晚某次 caller `blr <stored_ret>` 就
-   炸到 0x6E.../0x7B... 之类地方.
+被丢的包括:
+  - region 124 (Vulkan loader, 70+ BLR)
+  - region 145 (vtable dispatch)
+  - region 127 (operator new wrapper, br x2 tail call)
+  - region 8/9 (malloc/free thunks)
+  - 各种 indirect call helper
 
-2. **同时出 light 包 (37_light.hardened)**
-   light 预设: insert_junk=false, handler_duplication=1.
-   把 protection 强度降到最低. 如果 light 跑得过去出 ImGui, standard
-   出不去 → 残留 bug 在 junk 或 dup. 如果 light 也挂同一个地方 →
-   bug 在 VM 核心路径.
+剩下的都是无间接调用的纯计算函数 — getter, setter, simple math, 各种
+小 helper. 这类 VM 翻译风险最低.
 
-部署 (任选一):
-  方案 A: 测 standard
-    1. libqvmp_runtime.so → /data/local/tmp/
-    2. 37_std_retlog.hardened → 任意位置
-    3. MT 双击, 把整段日志粘回来
+A/B 实验方向:
+  - 如果 38_leaf_only.hardened 能起 ImGui UI → 残留 bug 100% 锁定在
+    含间接调用的 region. 下一步针对 NativeCall + VM 状态做更深入修.
+  - 如果还是同样位置挂 → root cause 更深 (rodata 解密? FP 寄存器没传?
+    syscall 缺翻译?), 我得换思路.
 
-  方案 B: 测 light (强烈推荐先跑这个对照)
-    1. libqvmp_runtime.so → /data/local/tmp/
-    2. 37_light.hardened → 任意位置
-    3. MT 双击, 看是否能起 ImGui
+部署:
+  1. libqvmp_runtime.so → /data/local/tmp/  (沿用 v37 那份, 没换 .so)
+  2. 38_leaf_only.hardened → 任意位置
+  3. MT 双击
 
-  方案 C: 两个都跑, 报告 light 是否能起 UI
+把日志全粘回来. 即使挂了也好, log 的形状会比之前更稀, 信噪比更高.
 
 MD5:
-  37_std_retlog.hardened  7e12b735c4fcdc3a33012025d8eb3473
-  37_light.hardened       756c5b314aab9cf3dcf89bcf432b7ace
-  libqvmp_runtime.so      f06a1ee8de96935d7ea8740eb3b874db
+  38_leaf_only.hardened  e8a0b7e7722b0a5477894499e5895b8d
+  libqvmp_runtime.so     (跟 v37 standard 同, f06a1ee8de96935d7ea8740eb3b874db)

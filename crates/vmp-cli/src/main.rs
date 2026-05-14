@@ -301,6 +301,23 @@ fn main() -> anyhow::Result<()> {
                 dropped.len()
             );
 
+            // QVMP_LEAF_ONLY=1：只保护"叶子函数" —— 不含 NativeCall（BLR/BR Rn）
+            // 也不含 CallRegion（BL 到其它被保护函数）的 region. 适合做 A/B 测试,
+            // 排除 VM 间接调用相关的潜在 bug.
+            if std::env::var("QVMP_LEAF_ONLY").is_ok() {
+                let before = funcs.len();
+                funcs.retain(|f| {
+                    !f.ir.iter().any(|i| {
+                        matches!(i.op, VOp::NativeCall | VOp::CallRegion)
+                    })
+                });
+                log::info!(
+                    "QVMP_LEAF_ONLY: kept {} leaf regions (dropped {})",
+                    funcs.len(),
+                    before - funcs.len()
+                );
+            }
+
             // 第三遍：每个 region 独立 codegen，用 region_idx 作 IV salt。
             let mut pool: Vec<u8> = Vec::new();
             let mut regions: Vec<StubRegion> = Vec::new();
