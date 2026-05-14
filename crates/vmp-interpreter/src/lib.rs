@@ -104,6 +104,45 @@ fn trace_native_call(rd: u8, target: u64, args: &[u64]) {
     }
 }
 
+fn trace_native_ret(target: u64, ret: u64) {
+    if !TRACE_NATIVE_CALLS.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut buf = [0u8; 128];
+    let mut pos = 0usize;
+    fn push(buf: &mut [u8], pos: &mut usize, s: &[u8]) {
+        for &b in s {
+            if *pos < buf.len() {
+                buf[*pos] = b;
+                *pos += 1;
+            }
+        }
+    }
+    fn push_hex(buf: &mut [u8], pos: &mut usize, v: u64) {
+        push(buf, pos, b"0x");
+        let mut started = false;
+        for i in (0..16).rev() {
+            let nib = ((v >> (i * 4)) & 0xF) as u8;
+            if nib != 0 || started || i == 0 {
+                started = true;
+                let c = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+                if *pos < buf.len() {
+                    buf[*pos] = c;
+                    *pos += 1;
+                }
+            }
+        }
+    }
+    push(&mut buf, &mut pos, b"[qvmp] vm: <- ret=");
+    push_hex(&mut buf, &mut pos, ret);
+    push(&mut buf, &mut pos, b" (from target=");
+    push_hex(&mut buf, &mut pos, target);
+    push(&mut buf, &mut pos, b")\n");
+    unsafe {
+        let _ = write(2, buf.as_ptr(), pos);
+    }
+}
+
 pub struct Interpreter<'a> {
     pub spec: &'a IsaSpec,
     pub bytecode: &'a [u8],
@@ -281,6 +320,7 @@ impl<'a> Interpreter<'a> {
                             })?,
                         None => return Err(Error::vm("E2")),
                     };
+                    trace_native_ret(target_ptr, ret);
                     self.state.regs[0] = ret;
                 }
                 VOp::CallRegion => {
