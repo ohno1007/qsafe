@@ -314,6 +314,10 @@ fn discover_and_decrypt_blob() -> Option<StubBlob> {
     // Same flag also enables per-BLR diagnostic emission inside the VM.
     vmp_interpreter::TRACE_NATIVE_CALLS
         .store(f.log_flag, std::sync::atomic::Ordering::Relaxed);
+    // PIE relocation: the lifter encodes ADRP / ADR / LDR-literal as offsets
+    // from ELF vaddr 0. Push the real dlpi_addr so the VM resolves them.
+    vmp_interpreter::MAIN_EXEC_LOAD_BIAS
+        .store(f.load_bias as u64, std::sync::atomic::Ordering::Relaxed);
 
     // Decrypt rodata FIRST — must happen before any code that references its
     // bytes runs. Our .init_array entry is invoked before the main binary's

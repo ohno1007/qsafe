@@ -21,6 +21,10 @@ pub type Width = VmWidth;
 const SCRATCH: u8 = 32;
 const SCRATCH2: u8 = 33;
 const SCRATCH3: u8 = 34;
+/// 运行时 load_bias 槽位：interpreter 在 run() 起始把宿主 ELF 的 dlpi_addr
+/// 写进去。PIE 二进制的 ADRP / ADR / LDR(literal) 在 lift 阶段算出的是
+/// 「以 ELF 起点 0 为 base 的偏移」，运行时必须加上 load_bias 才是真地址。
+const LOAD_BIAS_REG: u8 = 62;
 /// 固定 XZR：interpreter 每周期重置为 0。指令族里需要 X31 当 XZR 时把寄存器号映射到这里。
 const XZR_VREG: u8 = 63;
 
@@ -95,13 +99,27 @@ fn decode_data_imm(raw: u32, pc: u64) -> Result<Vec<Instr>, &'static str> {
         } else {
             (pc as i64).wrapping_add(imm) as u64
         };
-        return Ok(vec![Instr {
-            op: VOp::MovI,
-            rd,
-            imm: target as i64,
-            width: Width::W64,
-            ..Default::default()
-        }]);
+        // PIE-aware: 在 lift 时 target 是 ELF 内部 vaddr (load_bias=0)，
+        // 运行时必须加上真实 load_bias。展开为两条 VOp：
+        //   MovI SCRATCH = target        (作为 64-bit offset)
+        //   Add  rd = LOAD_BIAS_REG + SCRATCH
+        return Ok(vec![
+            Instr {
+                op: VOp::MovI,
+                rd: SCRATCH,
+                imm: target as i64,
+                width: Width::W64,
+                ..Default::default()
+            },
+            Instr {
+                op: VOp::Add,
+                rd,
+                rs: LOAD_BIAS_REG,
+                rt: SCRATCH,
+                width: Width::W64,
+                ..Default::default()
+            },
+        ]);
     }
 
     let sf = (raw >> 31) & 1;
@@ -396,8 +414,11 @@ fn decode_load_store(raw: u32, pc: u64) -> Result<Vec<Instr>, &'static str> {
             1 => Width::W64,
             _ => Width::W64, // LDRSW（符号扩展未做）
         };
+        // PIE-aware: LDR (literal) 同 ADRP，target 是 ELF vaddr，运行时需要
+        // 加 load_bias。
         return Ok(vec![
             Instr { op: VOp::MovI, rd: SCRATCH, imm: target as i64, width: Width::W64, ..Default::default() },
+            Instr { op: VOp::Add, rd: SCRATCH, rs: LOAD_BIAS_REG, rt: SCRATCH, width: Width::W64, ..Default::default() },
             Instr { op: VOp::Load, rd: rt, rs: SCRATCH, imm: 0, width, ..Default::default() },
         ]);
     }

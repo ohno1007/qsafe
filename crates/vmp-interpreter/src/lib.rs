@@ -11,7 +11,7 @@
 pub mod state;
 
 use log::trace;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use vmp_core::{Error, Result};
 use vmp_isa::{decode_instr, Cond, IsaSpec, VOp, Width};
 
@@ -22,6 +22,16 @@ pub use state::{HostBridge, VmState};
 /// every VOp::NativeCall logs "BLR xN target=0x… x0..x7=…" to fd 2 before
 /// crossing into the host. Silent on the protect-side CLI by default.
 pub static TRACE_NATIVE_CALLS: AtomicBool = AtomicBool::new(false);
+
+/// 主可执行 ELF 的 dlpi_addr。PIE 二进制 lifter 把 ADRP/ADR/LDR-literal 编成
+/// `Add rd, V62, offset`，运行时需要 V62 = load_bias 才能算出真实地址。
+/// 由 vmp-soruntime 的 qvmp_init 在 dl_iterate_phdr 找到 QVMP magic 那一瞬
+/// 写入。CLI 模拟器场景保留 0（与 lift 时 pc 一致）。
+pub static MAIN_EXEC_LOAD_BIAS: AtomicU64 = AtomicU64::new(0);
+
+/// lifter / interpreter 约定：VM 寄存器 V62 在每次 run() 启动时被装载
+/// MAIN_EXEC_LOAD_BIAS，用于 ADRP / ADR / LDR-literal 的运行时重定位。
+pub const VM_REG_LOAD_BIAS: usize = 62;
 
 extern "C" {
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
@@ -127,6 +137,10 @@ impl<'a> Interpreter<'a> {
 
     /// 主循环；返回 VExit 时携带的值（约定放入 R0）。
     pub fn run(&mut self) -> Result<u64> {
+        // PIE 重定位：V62 = 运行时 load_bias。lifter 把 ADRP/ADR/LDR-literal
+        // 都展开成 `Add rd, V62, vaddr_offset` 形式。
+        self.state.regs[VM_REG_LOAD_BIAS] =
+            MAIN_EXEC_LOAD_BIAS.load(Ordering::Relaxed);
         let bc = if self.spec.encrypt {
             let mut tmp = self.bytecode.to_vec();
             vmp_codegen::stream::decrypt_in_place_salted(

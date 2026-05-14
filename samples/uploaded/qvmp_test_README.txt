@@ -1,44 +1,56 @@
-qvmp_test.zip — v31 加 NativeCall pre-trace + SEGV 全 GPR dump
-================================================================
+qvmp_test.zip — v32 PIE ADRP/ADR/LDR-literal 加 load_bias 重定位
+==================================================================
 
-v30 反馈:
-  [qvmp] SIGSEGV sig=11
-  [qvmp] SIGSEGV pc=536060413072      = 0x7CD8D33490   (库代码段)
-  [qvmp] SIGSEGV addr=158712          = 0x26C78        (null + 大偏移?)
-  [qvmp] SIGSEGV lr=536060395512      = 0x7CD8D2EFF8   (同库内)
+v31 抓到 root cause:
+  region 124 在 0x190058，前几条:
+    adrp x0, 0x26000        ← lifter 把 target 算成 ELF vaddr 0x26000
+    add  x0, x0, #0xbf9     ← x0 = 0x26bf9
+    blr  x20
 
-意思是 VM 把控制转给某库的 native 函数，函数立刻去解引用一个低地址，
-像是 x0 装的不是真 "this/struct"。要分清是 VM 传给 BLR 的 x0..x7 已
-经错了还是 native 函数自身实现问题。v31 加两组数据:
+  VM 算出 x0 = 0x26bf9 直接传给 BLR. 但 binary 是 PIE，
+  运行时 ELF 加载在 dlpi_addr = 0x754xxxxxxx, 真实地址应该是
+  dlpi_addr + 0x26bf9. native 函数把 0x26bf9 当字符串指针 deref → SEGV.
 
-1. **NativeCall pre-trace** (crates/vmp-interpreter/src/lib.rs)
-   即将走 BLR 时先打:
-     [qvmp] vm: BLR x16 target=0x7c... x0=0x... x1=... ... x7=...
-   告诉你 VM 实际传出去的是什么. 如果 x0=0 / x0=0x... 像不像 this，
-   一眼就能看出来 lifter 是否漏译了 BLR 前面的 mov x0, ...
+  这不是 region 124 一个的问题, 而是 lifter 对所有 PIE 二进制的 ADRP /
+  ADR / LDR(literal) 都漏译了 load_bias 重定位.
 
-2. **SIGSEGV 全 GPR dump** (crates/vmp-soruntime/src/lib.rs)
-   SEGV 时把 x0..x30 + sp 全打出来 (31 行 + 1 行 sp). 这是 native
-   函数在崩溃瞬间的寄存器状态，能看到它在用什么作 base 算出 0x26C78
-   (例: 如果某 xN = 0x26C78 - <offset>，那条 ldr/str 就是元凶).
+v32 修:
 
-NativeCall trace 默认跟 --log on 联动（QVMP 头日志位打开就一起打开）.
+1. vmp-arch/src/arm64/decode.rs
+   - 新增 `LOAD_BIAS_REG = 62`
+   - ADRP/ADR/LDR-literal 不再编成 `MovI rd, target`, 而是
+       MovI SCRATCH, target           (vaddr offset)
+       Add  rd, V62, SCRATCH          (rd = load_bias + offset)
+     LDR-literal 多一条 Load.
+
+2. vmp-interpreter/src/lib.rs
+   - 新增 `pub static MAIN_EXEC_LOAD_BIAS: AtomicU64`
+   - Interpreter::run() 起始 `state.regs[62] = MAIN_EXEC_LOAD_BIAS.load()`
+   - CLI 模拟器路径 load_bias=0, 行为不变.
+
+3. vmp-soruntime/src/lib.rs
+   - qvmp_init 找到 QVMP magic 时, 把 dlpi_addr 写进 MAIN_EXEC_LOAD_BIAS.
+
+字节码尺寸涨了一点 (195892 → 197799 bytes, +1%), 因为每条 ADRP 从 1 条
+VOp 变成 2 条.
 
 部署:
   1. libqvmp_runtime.so → /data/local/tmp/
-  2. 31_segv_gpr_dump.hardened → 任意位置
+  2. 32_pie_reloc.hardened → 任意位置
   3. MT 双击
 
-把 dispatching region=124 之后开始的所有 [qvmp] 日志全粘回来. 数量
-会比之前多 (BLR trace 一行 + SEGV 一堆 GPR), 但全是有用诊断信息.
+期望:
+  [qvmp] rodata decrypted in place
+  [qvmp] blob loaded, SIGTRAP+SIGSEGV handlers installed
+  [qvmp] dispatching region=N (大量)
+  [qvmp] vm: BLR xN target=0x... x0=0x754... x1=...      (高地址了，正常的指针)
+  <ImGui 窗口>
 
-可能的发现:
-  - "[qvmp] vm: BLR x16 target=0x... x0=0x0 x1=0x0 ..." → VM 没给函
-    数准备 args，lifter 漏了。
-  - "[qvmp] vm: BLR x16 target=0x... x0=0x7c..." 看起来合理 → 但
-    SEGV 时 x0 已变 → native 函数被传入的某指针其实是悬空 / 早释放.
-  - target=0x0 → BLR 寄存器没填好，前面 ADRP/LDR 没翻译.
+如果还挂:
+  - BLR x0 还是 0x26bf9 范围 → 我哪里写错了, 把日志粘回来
+  - BLR x0 看着像高地址 (0x7...) 但还 SEGV → 别的 lifter gap, 把整段
+    [qvmp] 日志 + SIGSEGV 4 行粘回来
 
 MD5:
-  31_segv_gpr_dump.hardened  d5772ccabd2becae7c1d9edc5f5eb71a
-  libqvmp_runtime.so         32d05e8f82b282214ee54ef5eea91ef0
+  32_pie_reloc.hardened  8735bfa405924d8db1ecd8169176b68a
+  libqvmp_runtime.so     ae803cacd1d87aaa0eb1be3687e3ad41
