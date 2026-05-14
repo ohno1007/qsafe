@@ -69,6 +69,34 @@ fn log_enabled() -> bool {
     LOG_FLAG.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Format `<prefix><decimal id>\n\0` into `buf`, returns the byte length used.
+/// Avoids heap allocations so it's safe to call from a signal handler.
+fn format_dispatch_msg(buf: &mut [u8], prefix: &[u8], id: usize) -> usize {
+    let mut pos = 0;
+    for &b in prefix {
+        if pos < buf.len() { buf[pos] = b; pos += 1; }
+    }
+    // Stringify id as decimal
+    let mut digits = [0u8; 20];
+    let mut n = 0;
+    let mut v = id;
+    if v == 0 {
+        digits[0] = b'0';
+        n = 1;
+    } else {
+        while v > 0 {
+            digits[n] = b'0' + (v % 10) as u8;
+            v /= 10;
+            n += 1;
+        }
+    }
+    for i in (0..n).rev() {
+        if pos < buf.len() { buf[pos] = digits[i]; pos += 1; }
+    }
+    if pos < buf.len() { buf[pos] = 0; }
+    pos
+}
+
 fn log_msg(msg: &[u8]) {
     if !log_enabled() {
         return;
@@ -365,6 +393,14 @@ extern "C" fn sigtrap_handler(
     }
 
     let lr = uc.uc_mcontext.regs[30];
+
+    // Log the region we're about to dispatch (helps diagnose SEGV during VM run)
+    {
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: dispatching region=", region_id);
+        log_msg(&buf[..n]);
+    }
+
     let mut host = vmp_stub::linux::LinuxHost::new();
     let (gpr_ret, fpr_ret) = match vmp_stub::dispatch_vm_fp(
         blob,
@@ -374,8 +410,20 @@ extern "C" fn sigtrap_handler(
         &mut host,
     ) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => {
+            let mut buf = [0u8; 96];
+            let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: VM ERROR for region=", region_id);
+            log_msg(&buf[..n]);
+            return;
+        }
     };
+
+    // Log successful return
+    {
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: VM returned region=", region_id);
+        log_msg(&buf[..n]);
+    }
 
     if let Some(vregs) = read_fpsimd_mut(uc) {
         let upper = vregs[0] & !((1u128 << 64) - 1);

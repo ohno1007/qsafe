@@ -1,34 +1,38 @@
-qvmp_test.zip — v19 DT_NEEDED 方案
-====================================
+qvmp_test.zip — v20 dispatch_vm logging
+========================================
 
-之前所有 dlopen 路径都触发栈金丝雀 (134). 换完全不同的方案:
+v19 进展: cdylib qvmp_init 全部跑通, SIGTRAP handler 装好. 然后 SEGV.
+说明 SEGV 在 dispatch_vm 内部 (VM 解释器跑某个 region 时崩).
 
-  - 在 .dynamic 里加 DT_NEEDED 条目, 让 Android linker 自动加载
-    libqvmp_runtime.so, 时机是 main exec 的 INIT_ARRAY 跑之前.
-  - 这是个"安全的 dlopen 时机", 跟我们手动 dlopen 完全不同.
-  - libqvmp_runtime.so 的 qvmp_init 在 linker setup 阶段跑, 在那里装
-    SIGTRAP handler.
-  - 然后 main exec INIT_ARRAY 跑, 撞到保护函数 BRK, handler dispatch.
+v20 给 cdylib 加了详细日志:
 
-部署要求 (★ 两个文件):
+  [qvmp] qvmp_runtime: dispatching region=N
+  [qvmp] qvmp_runtime: VM returned region=N      (成功)
+  [qvmp] qvmp_runtime: VM ERROR for region=N    (dispatch_vm 返回 Err)
+  
+  如果 dispatch 中间 SEGV, 我们会看到 "dispatching" 但没有 "returned/ERROR"
+  → 知道是哪个 region_id 触发的崩, 后面能定位.
 
-  1. 把 libqvmp_runtime.so 放到 /data/local/tmp/libqvmp_runtime.so
-     (绝对路径写在 binary 里了, 必须是这个位置)
-  2. 把 23_dt_needed.hardened 放到任意位置 (你目前 /data/ 也行)
-  3. MT 管理器双击 23_dt_needed.hardened
+部署 (跟 v19 一样, 两个文件):
+  
+  /data/local/tmp/libqvmp_runtime.so   (★ 这版新)
+  23_dt_needed.hardened                 (可以原地址,没改)
+  
+  MT 管理器双击 hardened, 看输出.
 
-  Android linker 启动时看到 DT_NEEDED, 去加载
-  /data/local/tmp/libqvmp_runtime.so. 它的 init_array 跑 qvmp_init.
-  装好 SIGTRAP handler. 然后主 exec 继续, INIT_ARRAY 撞到保护函数,
-  handler 接住, dispatch VM, ImGui GUI 起来.
+我希望看到的:
 
-期望:
-
-  ImGui GUI 起来       → ★ 完全跑通
-  CANNOT LINK 找不到 .so → 你忘了放 libqvmp_runtime.so 到 /data/local/tmp/
-  CANNOT LINK 其他错误 → 告诉我具体错误文本
-  SIGTRAP/SEGV         → 告诉我 error code
+  情景 A — 多条 dispatching/returned 配对, ImGui GUI 起来
+           → ★ 全部跑通, region 都顺序处理
+  情景 B — 单条 "dispatching region=X" 然后 SEGV
+           → region X 内部某个 VOp 崩, 我可以加更细 log 进 dispatch_vm
+  情景 C — 多条 dispatching/returned 然后 SEGV
+           → 某个 region 跑完后才崩, 可能 PC=LR 跳到错地方
+  情景 D — 一条 dispatching 都没看到, 直接 SEGV
+           → handler 自己崩 (FPSIMD 偏移、ucontext 解析等)
 
 MD5:
   23_dt_needed.hardened   38c462247de8c6810b8862608b638d3a
-  libqvmp_runtime.so      f840ec8a5f5ac492ff8a4335efb6f074
+  libqvmp_runtime.so      6e07c5c5e0d66b2d8c930cdeef38af9e
+
+把整段 [qvmp] 日志 + 后面的错误一起贴回来.
