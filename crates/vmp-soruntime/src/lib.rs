@@ -41,6 +41,14 @@ static BLOB: OnceLock<StubBlob> = OnceLock::new();
 static INIT_ARRAY_ENTRY: extern "C" fn() = qvmp_init;
 
 extern "C" fn qvmp_init() {
+    // 不经过 LOG_FLAG, 总是写一行 "qvmp_init: enter" 到 fd 2. 这个就是探针:
+    // 如果用户看不到这一行, 说明 .init_array 根本没被调到 (dlopen 失败 / 路径
+    // 错 / 文件没刷新等); 看到了但没后续 log_msg, 说明 LOG_FLAG 没拿到 (QVMP
+    // header 没设 log byte). 帮助远程隔离 "为什么没日志" 这类问题.
+    unsafe {
+        let msg = b"[qvmp] qvmp_init: enter\n";
+        raw_write(2, msg.as_ptr(), msg.len());
+    }
     if let Some(blob) = discover_and_decrypt_blob() {
         let _ = BLOB.set(blob);
         // Pre-load the blob's data segments BEFORE installing the SIGTRAP

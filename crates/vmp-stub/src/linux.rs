@@ -129,49 +129,58 @@ impl HostBridge for LinuxHost {
 
 /// AAPCS64 函数调用蹦床: 装载 GPR x0..x7 + FP/SIMD v0..v7 (低 64 位) → blr target
 /// → 读回 (x0, d0 低 64 位). 这是替代 `transmute::<_, F8>(p)` 的核心: Rust
-/// 的 `extern "C"` 调用约定只搬 GPR, FP/SIMD 寄存器从来不被显式加载. ImGui /
-/// Vulkan 大量函数把 float / ImVec2 / ImVec4 经 v0..v7 传, 走 transmute 路径
-/// callee 拿到的是 SIGTRAP 触发那一刻 caller 的 stale FP regs — VM 内的浮点
-/// 计算结果完全丢. 用 inline asm 直接装载寄存器, 才能让 VM 算出的 FP 值真正
-/// 落到 callee.
+/// 的 `extern "C"` 调用约定只搬 GPR, FP/SIMD 寄存器从来不被显式加载.
+///
+/// 用 naked extern "C" 函数包: target 在 x0, gpr_ptr 在 x1, fpr_ptr 在 x2 (AAPCS).
+/// 我们先用 x16/x17 暂存指针 (x16/x17 是平台 scratch, 调用约定允许任意覆盖),
+/// 再 ldp 从 gpr_ptr 把 x0..x7 装好, ldp d0..d7 从 fpr_ptr 装 FP. blr x16 调
+/// 用. 返回 fpr 在 x1 (AAPCS 16-byte struct return → x0,x1).
+///
+/// 用 `global_asm!` 而非 `asm!` 避免 Rust 寄存器分配器的复杂性: 这里我们对
+/// 整个调用规约负责, 不让编译器插手.
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
+core::arch::global_asm!(
+    ".globl qvmp_call_with_fp",
+    ".type  qvmp_call_with_fp, %function",
+    "qvmp_call_with_fp:",
+    // x0 = target, x1 = gpr_ptr (&[u64;8]), x2 = fpr_ptr (&[u64;8])
+    "stp x29, x30, [sp, #-16]!",
+    "mov x29, sp",
+    "mov x16, x0",                 // x16 = target (preserved across the ldp's)
+    "mov x17, x2",                 // x17 = fpr_ptr
+    // 装载 GPR x0..x7 from gpr_ptr (was x1).
+    "ldp x6, x7, [x1, #48]",       // load x6/x7 first since x1 is loaded last
+    "ldp x4, x5, [x1, #32]",
+    "ldp x2, x3, [x1, #16]",
+    "ldp x0, x1, [x1]",            // overwrites x1 (no longer needed)
+    // 装载 FP v0..v7 from fpr_ptr (saved in x17).
+    "ldp d0, d1, [x17]",
+    "ldp d2, d3, [x17, #16]",
+    "ldp d4, d5, [x17, #32]",
+    "ldp d6, d7, [x17, #48]",
+    "blr x16",
+    // x0 = gpr return; put fpr return in x1 (AAPCS 16-byte struct return slot).
+    "fmov x1, d0",
+    "ldp x29, x30, [sp], #16",
+    "ret",
+    ".size qvmp_call_with_fp, . - qvmp_call_with_fp",
+);
+
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
+extern "C" {
+    fn qvmp_call_with_fp(target: u64, gpr: *const u64, fpr: *const u64) -> CallRet;
+}
+
+#[repr(C)]
+struct CallRet {
+    gpr: u64,
+    fpr: u64,
+}
+
 #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
 unsafe fn call_with_fp(target: u64, gpr: &[u64; 8], fpr: &[u64; 8]) -> (u64, u64) {
-    let g_ret: u64;
-    let f_ret: u64;
-    let fpr_ptr = fpr.as_ptr();
-    core::arch::asm!(
-        "ldp d0, d1, [{fp}]",
-        "ldp d2, d3, [{fp}, #16]",
-        "ldp d4, d5, [{fp}, #32]",
-        "ldp d6, d7, [{fp}, #48]",
-        "blr {tgt}",
-        "fmov {fret}, d0",
-        fp = in(reg) fpr_ptr,
-        tgt = in(reg) target,
-        fret = lateout(reg) f_ret,
-        inlateout("x0") gpr[0] => g_ret,
-        inlateout("x1") gpr[1] => _,
-        inlateout("x2") gpr[2] => _,
-        inlateout("x3") gpr[3] => _,
-        inlateout("x4") gpr[4] => _,
-        inlateout("x5") gpr[5] => _,
-        inlateout("x6") gpr[6] => _,
-        inlateout("x7") gpr[7] => _,
-        lateout("x8") _, lateout("x9") _, lateout("x10") _, lateout("x11") _,
-        lateout("x12") _, lateout("x13") _, lateout("x14") _, lateout("x15") _,
-        // x18 是 Android/aarch64 平台保留寄存器 (TLS), 不能列入 clobber list.
-        // Android NDK clang 会保证不被调函数破坏它. blr 出去再回来还是同一个值,
-        // 所以也不需要声明.
-        lateout("x16") _, lateout("x17") _, lateout("x30") _,
-        out("v0") _, out("v1") _, out("v2") _, out("v3") _,
-        out("v4") _, out("v5") _, out("v6") _, out("v7") _,
-        out("v16") _, out("v17") _, out("v18") _, out("v19") _,
-        out("v20") _, out("v21") _, out("v22") _, out("v23") _,
-        out("v24") _, out("v25") _, out("v26") _, out("v27") _,
-        out("v28") _, out("v29") _, out("v30") _, out("v31") _,
-        options(nostack),
-    );
-    (g_ret, f_ret)
+    let r = unsafe { qvmp_call_with_fp(target, gpr.as_ptr(), fpr.as_ptr()) };
+    (r.gpr, r.fpr)
 }
 
 #[cfg(not(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64")))]

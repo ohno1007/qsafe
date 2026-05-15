@@ -1,69 +1,51 @@
-qvmp_test.zip — v47 真·真 root cause: FP 寄存器从未传给 native callee
-=====================================================================
+qvmp_test.zip — v48 探针 + global_asm 重写 FP 调用蹦床
+==========================================================
 
-(回应反馈: v45 n64 实际能一直跑稳定. 那就说明 v46 的"pool exhausted"
-推断本身就走错了树. n64 UI 功能错乱 = wrong float args 算出 wrong UI
-布局; 0..534 全量挂 = 同一 bug 走到更深的 FP 路径触发 vtable 错位.)
+# v47 的问题
 
-# 真因
+v47 silently 挂 (no logs). 但 .so 看着正常, 符号完整, 程序段对.
+怀疑两个方向:
+  A) inline asm! 的寄存器分配跟 BIND_NOW 之类的 .so 链接特性互冲
+  B) qvmp_init 根本没跑到 (dlopen 失败 / 文件没刷)
 
-VM 解释器的 `VOp::NativeCall` 只把 `regs[0..8]` 透传给 host:
-  - LinuxHost.native_call 用 `transmute::<_, F8>` 调 callee
-  - F8 是个普通 `extern "C" fn(u64, u64, ..., u64)`, Rust ABI 只搬 GPR
-  - 整个调用过程 hardware V0..V7 从未被显式装载!
+v48 改两处帮排查:
 
-效果:
-  - SIGTRAP 触发那一刻 hardware V0..V7 = caller 传给被保护函数的 float args
-  - VM 在内部 fregs[] 里做 FAdd/FMul/SCvtF 各种 FP 运算 (软件层)
-  - VM 走到 BLR x8 → NativeCall → callee 看到的是 SIGTRAP 那一刻的
-    stale hardware V0..V7, 完全不是 VM 算出来的结果
+1. **`crates/vmp-soruntime/src/lib.rs`** 在 qvmp_init 开头加一行**不经
+   LOG_FLAG 控制**的 raw_write `[qvmp] qvmp_init: enter`. 这是探针:
+     - 看到这行 → .init_array 跑了, .so 链接 OK; 然后 LOG_FLAG 也设上,
+       后续 log_msg 才会出来.
+     - 没看到 → dlopen 没跑成功 (deploy 没刷 .so / 路径不对 / .so 不兼容).
 
-ImGui / Vulkan 大量用 v0..v7 传 float / ImVec2 / ImVec4 / 矩阵元素.
-拿到 stale FP arg → 算出错误 size / offset → vtable lookup 错位 →
-跑一段时间 (堆积出某个特定调用链) → SEGV at heap-PC.
+2. **`crates/vmp-stub/src/linux.rs`** 把 call_with_fp 从 `core::arch::asm!`
+   inline 改成 `core::arch::global_asm!` 写一个 naked 函数 `qvmp_call_with_fp`.
+   Rust 寄存器分配器完全不介入, 整个 ABI 由我们汇编直接定义:
+     x0 = target, x1 = gpr_ptr, x2 = fpr_ptr  (入)
+     x0, x1 = (gpr_ret, fpr_ret)              (出)
 
-n64 子集 UI "错乱" + 不挂: 0..63 region 里 FP-heavy 调用链不够深, 错
-得到的 float 值还能落进合法地址区间, UI 看着花但不会撞墙.
-全量 0..534: FP-heavy 路径打开, 一两秒就死.
-
-# 修复 (v47)
-
-`crates/vmp-stub/src/linux.rs` 加 `call_with_fp` 蹦床 (inline asm):
-  - ldp d0, d1, [fpr_ptr]; ldp d2, d3, ... ; ldp d6, d7, ...
-  - inlateout("x0".."x7") = gpr[0..8]
-  - blr target
-  - fmov x_ret, d0  → 把 FP 返回值带回
-
-`crates/vmp-interpreter/src/lib.rs` VOp::NativeCall 改走 native_call_fp,
-同时传 GPR + FREG; 返回时写回 regs[0] + fregs[0] 低 64 位.
-
-`crates/vmp-stub/src/entry.rs` NestedDispatchHost.native_call_fp 透传
-fpr_args 给 resolve_to_region 的递归路径 (跨保护函数互调也保 FP arg).
+   这样 inline asm 跟 Rust register coloring 的任何潜在冲突彻底消除.
 
 # 包
 
-47_full.hardened: standard 534 region 全量包, 单文件可双击.
-libqvmp_runtime.so: 配套 .so, 必须更新.
+48_full.hardened: standard 534 region 全量, embed-runtime, 单文件双击.
+libqvmp_runtime.so: 配套 .so (此 build 不依赖, 但还是放着).
 
-部署:
-  1. libqvmp_runtime.so → /data/local/tmp/  (md5 必须对上)
-  2. 47_full.hardened → 任意位置
-  3. MT 双击
+# 部署
+
+  1. 48_full.hardened → 任意位置
+  2. MT 双击
 
 # 预期
 
-n64 之前 UI 功能错乱的地方应该都正常了 — 因为 float arg 不再是 stale.
-0..534 全量启动 → ImGui 正常出 UI, 长跑不挂.
+A) 看到 `[qvmp] qvmp_init: enter` 一行就够告诉我 .so 加载了; 后面再看
+   能不能看到 `handler entry #1` 等正常日志.
+B) 如果 v48 跑得跟 v46 一样 (从 handler #1 一路 log 到 handler #128 后
+   SIGSEGV), 说明 FP 修复也没生效 — 我的诊断方向错了.
+C) 如果 v48 一路 log 但比 v46 跑得远 (handler #N 远超 128), 说明 FP fix
+   起作用了.
+D) 如果 v48 还是 `[qvmp] qvmp_init: enter` 之后立刻挂, 那是我的 asm 调
+   用约定有问题, 已经可以缩到 call_with_fp.
 
 # MD5
 
-  47_full.hardened    90250f0467e19dd619267e6fa4d82917
-  libqvmp_runtime.so  6a0cc1702079f464af810f171b89587f
-
-# 排查方向
-
-如果还挂:
-  - 检查 sigsegv handler 打出来的 x0..x7 是否仍带"sign-bit 0x8000..." 的
-    异常值: 是 → 这条 FP 路径没覆盖 (比如 NEON Q-reg 128bit 传参)
-  - 出现 Eb2:E:E1:... (NoRegion) → 又是 cli cascade-drop 漏过滤
-  - 出现 Eb3 (pool exhausted) → 真的递归超 200 层, 极不寻常
+  48_full.hardened    589b9143a2ec06dcb22930a44715d5f8
+  libqvmp_runtime.so  db1a3a437a70c20742dca8e01fe1a632
