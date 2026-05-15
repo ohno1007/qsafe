@@ -520,11 +520,13 @@ fn install_sigtrap_handler() {
     }
 }
 
-// Bionic ucontext_t layout (empirically verified on-device — Rust libc assumes
-// glibc layout and would mis-locate every register). mcontext_t starts at
+// ucontext_t layout — kernel arch/arm64/include/uapi/asm/sigcontext.h defines
+// the on-stack rt_sigframe. Empirically (Android bionic device + Linux glibc
+// under qemu-user-mode aarch64) the same offsets apply: uc_mcontext starts at
 // ucontext+176, regs[0..31] at +184..+432, sp +432, pc +440, pstate +448,
-// __reserved +456. Cross-checked: si_addr matches *((uc+440) as *const u64).
-const UC_REGS_OFFSET: usize = 184; // regs[0]
+// __reserved +456. The 1024-bit POSIX sigset_t padding the kernel reserves
+// brings glibc and bionic into alignment for everything past uc_sigmask.
+const UC_REGS_OFFSET: usize = 184;
 const UC_PC_OFFSET: usize = 440;
 const UC_RESERVED_OFFSET: usize = 456;
 
