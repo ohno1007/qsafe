@@ -27,8 +27,10 @@ use vmp_isa::Width;
 // 给每次 dispatch 切出 64KB 的 VM stack + 16KB 的 bytecode scratch. 递归
 // dispatch (vm_call_region_fp) 再切下一片, 退出时归还. 完全不走 malloc.
 //
-// 1MB / 80KB ≈ 12 层递归, 远够 ImGui / C++ 容器/迭代场景.
-const POOL_SIZE: usize = 1024 * 1024;
+// ImGui/C++ 容器算法 (std::vector::resize, std::sort, 字符串拼接) 嵌套调用
+// 轻松 20-30 层. 1MB 池 / 80KB 每 frame 只够 12 层 → "frame pool exhausted"
+// 错误 (Eb3) 是 v37-v44 全量挂的真正 root cause. 升 16MB → ~200 层够用.
+const POOL_SIZE: usize = 16 * 1024 * 1024;
 const VM_STACK_BYTES: usize = 64 * 1024;
 const BC_SCRATCH_BYTES: usize = 16 * 1024;
 const FRAME_BYTES: usize = VM_STACK_BYTES + BC_SCRATCH_BYTES;

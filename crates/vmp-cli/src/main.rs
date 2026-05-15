@@ -267,9 +267,39 @@ fn main() -> anyhow::Result<()> {
             // 含 Trap 的 region 在 VM 跑会直接 Err("E8"). 级联剔除：每轮丢掉含
             // Trap 的 region，重建 entry 表，再 resolve 一遍 (从原始 IR 副本)
             // —— 之前 CallRegion 到现在不在的目标会变成 Trap，下一轮继续丢。
+            //
+            // 同样的循环也吸收 QVMP_LEAF_ONLY / QVMP_DROP_FP / QVMP_REGION_RANGE
+            // 过滤：把要踢的 region name 一开始就塞进 `dropped`, cascade loop 自然
+            // 把 CallRegion 指向已丢 region 的 caller 也再剔掉. 这修了 v45 实验里
+            // 看到的 "Eb2:E:E1:19" (NoRegion) 错误——之前的实现在 cascade loop
+            // **之后** 才做 range/leaf/fp 过滤, IR 里残留 CallRegion 指向被踢的
+            // 索引, 运行时 dispatch 这些 CallRegion 就 NoRegion 报错.
             let pristine_funcs = funcs.clone();
             let mut dropped: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
+
+            // QVMP_REGION_RANGE=start,end：保留索引区间 [start, end) 内的 region.
+            // 用于二分定位坏 region —— 区间外的全部加入 dropped, cascade 再清理
+            // 任何 CallRegion 残留.
+            if let Ok(range) = std::env::var("QVMP_REGION_RANGE") {
+                if let Some((s, e)) = range.split_once(',') {
+                    let s: usize = s.parse().unwrap_or(0);
+                    let e: usize = e.parse().unwrap_or(usize::MAX);
+                    for (i, f) in pristine_funcs.iter().enumerate() {
+                        if i < s || i >= e {
+                            dropped.insert(f.name.clone());
+                        }
+                    }
+                    log::info!(
+                        "QVMP_REGION_RANGE={}..{}: marked {} regions for drop",
+                        s, e, dropped.len()
+                    );
+                }
+            }
+
+            let leaf_only = std::env::var("QVMP_LEAF_ONLY").is_ok();
+            let drop_fp = std::env::var("QVMP_DROP_FP").is_ok();
+
             let resolve_report = loop {
                 funcs = pristine_funcs
                     .iter()
@@ -277,19 +307,38 @@ fn main() -> anyhow::Result<()> {
                     .cloned()
                     .collect();
                 let r = resolve_program(&mut funcs);
-                let bad: Vec<String> = funcs
-                    .iter()
-                    .filter(|f| f.ir.iter().any(|i| i.op == VOp::Trap))
-                    .map(|f| f.name.clone())
-                    .collect();
-                if bad.is_empty() {
+
+                // Each pass drops:
+                //  1. regions whose post-resolve IR has VOp::Trap
+                //     (unresolved branches or cascaded CallRegion-to-dropped),
+                //  2. QVMP_LEAF_ONLY: regions using NativeCall / CallRegion,
+                //  3. QVMP_DROP_FP: regions using any FP op.
+                // Loop until fixpoint.
+                let mut newly_dropped: Vec<String> = Vec::new();
+                for f in &funcs {
+                    let has_trap =
+                        f.ir.iter().any(|i| i.op == VOp::Trap);
+                    let leaf_violates = leaf_only && f.ir.iter().any(|i| {
+                        matches!(i.op, VOp::NativeCall | VOp::CallRegion)
+                    });
+                    let fp_violates = drop_fp && f.ir.iter().any(|i| matches!(
+                        i.op,
+                        VOp::FLoad | VOp::FStore | VOp::FMovR | VOp::FMovFromGpr
+                        | VOp::FMovToGpr | VOp::FAdd | VOp::FSub | VOp::FMul
+                        | VOp::FDiv | VOp::FCmp | VOp::FCvtZS | VOp::SCvtF
+                    ));
+                    if has_trap || leaf_violates || fp_violates {
+                        newly_dropped.push(f.name.clone());
+                    }
+                }
+                if newly_dropped.is_empty() {
                     break r;
                 }
                 log::info!(
-                    "dropping {} region(s) with unresolved branches (cascade)",
-                    bad.len()
+                    "dropping {} region(s) (Trap/leaf/fp filter, cascade)",
+                    newly_dropped.len()
                 );
-                for n in bad {
+                for n in newly_dropped {
                     dropped.insert(n);
                 }
             };
@@ -300,41 +349,6 @@ fn main() -> anyhow::Result<()> {
                 resolve_report.unresolved,
                 dropped.len()
             );
-
-            // QVMP_LEAF_ONLY=1：只保护"叶子函数" —— 不含 NativeCall（BLR/BR Rn）
-            // 也不含 CallRegion（BL 到其它被保护函数）的 region. 适合做 A/B 测试,
-            // 排除 VM 间接调用相关的潜在 bug.
-            if std::env::var("QVMP_LEAF_ONLY").is_ok() {
-                let before = funcs.len();
-                funcs.retain(|f| {
-                    !f.ir.iter().any(|i| {
-                        matches!(i.op, VOp::NativeCall | VOp::CallRegion)
-                    })
-                });
-                log::info!(
-                    "QVMP_LEAF_ONLY: kept {} leaf regions (dropped {})",
-                    funcs.len(),
-                    before - funcs.len()
-                );
-            }
-
-            // QVMP_REGION_RANGE=start,end (after all other filters)：保留索引区
-            // 间 [start, end) 内的 region. 用于二分定位坏 region.
-            if let Ok(range) = std::env::var("QVMP_REGION_RANGE") {
-                if let Some((s, e)) = range.split_once(',') {
-                    let s: usize = s.parse().unwrap_or(0);
-                    let e: usize = e.parse().unwrap_or(usize::MAX);
-                    let before = funcs.len();
-                    funcs = funcs.into_iter().enumerate()
-                        .filter(|(i, _)| *i >= s && *i < e)
-                        .map(|(_, f)| f)
-                        .collect();
-                    log::info!(
-                        "QVMP_REGION_RANGE={}..{}: kept {} regions (was {})",
-                        s, e, funcs.len(), before
-                    );
-                }
-            }
 
             // QVMP_DROP_FP=1: drop any region whose IR uses floating-point ops.
             // ARM64 FP/NEON 的 lifter 覆盖窄, 也是 leaf-only 后剩下最可疑的指令类.
