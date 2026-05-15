@@ -26,6 +26,7 @@
 //! 我们只追加新段、修改 e_phoff、e_phnum，必要时把 `.text` 中函数入口写一条 B 指令。
 
 pub mod armor;
+pub mod bootstrap;
 pub mod elf_writer;
 pub mod patcher;
 

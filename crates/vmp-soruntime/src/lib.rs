@@ -1,0 +1,778 @@
+//! libqvmp_runtime.so — on-device dispatcher for hardened ELFs.
+//!
+//! Lifecycle:
+//!  1. ELF load (linker pulls this .so via DT_NEEDED **or** the user sets LD_PRELOAD).
+//!  2. The dynamic linker invokes `qvmp_init` from `.init_array` once all .so's
+//!     and the main exec are mapped.
+//!  3. `qvmp_init` walks `dl_iterate_phdr`, scans every PT_LOAD for the
+//!     `QVMP` magic the rewriter planted (8-byte header: 4-byte magic + u32
+//!     length, followed by an XOR-encrypted packed StubBlob).
+//!  4. The blob is decrypted with the same FNV+ELF-header keystream the
+//!     rewriter used (`armor::encrypt_payload_in_place`), then `unpack_blob`'d.
+//!  5. A SIGTRAP handler is installed via `sigaction(SIGTRAP, SA_SIGINFO)`.
+//!  6. On every BRK trap fired by a rewriter trampoline, the handler reads X16
+//!     (region_id), gathers GPR/FP arg regs, calls `dispatch_vm_fp`, writes
+//!     the return into X0/D0, and sets PC := LR (X30) to return to caller.
+//!
+//! Trampoline layout (from vmp-rewriter::patcher):
+//!   `mov x16, #region_id ; brk #(0x5156 | region_id_low8) ; nop ; b .`
+//! BRK imm16 high byte = 0x51 ('Q'). We use that to filter unrelated SIGTRAPs.
+
+#![cfg(any(target_os = "linux", target_os = "android"))]
+#![cfg(target_arch = "aarch64")]
+
+use std::ffi::c_void;
+use std::sync::OnceLock;
+
+use vmp_stub::StubBlob;
+
+// ---------------------------------------------------------------------------
+// Globals
+// ---------------------------------------------------------------------------
+
+static BLOB: OnceLock<StubBlob> = OnceLock::new();
+
+// ---------------------------------------------------------------------------
+// .init_array constructor
+// ---------------------------------------------------------------------------
+
+#[link_section = ".init_array"]
+#[used]
+static INIT_ARRAY_ENTRY: extern "C" fn() = qvmp_init;
+
+extern "C" fn qvmp_init() {
+    // 不经过 LOG_FLAG, 总是写一行 "qvmp_init: enter" 到 fd 2. 这个就是探针:
+    // 如果用户看不到这一行, 说明 .init_array 根本没被调到 (dlopen 失败 / 路径
+    // 错 / 文件没刷新等); 看到了但没后续 log_msg, 说明 LOG_FLAG 没拿到 (QVMP
+    // header 没设 log byte). 帮助远程隔离 "为什么没日志" 这类问题.
+    unsafe {
+        let msg = b"[qvmp] qvmp_init: enter\n";
+        raw_write(2, msg.as_ptr(), msg.len());
+    }
+    if let Some(blob) = discover_and_decrypt_blob() {
+        let _ = BLOB.set(blob);
+        // Pre-load the blob's data segments BEFORE installing the SIGTRAP
+        // handler. preload_data_segments calls mmap repeatedly; we want
+        // those done on the main thread (no signal handler shenanigans) so
+        // the previous std::sync::Once-guarded path inside dispatch_vm_fp
+        // can be deleted entirely (Once's futex isn't signal-safe).
+        let blob_ref = BLOB.get().unwrap();
+        let mut host = vmp_stub::linux::LinuxHost::new();
+        vmp_stub::preload_data_segments(blob_ref, &mut host);
+        install_sigtrap_handler();
+        install_sigsegv_logger();
+        log_msg(b"qvmp_runtime: blob loaded, SIGTRAP+SIGSEGV handlers installed\0");
+    } else {
+        log_msg(b"qvmp_runtime: no QVMP payload found in any loaded ELF\0");
+    }
+}
+
+#[cfg(target_os = "android")]
+extern "C" {
+    fn __android_log_write(
+        prio: libc::c_int,
+        tag: *const libc::c_char,
+        text: *const libc::c_char,
+    ) -> libc::c_int;
+}
+
+// Logging is gated by a byte at QVMP-header-offset+24 — baked into the
+// hardened ELF at rewrite time (`vmp rewrite --log on|off`). When non-zero
+// we mirror messages to stderr (fd 2) so MT 管理器's run window / `adb shell`
+// see them directly. No env-var lookup at runtime.
+static LOG_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn log_enabled() -> bool {
+    LOG_FLAG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Format `<prefix><decimal id>\n\0` into `buf`, returns the byte length used.
+/// Avoids heap allocations so it's safe to call from a signal handler.
+fn format_dispatch_msg(buf: &mut [u8], prefix: &[u8], id: usize) -> usize {
+    let mut pos = 0;
+    for &b in prefix {
+        if pos < buf.len() { buf[pos] = b; pos += 1; }
+    }
+    // Stringify id as decimal
+    let mut digits = [0u8; 20];
+    let mut n = 0;
+    let mut v = id;
+    if v == 0 {
+        digits[0] = b'0';
+        n = 1;
+    } else {
+        while v > 0 {
+            digits[n] = b'0' + (v % 10) as u8;
+            v /= 10;
+            n += 1;
+        }
+    }
+    for i in (0..n).rev() {
+        if pos < buf.len() { buf[pos] = digits[i]; pos += 1; }
+    }
+    if pos < buf.len() { buf[pos] = 0; }
+    pos
+}
+
+/// raw write(2) via `svc #0` — POSIX 说 libc::write 是 async-signal-safe, 但
+/// bionic 的 libc wrapper 走 errno tls 等通路, 实际触发过 signal-handler 内的
+/// bionic 内部 mutex 重入. 直接 syscall 完全绕过 libc 状态.
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
+#[inline]
+unsafe fn raw_write(fd: i32, buf: *const u8, len: usize) {
+    let _ret: i64;
+    core::arch::asm!(
+        "svc #0",
+        in("x8") 64u64, // SYS_write
+        inlateout("x0") fd as u64 => _ret,
+        inlateout("x1") buf as u64 => _,
+        inlateout("x2") len as u64 => _,
+        lateout("x3") _, lateout("x4") _, lateout("x5") _,
+        lateout("x6") _, lateout("x7") _,
+        options(nostack),
+    );
+}
+
+#[cfg(not(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64")))]
+unsafe fn raw_write(fd: i32, buf: *const u8, len: usize) {
+    let _ = libc::write(fd, buf as *const _, len);
+}
+
+fn log_msg(msg: &[u8]) {
+    if !log_enabled() {
+        return;
+    }
+    let stripped = if msg.last() == Some(&0) { &msg[..msg.len() - 1] } else { msg };
+    // 全程 raw syscall, 不调 bionic logger / __android_log_write —— 后者在
+    // 内部走 socket + mutex, 在 SIGTRAP handler 路径上撞主线程 logger mutex
+    // 会重入死锁/堆损坏.
+    unsafe {
+        let prefix = b"[qvmp] ";
+        raw_write(2, prefix.as_ptr(), prefix.len());
+        raw_write(2, stripped.as_ptr(), stripped.len());
+        raw_write(2, b"\n".as_ptr(), 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Blob discovery via dl_iterate_phdr
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+struct DlPhdrInfo {
+    dlpi_addr: usize,
+    dlpi_name: *const libc::c_char,
+    dlpi_phdr: *const libc::Elf64_Phdr,
+    dlpi_phnum: u16,
+}
+
+extern "C" {
+    fn dl_iterate_phdr(
+        callback: extern "C" fn(*mut DlPhdrInfo, libc::size_t, *mut c_void) -> libc::c_int,
+        data: *mut c_void,
+    ) -> libc::c_int;
+}
+
+struct Find {
+    magic_vaddr: usize,
+    payload_len: usize,
+    payload_file_offset: u64,
+    elf_header: [u8; 32],
+    rodata_vaddr: u64,
+    rodata_len: u64,
+    load_bias: usize,
+    log_flag: bool,
+}
+
+/// QVMP header (32 bytes total):
+///   [0..4]   "QVMP" magic
+///   [4..8]   payload_len: u32
+///   [8..16]  rodata_vaddr: u64
+///   [16..24] rodata_len: u64
+///   [24]     log_flag: u8         (1 = stderr+logcat on, 0 = silent)
+///   [25..32] reserved (zero)
+const QVMP_HEADER_LEN: usize = 32;
+
+extern "C" fn iter_cb(info: *mut DlPhdrInfo, _size: libc::size_t, data: *mut c_void) -> libc::c_int {
+    let info = unsafe { &*info };
+    let out = unsafe { &mut *(data as *mut Option<Find>) };
+    if out.is_some() {
+        return 1;
+    }
+    let load_base = info.dlpi_addr;
+    let phdrs = unsafe { std::slice::from_raw_parts(info.dlpi_phdr, info.dlpi_phnum as usize) };
+
+    // Lowest PT_LOAD vaddr → in-memory ELF header start.
+    let mut elf_hdr_addr: Option<usize> = None;
+    for ph in phdrs {
+        if ph.p_type == libc::PT_LOAD {
+            let v = load_base + ph.p_vaddr as usize;
+            elf_hdr_addr = Some(elf_hdr_addr.map_or(v, |x| x.min(v)));
+        }
+    }
+    let elf_hdr_addr = match elf_hdr_addr {
+        Some(v) => v,
+        None => return 0,
+    };
+
+    for ph in phdrs {
+        if ph.p_type != libc::PT_LOAD {
+            continue;
+        }
+        let seg_start = load_base + ph.p_vaddr as usize;
+        let seg_len = ph.p_filesz as usize;
+        if seg_len < QVMP_HEADER_LEN {
+            continue;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(seg_start as *const u8, seg_len) };
+        let mut i = 0usize;
+        while i + QVMP_HEADER_LEN <= bytes.len() {
+            if &bytes[i..i + 4] == b"QVMP" {
+                let payload_len = u32::from_le_bytes([
+                    bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7],
+                ]) as usize;
+                let rodata_vaddr = u64::from_le_bytes([
+                    bytes[i + 8],  bytes[i + 9],  bytes[i + 10], bytes[i + 11],
+                    bytes[i + 12], bytes[i + 13], bytes[i + 14], bytes[i + 15],
+                ]);
+                let rodata_len = u64::from_le_bytes([
+                    bytes[i + 16], bytes[i + 17], bytes[i + 18], bytes[i + 19],
+                    bytes[i + 20], bytes[i + 21], bytes[i + 22], bytes[i + 23],
+                ]);
+                if i + QVMP_HEADER_LEN + payload_len <= bytes.len() {
+                    let mut header = [0u8; 32];
+                    let hdr = unsafe { std::slice::from_raw_parts(elf_hdr_addr as *const u8, 32) };
+                    header.copy_from_slice(hdr);
+                    let log_flag = bytes[i + 24] != 0;
+                    *out = Some(Find {
+                        magic_vaddr: seg_start + i,
+                        payload_len,
+                        payload_file_offset: ph.p_offset as u64 + i as u64,
+                        elf_header: header,
+                        rodata_vaddr,
+                        rodata_len,
+                        load_bias: load_base,
+                        log_flag,
+                    });
+                    return 1;
+                }
+            }
+            i += 4;
+        }
+    }
+    0
+}
+
+/// Domain tags must match vmp-rewriter::armor.
+const DOMAIN_PAYLOAD: u64 = 0;
+const DOMAIN_RODATA: u64 = 0xC0DE_DA7A_BABE_F00D;
+
+fn derive_key(elf_header: &[u8; 32], magic_vaddr: usize, payload_offset: u64) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    for i in 0..16 {
+        key[i] = elf_header[i] ^ ((payload_offset >> (i % 8)) as u8);
+    }
+    let entry_field = u64::from_le_bytes([
+        elf_header[0x18], elf_header[0x19], elf_header[0x1a], elf_header[0x1b],
+        elf_header[0x1c], elf_header[0x1d], elf_header[0x1e], elf_header[0x1f],
+    ]);
+    for i in 0..8 {
+        key[16 + i] = ((entry_field >> (i * 8)) as u8) ^ 0xA5;
+    }
+    // For any real-sized binary, `elf[(off + i) % elf.len()]` lands at off..off+8
+    // — the unencrypted QVMP magic + length bytes. Read those from live memory.
+    for i in 0..8 {
+        let byte = unsafe { *((magic_vaddr + i) as *const u8) };
+        key[24 + i] = byte ^ 0x5A;
+    }
+    key
+}
+
+fn keystream_byte(key: &[u8; 32], i: usize, domain: u64) -> u8 {
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325 ^ domain;
+    h ^= key[i % 32] as u64;
+    h = h.wrapping_mul(0x100_0000_01B3);
+    h ^= (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h = h.wrapping_mul(0x100_0000_01B3);
+    (h >> 32) as u8
+}
+
+/// Make a vaddr range writable, run a closure, restore RX/RO. Page-aligns.
+unsafe fn with_writable<F: FnOnce()>(addr: usize, len: usize, restore_prot: i32, f: F) -> bool {
+    let page = 0x1000usize;
+    let aligned_addr = addr & !(page - 1);
+    let end = (addr + len + page - 1) & !(page - 1);
+    let aligned_len = end - aligned_addr;
+    let r1 = libc::mprotect(
+        aligned_addr as *mut c_void,
+        aligned_len,
+        libc::PROT_READ | libc::PROT_WRITE,
+    );
+    if r1 != 0 {
+        return false;
+    }
+    f();
+    let r2 = libc::mprotect(aligned_addr as *mut c_void, aligned_len, restore_prot);
+    r2 == 0
+}
+
+fn decrypt_rodata_in_place(f: &Find) {
+    if f.rodata_len == 0 || f.rodata_vaddr == 0 {
+        return;
+    }
+    let key = derive_key(&f.elf_header, f.magic_vaddr, f.payload_file_offset);
+    let target = f.load_bias + f.rodata_vaddr as usize;
+    let len = f.rodata_len as usize;
+    unsafe {
+        let ok = with_writable(target, len, libc::PROT_READ, || {
+            let p = target as *mut u8;
+            for i in 0..len {
+                let k = keystream_byte(&key, i, DOMAIN_RODATA);
+                *p.add(i) ^= k;
+            }
+        });
+        if !ok {
+            log_msg(b"qvmp_runtime: rodata mprotect failed; skipped decrypt\0");
+        } else {
+            log_msg(b"qvmp_runtime: rodata decrypted in place\0");
+        }
+    }
+}
+
+fn discover_and_decrypt_blob() -> Option<StubBlob> {
+    let mut find: Option<Find> = None;
+    unsafe {
+        dl_iterate_phdr(iter_cb, &mut find as *mut _ as *mut c_void);
+    }
+    let f = find?;
+    LOG_FLAG.store(f.log_flag, std::sync::atomic::Ordering::Relaxed);
+    // Same flag also enables per-BLR diagnostic emission inside the VM.
+    vmp_interpreter::TRACE_NATIVE_CALLS
+        .store(f.log_flag, std::sync::atomic::Ordering::Relaxed);
+    // PIE relocation: the lifter encodes ADRP / ADR / LDR-literal as offsets
+    // from ELF vaddr 0. Push the real dlpi_addr so the VM resolves them.
+    vmp_interpreter::MAIN_EXEC_LOAD_BIAS
+        .store(f.load_bias as u64, std::sync::atomic::Ordering::Relaxed);
+
+    // Decrypt rodata FIRST — must happen before any code that references its
+    // bytes runs. Our .init_array entry is invoked before the main binary's
+    // .init_array (LD_PRELOAD ordering or NEEDED-deps-before-main ordering),
+    // so this is the right window.
+    decrypt_rodata_in_place(&f);
+
+    // Snapshot the encrypted payload into a writable buffer.
+    let payload_addr = f.magic_vaddr + QVMP_HEADER_LEN;
+    let mut buf: Vec<u8> = unsafe {
+        std::slice::from_raw_parts(payload_addr as *const u8, f.payload_len).to_vec()
+    };
+
+    let key = derive_key(&f.elf_header, f.magic_vaddr, f.payload_file_offset);
+    for i in 0..f.payload_len {
+        buf[i] ^= keystream_byte(&key, i, DOMAIN_PAYLOAD);
+    }
+
+    vmp_stub::unpack_blob(&buf).ok()
+}
+
+// ---------------------------------------------------------------------------
+// SIGTRAP handler
+// ---------------------------------------------------------------------------
+
+fn sig_dfl_sigtrap() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        libc::sigaction(libc::SIGTRAP, &sa, std::ptr::null_mut());
+    }
+}
+
+/// Catch SEGVs (typically from a VM-issued native call landing on a bad
+/// function pointer) and log pc + fault address before letting the kernel
+/// terminate. Without this, MT 管理器 just shows a bare "Segmentation fault".
+fn install_sigsegv_logger() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigsegv_handler as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
+        // SIGILL 同套 handler: 在 VMP 上下文里, 如果 caller 回 lr 之后跑到
+        // 一段全 0 / 未初始化内存当指令解 → udf #0 → SIGILL. 拿到 pc/regs
+        // 才能定位是哪个 region 返回时把状态搞坏了.
+        libc::sigaction(libc::SIGILL, &sa, std::ptr::null_mut());
+    }
+}
+
+extern "C" fn sigsegv_handler(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    ucontext: *mut c_void,
+) {
+    let fault_addr = unsafe { *((info as *const u8).add(16) as *const u64) };
+    let pc = unsafe { uc_pc(ucontext) };
+    {
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: SIGSEGV sig=", sig as usize);
+        log_msg(&buf[..n]);
+    }
+    {
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: SIGSEGV pc=", pc as usize);
+        log_msg(&buf[..n]);
+    }
+    {
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: SIGSEGV addr=", fault_addr as usize);
+        log_msg(&buf[..n]);
+    }
+    // Dump x0..x30 + sp at fault — pinpoint which arg/this-ptr was bogus.
+    for i in 0..31usize {
+        let v = unsafe { uc_reg(ucontext, i) };
+        let mut buf = [0u8; 96];
+        let mut prefix = [0u8; 32];
+        let mut p = 0usize;
+        for &b in b"qvmp_runtime: x" {
+            prefix[p] = b;
+            p += 1;
+        }
+        let mut digits = [0u8; 4];
+        let mut n = 0usize;
+        let mut v_i = i;
+        if v_i == 0 {
+            digits[0] = b'0';
+            n = 1;
+        } else {
+            while v_i > 0 {
+                digits[n] = b'0' + (v_i % 10) as u8;
+                v_i /= 10;
+                n += 1;
+            }
+        }
+        for j in (0..n).rev() {
+            prefix[p] = digits[j];
+            p += 1;
+        }
+        prefix[p] = b'=';
+        p += 1;
+        let n2 = format_dispatch_msg(&mut buf, &prefix[..p], v as usize);
+        log_msg(&buf[..n2]);
+    }
+    {
+        let sp = unsafe {
+            *((ucontext as *const u8).add(UC_PC_OFFSET - 8) as *const u64)
+        };
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: sp=", sp as usize);
+        log_msg(&buf[..n]);
+    }
+
+    // Frame-pointer chain walk: AAPCS64 every prologue stores
+    //   [fp+0] = saved fp, [fp+8] = saved lr.
+    // Hand-walk up to 12 frames to give a poor-man's backtrace. Reads through
+    // raw pointers — if a frame is corrupt we'll re-fire SEGV; the kernel will
+    // then default-terminate (SA_NODEFER is *not* set on SIGSEGV).
+    let mut fp = unsafe { uc_reg(ucontext, 29) };
+    for i in 0..12 {
+        if fp == 0 || fp & 0x7 != 0 || fp < 0x1000 {
+            break;
+        }
+        let saved_fp = unsafe { *(fp as *const u64) };
+        let saved_lr = unsafe { *((fp + 8) as *const u64) };
+        {
+            let mut prefix = [0u8; 64];
+            let mut p = 0;
+            for &b in b"qvmp_runtime: frame[" {
+                prefix[p] = b; p += 1;
+            }
+            let mut dig = [0u8; 4]; let mut dn = 0; let mut v_i = i;
+            if v_i == 0 { dig[0] = b'0'; dn = 1; } else {
+                while v_i > 0 { dig[dn] = b'0' + (v_i % 10) as u8; v_i /= 10; dn += 1; }
+            }
+            for j in (0..dn).rev() { prefix[p] = dig[j]; p += 1; }
+            for &b in b"] lr=" { prefix[p] = b; p += 1; }
+            let mut buf = [0u8; 96];
+            let n = format_dispatch_msg(&mut buf, &prefix[..p], saved_lr as usize);
+            log_msg(&buf[..n]);
+        }
+        if saved_fp <= fp {
+            // FP must grow upward; stop on inversion or loop.
+            break;
+        }
+        fp = saved_fp;
+    }
+
+    // Hand back to default action — process will terminate with SIGSEGV.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        libc::sigaction(sig, &sa, std::ptr::null_mut());
+    }
+}
+
+fn install_sigtrap_handler() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigtrap_handler as *const () as usize;
+        // SA_NODEFER: 允许嵌套 SIGTRAP。VM 内 BLR 到另一个被保护 region
+        // 的 trampoline 时会触发二次 BRK，没这个 flag 内核会 mask 信号 →
+        // 默认动作终止进程 (exit 133). NestedDispatchHost.native_call 已尽量
+        // 在 VM 内直接调度，本 flag 作 fallback 防御。
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART | libc::SA_NODEFER;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGTRAP, &sa, std::ptr::null_mut());
+    }
+}
+
+// ucontext_t layout — kernel arch/arm64/include/uapi/asm/sigcontext.h defines
+// the on-stack rt_sigframe. Empirically (Android bionic device + Linux glibc
+// under qemu-user-mode aarch64) the same offsets apply: uc_mcontext starts at
+// ucontext+176, regs[0..31] at +184..+432, sp +432, pc +440, pstate +448,
+// __reserved +456. The 1024-bit POSIX sigset_t padding the kernel reserves
+// brings glibc and bionic into alignment for everything past uc_sigmask.
+const UC_REGS_OFFSET: usize = 184;
+const UC_PC_OFFSET: usize = 440;
+const UC_RESERVED_OFFSET: usize = 456;
+
+#[inline(always)]
+unsafe fn uc_reg(ucontext: *mut c_void, idx: usize) -> u64 {
+    let p = (ucontext as *const u8).add(UC_REGS_OFFSET + idx * 8) as *const u64;
+    *p
+}
+#[inline(always)]
+unsafe fn uc_set_reg(ucontext: *mut c_void, idx: usize, val: u64) {
+    let p = (ucontext as *mut u8).add(UC_REGS_OFFSET + idx * 8) as *mut u64;
+    *p = val;
+}
+#[inline(always)]
+unsafe fn uc_pc(ucontext: *mut c_void) -> u64 {
+    let p = (ucontext as *const u8).add(UC_PC_OFFSET) as *const u64;
+    *p
+}
+#[inline(always)]
+unsafe fn uc_set_pc(ucontext: *mut c_void, val: u64) {
+    let p = (ucontext as *mut u8).add(UC_PC_OFFSET) as *mut u64;
+    *p = val;
+}
+
+static HANDLER_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+extern "C" fn sigtrap_handler(
+    _sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    ucontext: *mut c_void,
+) {
+    let n = HANDLER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    // 早期诊断: 前 32 次全打, 之后退回 power-of-two / 1000 倍数节流.
+    if n <= 32 || n.is_power_of_two() || n % 1000 == 0 {
+        let mut buf = [0u8; 96];
+        let n_msg = format_dispatch_msg(&mut buf, b"qvmp_runtime: handler entry #", n as usize);
+        log_msg(&buf[..n_msg]);
+    }
+    // si_addr (kernel's authoritative trap address) is at byte offset 16
+    // in siginfo_t for SIGTRAP. The bionic ucontext layout has varied across
+    // devices, so we trust si_addr over uc_pc() for the trapped instruction.
+    let real_pc = unsafe { *((info as *const u8).add(16) as *const u64) };
+    let inst = unsafe { *(real_pc as *const u32) };
+
+    // BRK encoding: 1101 0100 001 imm16 0 0000  →  base 0xD420_0000, imm16 in [20:5]
+    if (inst & 0xFFE0_001F) != 0xD420_0000 {
+        // Not our trap. Restore default handler so the kernel terminates the
+        // process instead of re-invoking us on the same non-BRK instruction.
+        sig_dfl_sigtrap();
+        return;
+    }
+    let imm16 = ((inst >> 5) & 0xFFFF) as u16;
+    if imm16 & 0xFF00 != 0x5100 {
+        // Foreign BRK — restore SIG_DFL so the kernel terminates rather than
+        // re-firing SIGTRAP on the same BRK in an infinite loop.
+        sig_dfl_sigtrap();
+        return;
+    }
+
+    let blob = match BLOB.get() {
+        Some(b) => b,
+        None => {
+            log_msg(b"qvmp_runtime: BLOB not set\0");
+            sig_dfl_sigtrap();
+            return;
+        }
+    };
+
+    // X16 carries the full region_id (the trampoline `mov x16, #N` is the
+    // authoritative source; imm16 only encodes the low byte).
+    let region_id = unsafe { uc_reg(ucontext, 16) } as usize;
+    if region_id >= blob.regions.len() {
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: region_id OOB, id=", region_id);
+        log_msg(&buf[..n]);
+        sig_dfl_sigtrap();
+        return;
+    }
+
+    let mut gpr_args = [0u64; 8];
+    let mut fpr_args = [0u64; 8];
+    for i in 0..8 {
+        gpr_args[i] = unsafe { uc_reg(ucontext, i) };
+    }
+    // FP args via fpsimd_context inside reserved area
+    if let Some(vregs) = read_fpsimd_raw(ucontext) {
+        for i in 0..8 {
+            fpr_args[i] = vregs[i] as u64;
+        }
+    }
+
+    let lr = unsafe { uc_reg(ucontext, 30) };
+
+    // Log the region we're about to dispatch (helps diagnose SEGV during VM run)
+    {
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: dispatching region=", region_id);
+        log_msg(&buf[..n]);
+    }
+
+    let mut host = vmp_stub::linux::LinuxHost::new();
+    let (gpr_ret, fpr_ret) = match vmp_stub::dispatch_vm_fp(
+        blob,
+        region_id,
+        &gpr_args,
+        &fpr_args,
+        &mut host,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            // Format the error via a stack buffer (no heap, signal-safe).
+            use std::fmt::Write;
+            struct StackBuf<'a> { buf: &'a mut [u8], pos: usize }
+            impl<'a> std::fmt::Write for StackBuf<'a> {
+                fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                    for &b in s.as_bytes() {
+                        if self.pos < self.buf.len() {
+                            self.buf[self.pos] = b;
+                            self.pos += 1;
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            let mut sbuf = [0u8; 256];
+            let mut w = StackBuf { buf: &mut sbuf, pos: 0 };
+            let _ = write!(
+                w,
+                "qvmp_runtime: VM ERR region={} err={}",
+                region_id, e
+            );
+            let n = w.pos;
+            log_msg(&sbuf[..n]);
+
+            // Avoid infinite re-trap loop: restore SIG_DFL so the kernel
+            // terminates on the next BRK (PC hasn't moved) with code 133.
+            sig_dfl_sigtrap();
+            return;
+        }
+    };
+
+    // Log successful return
+    {
+        let mut buf = [0u8; 96];
+        let n = format_dispatch_msg(&mut buf, b"qvmp_runtime: VM returned region=", region_id);
+        log_msg(&buf[..n]);
+    }
+
+    if let Some(vregs_off) = find_fpsimd_offset_raw(ucontext) {
+        unsafe {
+            let p = (ucontext as *mut u8).add(vregs_off + FPSIMD_VREGS_OFFSET) as *mut u128;
+            let upper = *p & !((1u128 << 64) - 1);
+            *p = upper | (fpr_ret as u128);
+        }
+    }
+    unsafe {
+        uc_set_reg(ucontext, 0, gpr_ret);
+        uc_set_pc(ucontext, lr);
+    }
+}
+
+fn find_fpsimd_offset_raw(ucontext: *mut c_void) -> Option<usize> {
+    // Scan reserved area for FPSIMD_MAGIC. reserved starts at UC_RESERVED_OFFSET.
+    let base = ucontext as *const u8;
+    for off in (UC_RESERVED_OFFSET..UC_RESERVED_OFFSET + 4096).step_by(16) {
+        let p = unsafe { base.add(off) as *const u32 };
+        let m = unsafe { p.read_unaligned() };
+        if m == FPSIMD_MAGIC {
+            return Some(off);
+        }
+    }
+    None
+}
+
+fn read_fpsimd_raw(ucontext: *mut c_void) -> Option<[u128; 32]> {
+    let off = find_fpsimd_offset_raw(ucontext)?;
+    let base = (ucontext as *const u8).wrapping_add(off + FPSIMD_VREGS_OFFSET);
+    let mut out = [0u128; 32];
+    for i in 0..32 {
+        let p = base.wrapping_add(i * 16) as *const u128;
+        out[i] = unsafe { p.read_unaligned() };
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// fpsimd_context extraction from ucontext_t.uc_mcontext.__reserved
+// ---------------------------------------------------------------------------
+//
+// Linux kernel layout (arch/arm64/include/uapi/asm/sigcontext.h):
+//
+//   struct fpsimd_context {
+//       struct _aarch64_ctx head;   // u32 magic + u32 size
+//       u32 fpsr;
+//       u32 fpcr;
+//       __uint128_t vregs[32];
+//   };
+//   #define FPSIMD_MAGIC 0x46508001
+//
+// __reserved[] is iterated as a chain of _aarch64_ctx records, terminated by
+// a zero magic. We walk it to find FPSIMD_MAGIC.
+
+const FPSIMD_MAGIC: u32 = 0x46508001;
+const FPSIMD_VREGS_OFFSET: usize = 16; // head(8) + fpsr(4) + fpcr(4)
+
+fn find_fpsimd_offset(uc: &libc::ucontext_t) -> Option<usize> {
+    // libc's ucontext_t::uc_mcontext on aarch64 has field `__reserved: [u8; 4096]`
+    // but the layout varies between bionic and glibc. We treat the entire
+    // mcontext as a byte slice starting at `&mctx as *const _ as *const u8`,
+    // and walk it from a known position past `regs[31] + sp + pc + pstate + fault_address`.
+    // Easier: scan from a safe offset for the FPSIMD_MAGIC, since reserved
+    // area is large (4096 bytes) and fully zeroed except for the chain.
+    let base = uc as *const _ as *const u8;
+    // Skip the fixed mcontext head: fault_address(8) + regs[31](248) + sp(8) + pc(8) + pstate(8) = 280 bytes.
+    // We start scanning a little past that, in 16-byte stride.
+    let start = std::mem::size_of::<libc::ucontext_t>().min(4096);
+    // Scan within the ucontext itself (which embeds mcontext including reserved bytes):
+    // we read 32-bit aligned u32 candidates for FPSIMD_MAGIC.
+    for off in (0..start).step_by(16) {
+        let p = unsafe { base.add(off) as *const u32 };
+        let m = unsafe { p.read_unaligned() };
+        if m == FPSIMD_MAGIC {
+            return Some(off);
+        }
+    }
+    None
+}
+
+fn read_fpsimd(uc: &libc::ucontext_t) -> Option<[u128; 32]> {
+    let off = find_fpsimd_offset(uc)?;
+    let base = (uc as *const _ as *const u8).wrapping_add(off + FPSIMD_VREGS_OFFSET);
+    let mut out = [0u128; 32];
+    for i in 0..32 {
+        let p = base.wrapping_add(i * 16) as *const u128;
+        out[i] = unsafe { p.read_unaligned() };
+    }
+    Some(out)
+}
+
+fn read_fpsimd_mut(uc: &mut libc::ucontext_t) -> Option<&mut [u128; 32]> {
+    let off = find_fpsimd_offset(uc)?;
+    let base = (uc as *mut _ as *mut u8).wrapping_add(off + FPSIMD_VREGS_OFFSET);
+    Some(unsafe { &mut *(base as *mut [u128; 32]) })
+}

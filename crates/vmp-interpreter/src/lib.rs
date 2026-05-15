@@ -11,10 +11,162 @@
 pub mod state;
 
 use log::trace;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use vmp_core::{Error, Result};
 use vmp_isa::{decode_instr, Cond, IsaSpec, VOp, Width};
 
 pub use state::{HostBridge, VmState};
+
+/// Diagnostic flag: when set (typically by the on-device cdylib's qvmp_init
+/// when the rewrite-time `--log on` flag is baked into the QVMP header),
+/// every VOp::NativeCall logs "BLR xN target=0x… x0..x7=…" to fd 2 before
+/// crossing into the host. Silent on the protect-side CLI by default.
+pub static TRACE_NATIVE_CALLS: AtomicBool = AtomicBool::new(false);
+
+/// 主可执行 ELF 的 dlpi_addr。PIE 二进制 lifter 把 ADRP/ADR/LDR-literal 编成
+/// `Add rd, V62, offset`，运行时需要 V62 = load_bias 才能算出真实地址。
+/// 由 vmp-soruntime 的 qvmp_init 在 dl_iterate_phdr 找到 QVMP magic 那一瞬
+/// 写入。CLI 模拟器场景保留 0（与 lift 时 pc 一致）。
+pub static MAIN_EXEC_LOAD_BIAS: AtomicU64 = AtomicU64::new(0);
+
+/// lifter / interpreter 约定：VM 寄存器 V62 在每次 run() 启动时被装载
+/// MAIN_EXEC_LOAD_BIAS，用于 ADRP / ADR / LDR-literal 的运行时重定位。
+pub const VM_REG_LOAD_BIAS: usize = 62;
+
+/// Raw `SYS_write` via inline syscall — completely bypasses libc/bionic logger
+/// machinery, which holds internal mutexes that deadlock if the SIGTRAP handler
+/// re-enters them. POSIX `write(2)` is technically async-signal-safe, but
+/// observed bionic interactions (errno TLS, sockets, etc) make the syscall
+/// path the only truly safe option for tracing on the signal path.
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
+#[inline]
+unsafe fn syscall_write(fd: i32, buf: *const u8, len: usize) {
+    let _r: i64;
+    core::arch::asm!(
+        "svc #0",
+        in("x8") 64u64,
+        inlateout("x0") fd as u64 => _r,
+        inlateout("x1") buf as u64 => _,
+        inlateout("x2") len as u64 => _,
+        lateout("x3") _, lateout("x4") _, lateout("x5") _,
+        lateout("x6") _, lateout("x7") _,
+        options(nostack),
+    );
+}
+
+#[cfg(not(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64")))]
+unsafe fn syscall_write(fd: i32, buf: *const u8, len: usize) {
+    extern "C" {
+        fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    }
+    let _ = write(fd, buf, len);
+}
+
+fn trace_native_call(rd: u8, target: u64, args: &[u64]) {
+    if !TRACE_NATIVE_CALLS.load(Ordering::Relaxed) {
+        return;
+    }
+    // Stack-only formatting, signal-safe: "[qvmp] vm: BLR xRD target=0xHEX
+    // x0=… x1=… … x7=…\n"
+    let mut buf = [0u8; 384];
+    let mut pos = 0usize;
+    fn push(buf: &mut [u8], pos: &mut usize, s: &[u8]) {
+        for &b in s {
+            if *pos < buf.len() {
+                buf[*pos] = b;
+                *pos += 1;
+            }
+        }
+    }
+    fn push_hex(buf: &mut [u8], pos: &mut usize, v: u64) {
+        push(buf, pos, b"0x");
+        let mut started = false;
+        for i in (0..16).rev() {
+            let nib = ((v >> (i * 4)) & 0xF) as u8;
+            if nib != 0 || started || i == 0 {
+                started = true;
+                let c = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+                if *pos < buf.len() {
+                    buf[*pos] = c;
+                    *pos += 1;
+                }
+            }
+        }
+    }
+    fn push_dec(buf: &mut [u8], pos: &mut usize, v: u64) {
+        if v == 0 {
+            push(buf, pos, b"0");
+            return;
+        }
+        let mut digits = [0u8; 20];
+        let mut n = 0;
+        let mut v = v;
+        while v > 0 {
+            digits[n] = b'0' + (v % 10) as u8;
+            v /= 10;
+            n += 1;
+        }
+        for i in (0..n).rev() {
+            if *pos < buf.len() {
+                buf[*pos] = digits[i];
+                *pos += 1;
+            }
+        }
+    }
+    push(&mut buf, &mut pos, b"[qvmp] vm: BLR x");
+    push_dec(&mut buf, &mut pos, rd as u64);
+    push(&mut buf, &mut pos, b" target=");
+    push_hex(&mut buf, &mut pos, target);
+    for (i, v) in args.iter().take(8).enumerate() {
+        push(&mut buf, &mut pos, b" x");
+        push_dec(&mut buf, &mut pos, i as u64);
+        push(&mut buf, &mut pos, b"=");
+        push_hex(&mut buf, &mut pos, *v);
+    }
+    push(&mut buf, &mut pos, b"\n");
+    unsafe {
+        syscall_write(2, buf.as_ptr(), pos);
+    }
+}
+
+fn trace_native_ret(target: u64, ret: u64) {
+    if !TRACE_NATIVE_CALLS.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut buf = [0u8; 128];
+    let mut pos = 0usize;
+    fn push(buf: &mut [u8], pos: &mut usize, s: &[u8]) {
+        for &b in s {
+            if *pos < buf.len() {
+                buf[*pos] = b;
+                *pos += 1;
+            }
+        }
+    }
+    fn push_hex(buf: &mut [u8], pos: &mut usize, v: u64) {
+        push(buf, pos, b"0x");
+        let mut started = false;
+        for i in (0..16).rev() {
+            let nib = ((v >> (i * 4)) & 0xF) as u8;
+            if nib != 0 || started || i == 0 {
+                started = true;
+                let c = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+                if *pos < buf.len() {
+                    buf[*pos] = c;
+                    *pos += 1;
+                }
+            }
+        }
+    }
+    push(&mut buf, &mut pos, b"[qvmp] vm: <- ret=");
+    push_hex(&mut buf, &mut pos, ret);
+    push(&mut buf, &mut pos, b" (from target=");
+    push_hex(&mut buf, &mut pos, target);
+    push(&mut buf, &mut pos, b")\n");
+    unsafe {
+        syscall_write(2, buf.as_ptr(), pos);
+    }
+}
 
 pub struct Interpreter<'a> {
     pub spec: &'a IsaSpec,
@@ -48,19 +200,34 @@ impl<'a> Interpreter<'a> {
     }
 
     /// 主循环；返回 VExit 时携带的值（约定放入 R0）。
+    /// 旧入口 —— 通过堆分配字节码 scratch. 仅用于 host-side 模拟器/测试,
+    /// 不要在 signal handler 路径上调用 (malloc 不可重入).
     pub fn run(&mut self) -> Result<u64> {
-        let bc = if self.spec.encrypt {
-            let mut tmp = self.bytecode.to_vec();
+        let mut scratch = vec![0u8; self.bytecode.len()];
+        self.run_with_scratch(&mut scratch)
+    }
+
+    /// signal-safe 入口：调用方提供 `bytecode.len()` 字节的 scratch buffer
+    /// (栈数组 / mmap 池 / 等任何非 malloc 内存). 不再做堆分配.
+    pub fn run_with_scratch(&mut self, bc_scratch: &mut [u8]) -> Result<u64> {
+        if bc_scratch.len() < self.bytecode.len() {
+            return Err(Error::vm("bc scratch 太小"));
+        }
+        // PIE 重定位：V62 = 运行时 load_bias。lifter 把 ADRP/ADR/LDR-literal
+        // 都展开成 `Add rd, V62, vaddr_offset` 形式。
+        self.state.regs[VM_REG_LOAD_BIAS] =
+            MAIN_EXEC_LOAD_BIAS.load(Ordering::Relaxed);
+        let bc_view = &mut bc_scratch[..self.bytecode.len()];
+        bc_view.copy_from_slice(self.bytecode);
+        if self.spec.encrypt {
             vmp_codegen::stream::decrypt_in_place_salted(
-                &mut tmp,
+                bc_view,
                 &self.spec.stream_key,
                 &self.spec.stream_iv,
                 self.iv_salt,
             );
-            tmp
-        } else {
-            self.bytecode.to_vec()
-        };
+        }
+        let bc: &[u8] = bc_view;
         loop {
             // V63 = XZR：每周期重置为 0，保证它在 source 位置永远读 0、
             // 在 destination 位置充当"丢弃"槽位。
@@ -120,8 +287,33 @@ impl<'a> Interpreter<'a> {
                 VOp::Xor => self.alu(instr, |a, b| a ^ b),
                 VOp::Shl => self.alu(instr, |a, b| a.wrapping_shl((b & 63) as u32)),
                 VOp::LShr => self.alu(instr, |a, b| a.wrapping_shr((b & 63) as u32)),
-                VOp::AShr => self.alu(instr, |a, b| ((a as i64).wrapping_shr((b & 63) as u32)) as u64),
-                VOp::Ror => self.alu(instr, |a, b| a.rotate_right((b & 63) as u32)),
+                VOp::AShr => {
+                    // ASR 必须 width-aware: W32 时按 i32 做算术右移, 否则
+                    // u64 高 32 位是 0, sign bit (bit 31) 被视为正数, 无符号扩展.
+                    let a = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let b = self.state.regs[instr.rt as usize];
+                    let r = match instr.width {
+                        Width::W32 => {
+                            let amt = (b & 31) as u32;
+                            ((a as i32).wrapping_shr(amt)) as u32 as u64
+                        }
+                        _ => {
+                            let amt = (b & 63) as u32;
+                            ((a as i64).wrapping_shr(amt)) as u64
+                        }
+                    };
+                    self.state.regs[instr.rd as usize] = r & instr.width.mask();
+                }
+                VOp::Ror => {
+                    // RoR 也是 width-aware: W32 时按 32 位旋转, 否则 64 位.
+                    let a = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let b = self.state.regs[instr.rt as usize];
+                    let r = match instr.width {
+                        Width::W32 => (a as u32).rotate_right((b & 31) as u32) as u64,
+                        _ => a.rotate_right((b & 63) as u32),
+                    };
+                    self.state.regs[instr.rd as usize] = r & instr.width.mask();
+                }
                 VOp::Neg => {
                     let v = (self.state.regs[instr.rs as usize] as i64).wrapping_neg() as u64;
                     self.state.regs[instr.rd as usize] = v & instr.width.mask();
@@ -167,18 +359,36 @@ impl<'a> Interpreter<'a> {
                 VOp::Ret => {
                     // 函数入口的 Ret：栈空 ⇒ 视作 VExit（返回 R0）。
                     // 嵌套调用情况下栈不空 ⇒ 弹出真实返回 PC。
-                    if self.state.stack.is_empty() {
+                    if self.state.stack_is_empty() {
                         return Ok(self.state.regs[0]);
                     }
                     self.state.pc = self.state.pop()?;
                 }
                 VOp::NativeCall => {
-                    let target_ptr = instr.imm as u64;
-                    let ret = match self.host.as_deref_mut() {
-                        Some(h) => h.native_call(target_ptr, &self.state.regs[..8])?,
+                    // arm64 decode emits NativeCall { rd: Rn } for BLR/BR Rn —
+                    // the target lives in the live VM register, not in imm.
+                    let rd = instr.rd;
+                    let target_ptr = self.state.regs[rd as usize];
+                    trace_native_call(rd, target_ptr, &self.state.regs[..8]);
+                    // AAPCS64 同时传 GPR (x0..x7) 和 FP/SIMD (v0..v7) 参数. 之前
+                    // 只传 GPR, FP 路径完全丢: hardware V0..V7 仍是 SIGTRAP 触发
+                    // 时 caller 的值 (stale). ImGui/Vulkan 大量 float / ImVec2 /
+                    // ImVec4 经 V0..V7 传参, callee 拿到旧值 → 算出错误指针 /
+                    // vtable → 跑一会必挂. 这是 v37 起 multi-region 全量挂的真因.
+                    let mut gpr = [0u64; 8];
+                    let mut fpr = [0u64; 8];
+                    for i in 0..8 {
+                        gpr[i] = self.state.regs[i];
+                        fpr[i] = self.state.fregs[i] as u64;
+                    }
+                    let (gpr_ret, fpr_ret) = match self.host.as_deref_mut() {
+                        Some(h) => h.native_call_fp(target_ptr, &gpr, &fpr)?,
                         None => return Err(Error::vm("E2")),
                     };
-                    self.state.regs[0] = ret;
+                    trace_native_ret(target_ptr, gpr_ret);
+                    self.state.regs[0] = gpr_ret;
+                    let hi = self.state.fregs[0] & !0xFFFF_FFFF_FFFF_FFFFu128;
+                    self.state.fregs[0] = hi | (fpr_ret as u128);
                 }
                 VOp::CallRegion => {
                     let region_id = instr.imm as u64;
@@ -381,6 +591,106 @@ impl<'a> Interpreter<'a> {
                 }
                 VOp::Barrier => {
                     // 单线程 VM：内存屏障 = noop
+                }
+
+                // ==== Bit-count / bit-reverse (dp-1src) ====
+                VOp::Clz => {
+                    let v = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let bits = (instr.width.bytes() * 8) as u32;
+                    let r = if v == 0 { bits as u64 } else { v.leading_zeros() as u64 - (64 - bits as u64) };
+                    self.state.regs[instr.rd as usize] = r;
+                }
+                VOp::Rbit => {
+                    let v = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let r = if instr.width.bytes() == 4 {
+                        (v as u32).reverse_bits() as u64
+                    } else {
+                        v.reverse_bits()
+                    };
+                    self.state.regs[instr.rd as usize] = r;
+                }
+                VOp::Rev => {
+                    let v = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let r = if instr.width.bytes() == 4 {
+                        (v as u32).swap_bytes() as u64
+                    } else {
+                        v.swap_bytes()
+                    };
+                    self.state.regs[instr.rd as usize] = r;
+                }
+                VOp::Rev16 => {
+                    let v = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let r = if instr.width.bytes() == 4 {
+                        let v = v as u32;
+                        let lo = ((v & 0xFFFF) as u16).swap_bytes() as u32;
+                        let hi = (((v >> 16) & 0xFFFF) as u16).swap_bytes() as u32;
+                        ((hi << 16) | lo) as u64
+                    } else {
+                        let mut r: u64 = 0;
+                        for i in 0..4 {
+                            let h = ((v >> (i * 16)) & 0xFFFF) as u16;
+                            r |= (h.swap_bytes() as u64) << (i * 16);
+                        }
+                        r
+                    };
+                    self.state.regs[instr.rd as usize] = r;
+                }
+                VOp::Rev32 => {
+                    let v = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let r = if instr.width.bytes() == 4 {
+                        (v as u32).swap_bytes() as u64
+                    } else {
+                        // 在 64-bit reg 内按 32-bit 字翻转字节
+                        let lo = ((v & 0xFFFF_FFFF) as u32).swap_bytes() as u64;
+                        let hi = ((v >> 32) as u32).swap_bytes() as u64;
+                        (hi << 32) | lo
+                    };
+                    self.state.regs[instr.rd as usize] = r;
+                }
+
+                // ==== 128-bit NEON 位运算 ====
+                VOp::VEor => {
+                    self.state.fregs[instr.rd as usize & 31] =
+                        self.state.fregs[instr.rs as usize & 31] ^ self.state.fregs[instr.rt as usize & 31];
+                }
+                VOp::VAnd => {
+                    self.state.fregs[instr.rd as usize & 31] =
+                        self.state.fregs[instr.rs as usize & 31] & self.state.fregs[instr.rt as usize & 31];
+                }
+                VOp::VOr => {
+                    self.state.fregs[instr.rd as usize & 31] =
+                        self.state.fregs[instr.rs as usize & 31] | self.state.fregs[instr.rt as usize & 31];
+                }
+                VOp::VNot => {
+                    self.state.fregs[instr.rd as usize & 31] =
+                        !self.state.fregs[instr.rs as usize & 31];
+                }
+                VOp::VBic => {
+                    self.state.fregs[instr.rd as usize & 31] =
+                        self.state.fregs[instr.rs as usize & 31] & !self.state.fregs[instr.rt as usize & 31];
+                }
+
+                // ==== 128-bit FREG 每-64-bit-lane 移位/旋转 ====
+                VOp::VShlD => {
+                    let v = self.state.fregs[instr.rs as usize & 31];
+                    let amt = (instr.imm & 63) as u32;
+                    let lo = (v as u64).wrapping_shl(amt);
+                    let hi = ((v >> 64) as u64).wrapping_shl(amt);
+                    self.state.fregs[instr.rd as usize & 31] = (lo as u128) | ((hi as u128) << 64);
+                }
+                VOp::VLShrD => {
+                    let v = self.state.fregs[instr.rs as usize & 31];
+                    let amt = (instr.imm & 63) as u32;
+                    let lo = (v as u64).wrapping_shr(amt);
+                    let hi = ((v >> 64) as u64).wrapping_shr(amt);
+                    self.state.fregs[instr.rd as usize & 31] = (lo as u128) | ((hi as u128) << 64);
+                }
+                VOp::VRorD => {
+                    let v = self.state.fregs[instr.rs as usize & 31];
+                    let amt = (instr.imm & 63) as u32;
+                    let lo = (v as u64).rotate_right(amt);
+                    let hi = ((v >> 64) as u64).rotate_right(amt);
+                    self.state.fregs[instr.rd as usize & 31] = (lo as u128) | ((hi as u128) << 64);
                 }
             }
         }

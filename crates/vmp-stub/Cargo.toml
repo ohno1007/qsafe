@@ -12,6 +12,9 @@ vmp-interpreter.workspace = true
 thiserror.workspace = true
 log.workspace = true
 
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 vmp-arch = { path = "../vmp-arch" }
 vmp-loader = { path = "../vmp-loader" }

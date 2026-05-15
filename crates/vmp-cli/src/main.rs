@@ -15,7 +15,7 @@ use std::fs;
 use std::path::PathBuf;
 use vmp_codegen::{resolve_program, CodeGen, FunctionRegion};
 use vmp_core::{ProtectConfig, ProtectLevel};
-use vmp_isa::IsaRandomizer;
+use vmp_isa::{IsaRandomizer, VOp};
 use vmp_stub::{pack_blob, unpack_blob, StubBlob, StubRegion};
 
 #[derive(Debug, Parser)]
@@ -50,6 +50,12 @@ enum Cmd {
         /// 排除这些函数
         #[arg(long)]
         exclude: Vec<String>,
+        /// 跳过 lift 报告含 skipped/Trap 的函数（保留原生执行，避免运行时 Trap）
+        #[arg(long, default_value_t = true)]
+        skip_traps: bool,
+        /// 函数大小上限（字节）；超出则跳过 lift（默认 0 = 无限制）
+        #[arg(long, default_value_t = 0u64)]
+        max_func_size: u64,
     },
     /// 直接 lift 一段裸字节码（hex 或文件），用于调试 lifter
     Lift {
@@ -87,14 +93,23 @@ enum Cmd {
         #[arg(short, long)]
         output: PathBuf,
         /// 是否在原 .text 写跳板（默认开；仅嵌入 blob 不写跳板时关闭）
-        #[arg(long, default_value_t = true)]
+        #[arg(long, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_value_t = true, default_missing_value = "true")]
         write_trampolines: bool,
         /// 段名 / 符号名剥离 (.shstrtab / .strtab 置 0)
-        #[arg(long, default_value_t = true)]
+        #[arg(long, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_value_t = true, default_missing_value = "true")]
         strip_names: bool,
         /// payload 二次加密（依赖 ELF header 派生 key）
-        #[arg(long, default_value_t = true)]
+        #[arg(long, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_value_t = true, default_missing_value = "true")]
         xor_payload: bool,
+        /// 加密 .rodata（运行时由 libqvmp_runtime.so 在 .init_array 解密）
+        #[arg(long, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_value_t = true, default_missing_value = "true")]
+        encrypt_rodata: bool,
+        /// 烧录日志开关 (--log on / --log off)；运行时直接读 QVMP 头字节，无 env var
+        #[arg(long, default_value = "off")]
+        log: String,
+        /// 嵌入 libqvmp_runtime.so 的路径 → 单文件可执行（无需独立 .so 文件）
+        #[arg(long)]
+        embed_runtime: Option<PathBuf>,
     },
     /// 列出 .a 静态库内的 .o 成员（用于 batch protect 准备）
     ArList { archive: PathBuf },
@@ -157,7 +172,7 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
 
     match cli.cmd {
-        Cmd::Protect { input, output, level, seed, only, exclude } => {
+        Cmd::Protect { input, output, level, seed, only, exclude, skip_traps, max_func_size } => {
             let bytes = fs::read(&input).with_context(|| format!("读取 {}", input.display()))?;
             let obj = vmp_loader::load(bytes)?;
             log::info!(
@@ -181,16 +196,27 @@ fn main() -> anyhow::Result<()> {
             cfg.include_funcs.extend(only);
             cfg.exclude_funcs.extend(exclude);
 
-            let spec = IsaRandomizer::new(cfg.seed, cfg.handler_duplication, cfg.encrypt_bytecode).build();
-            log::info!("ISA 指纹: {}", hex::encode(spec.fingerprint));
+            // v2 blob: 一个 region 一个 IsaSpec. 第 0 个 spec 仍由 cfg.seed
+            // 派生作为"默认"; 各 region 自己的 spec 在第三遍 codegen 时按需生成
+            // (那时已经知道最终 region 数 — 经过 cascade-drop 的). 这里先做个
+            // 占位, 真正的 specs 在下面循环里建.
+            let default_spec =
+                IsaRandomizer::new(cfg.seed, cfg.handler_duplication, cfg.encrypt_bytecode).build();
+            log::info!("默认 ISA 指纹: {}", hex::encode(default_spec.fingerprint));
 
             // 第一遍：lift 每个候选函数到 IR（branch imm 仍是绝对地址）。
             let mut funcs: Vec<FunctionRegion> = Vec::new();
+            let mut skipped_size = 0usize;
+            let mut skipped_traps = 0usize;
             for sym in &obj.symbols {
                 if !cfg.exclude_funcs.is_empty() && cfg.exclude_funcs.iter().any(|n| n == &sym.name) {
                     continue;
                 }
                 if !cfg.include_funcs.is_empty() && !cfg.include_funcs.iter().any(|n| n == &sym.name) {
+                    continue;
+                }
+                if max_func_size > 0 && sym.size > max_func_size {
+                    skipped_size += 1;
                     continue;
                 }
                 let region = match obj.code.iter().find(|r| r.contains(sym.vaddr)) {
@@ -206,7 +232,7 @@ fn main() -> anyhow::Result<()> {
 
                 match vmp_arch::lift(obj.arch, func_bytes, sym.vaddr) {
                     Ok(lifted) => {
-                        log::info!(
+                        log::debug!(
                             "lift {} @ {:#x}  in={} out_ir={} skipped={} notes={}",
                             sym.name,
                             sym.vaddr,
@@ -215,8 +241,10 @@ fn main() -> anyhow::Result<()> {
                             lifted.report.skipped,
                             lifted.report.notes.len()
                         );
-                        if lifted.report.skipped > 0 && proto_level == ProtectLevel::Paranoid {
-                            log::warn!("paranoid 模式跳过含未支持指令的 {}", sym.name);
+                        if lifted.report.skipped > 0
+                            && (skip_traps || proto_level == ProtectLevel::Paranoid)
+                        {
+                            skipped_traps += 1;
                             continue;
                         }
                         funcs.push(FunctionRegion {
@@ -230,23 +258,146 @@ fn main() -> anyhow::Result<()> {
                     Err(e) => log::warn!("lift 失败 {}: {}", sym.name, e),
                 }
             }
+            log::info!(
+                "lift summary: kept={} skipped_traps={} skipped_size={} (of {} candidates)",
+                funcs.len(),
+                skipped_traps,
+                skipped_size,
+                obj.symbols.len()
+            );
 
             // 第二遍：全局多函数解析 —— BL <另一个被保护函数> 转为 CallRegion，
             // 函数内部分支转 IR 索引，无法解析的目标占位 Trap。
-            let resolve_report = resolve_program(&mut funcs);
+            //
+            // 含 Trap 的 region 在 VM 跑会直接 Err("E8"). 级联剔除：每轮丢掉含
+            // Trap 的 region，重建 entry 表，再 resolve 一遍 (从原始 IR 副本)
+            // —— 之前 CallRegion 到现在不在的目标会变成 Trap，下一轮继续丢。
+            //
+            // 同样的循环也吸收 QVMP_LEAF_ONLY / QVMP_DROP_FP / QVMP_REGION_RANGE
+            // 过滤：把要踢的 region name 一开始就塞进 `dropped`, cascade loop 自然
+            // 把 CallRegion 指向已丢 region 的 caller 也再剔掉. 这修了 v45 实验里
+            // 看到的 "Eb2:E:E1:19" (NoRegion) 错误——之前的实现在 cascade loop
+            // **之后** 才做 range/leaf/fp 过滤, IR 里残留 CallRegion 指向被踢的
+            // 索引, 运行时 dispatch 这些 CallRegion 就 NoRegion 报错.
+            let pristine_funcs = funcs.clone();
+            let mut dropped: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+
+            // QVMP_REGION_RANGE=start,end：保留索引区间 [start, end) 内的 region.
+            // 用于二分定位坏 region —— 区间外的全部加入 dropped, cascade 再清理
+            // 任何 CallRegion 残留.
+            if let Ok(range) = std::env::var("QVMP_REGION_RANGE") {
+                if let Some((s, e)) = range.split_once(',') {
+                    let s: usize = s.parse().unwrap_or(0);
+                    let e: usize = e.parse().unwrap_or(usize::MAX);
+                    for (i, f) in pristine_funcs.iter().enumerate() {
+                        if i < s || i >= e {
+                            dropped.insert(f.name.clone());
+                        }
+                    }
+                    log::info!(
+                        "QVMP_REGION_RANGE={}..{}: marked {} regions for drop",
+                        s, e, dropped.len()
+                    );
+                }
+            }
+
+            let leaf_only = std::env::var("QVMP_LEAF_ONLY").is_ok();
+            let drop_fp = std::env::var("QVMP_DROP_FP").is_ok();
+
+            let resolve_report = loop {
+                funcs = pristine_funcs
+                    .iter()
+                    .filter(|f| !dropped.contains(&f.name))
+                    .cloned()
+                    .collect();
+                let r = resolve_program(&mut funcs);
+
+                // Each pass drops:
+                //  1. regions whose post-resolve IR has VOp::Trap
+                //     (unresolved branches or cascaded CallRegion-to-dropped),
+                //  2. QVMP_LEAF_ONLY: regions using NativeCall / CallRegion,
+                //  3. QVMP_DROP_FP: regions using any FP op.
+                // Loop until fixpoint.
+                let mut newly_dropped: Vec<String> = Vec::new();
+                for f in &funcs {
+                    let has_trap =
+                        f.ir.iter().any(|i| i.op == VOp::Trap);
+                    let leaf_violates = leaf_only && f.ir.iter().any(|i| {
+                        matches!(i.op, VOp::NativeCall | VOp::CallRegion)
+                    });
+                    let fp_violates = drop_fp && f.ir.iter().any(|i| matches!(
+                        i.op,
+                        VOp::FLoad | VOp::FStore | VOp::FMovR | VOp::FMovFromGpr
+                        | VOp::FMovToGpr | VOp::FAdd | VOp::FSub | VOp::FMul
+                        | VOp::FDiv | VOp::FCmp | VOp::FCvtZS | VOp::SCvtF
+                    ));
+                    if has_trap || leaf_violates || fp_violates {
+                        newly_dropped.push(f.name.clone());
+                    }
+                }
+                if newly_dropped.is_empty() {
+                    break r;
+                }
+                log::info!(
+                    "dropping {} region(s) (Trap/leaf/fp filter, cascade)",
+                    newly_dropped.len()
+                );
+                for n in newly_dropped {
+                    dropped.insert(n);
+                }
+            };
             log::info!(
-                "branch resolve: intra={} cross_region={} unresolved={}",
+                "branch resolve: intra={} cross_region={} unresolved={} dropped_total={}",
                 resolve_report.intra_branches,
                 resolve_report.cross_region_calls,
-                resolve_report.unresolved
+                resolve_report.unresolved,
+                dropped.len()
             );
 
-            // 第三遍：每个 region 独立 codegen，用 region_idx 作 IV salt。
+            // QVMP_DROP_FP=1: drop any region whose IR uses floating-point ops.
+            // ARM64 FP/NEON 的 lifter 覆盖窄, 也是 leaf-only 后剩下最可疑的指令类.
+            if std::env::var("QVMP_DROP_FP").is_ok() {
+                let before = funcs.len();
+                funcs.retain(|f| {
+                    !f.ir.iter().any(|i| matches!(
+                        i.op,
+                        VOp::FLoad | VOp::FStore | VOp::FMovR | VOp::FMovFromGpr
+                        | VOp::FMovToGpr | VOp::FAdd | VOp::FSub | VOp::FMul
+                        | VOp::FDiv | VOp::FCmp | VOp::FCvtZS | VOp::SCvtF
+                    ))
+                });
+                log::info!(
+                    "QVMP_DROP_FP: kept {} regions (dropped {} FP-using)",
+                    funcs.len(),
+                    before - funcs.len()
+                );
+            }
+
+            // 第三遍：每个 region 独立 codegen，并且**每个 region 用它自己的
+            // IsaSpec** — opcode 映射, 寄存器置换, 加密 key, 立即数旋转全独立.
+            // 静态分析者拆解 region A 的 dispatch table 完全不能套到 region B 上;
+            // 等于每个被保护函数运行在一台不同的虚拟机里.
+            //
+            // 每个 region 的 spec 由 (cfg.seed ⊕ region_idx ⊕ func.vaddr) 派生,
+            // 复现性: 同一 seed + 同一二进制 ⇒ 同一份 spec 集.
+            let mut specs: Vec<vmp_isa::IsaSpec> = Vec::with_capacity(funcs.len());
             let mut pool: Vec<u8> = Vec::new();
             let mut regions: Vec<StubRegion> = Vec::new();
             for (region_idx, func) in funcs.iter().enumerate() {
+                let spec_seed = cfg
+                    .seed
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add((region_idx as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9))
+                    .wrapping_add(func.vaddr);
+                let region_spec = IsaRandomizer::new(
+                    spec_seed,
+                    cfg.handler_duplication,
+                    cfg.encrypt_bytecode,
+                )
+                .build();
                 let mut cg = CodeGen::new(
-                    &spec,
+                    &region_spec,
                     cfg.seed.wrapping_add(func.vaddr),
                     if cfg.insert_junk { 25 } else { 0 },
                     cfg.handler_duplication,
@@ -260,7 +411,13 @@ fn main() -> anyhow::Result<()> {
                     patch_len: func.size as u32,
                     bc_offset: bc_offset as u32,
                     bc_len: bc.len() as u32,
+                    spec_idx: region_idx as u32,
                 });
+                specs.push(region_spec);
+            }
+            // 没有 region 时仍要塞一个 spec 作为默认入口
+            if specs.is_empty() {
+                specs.push(default_spec);
             }
 
             // 选择入口 region：优先匹配 ELF 真实 entry point，否则 _start / main，否则 0。
@@ -289,7 +446,7 @@ fn main() -> anyhow::Result<()> {
             );
 
             let blob = StubBlob {
-                spec,
+                specs,
                 regions,
                 bytecode_pool: pool,
                 entry_region,
@@ -342,21 +499,33 @@ fn main() -> anyhow::Result<()> {
             println!("region {} 返回值 = {} (0x{:x})", region, r, r);
         }
 
-        Cmd::Rewrite { input, blob, output, write_trampolines, strip_names, xor_payload } => {
+        Cmd::Rewrite { input, blob, output, write_trampolines, strip_names, xor_payload, encrypt_rodata, log, embed_runtime } => {
             let elf_bytes = fs::read(&input)?;
             let loaded = vmp_loader::load(elf_bytes)?;
             let blob_bytes = fs::read(&blob)?;
             let stub_blob = vmp_stub::unpack_blob(&blob_bytes)?;
-            let opts = vmp_rewriter::RewriteOptions { write_entry_trampolines: write_trampolines };
+            let embed_so_bytes = if let Some(p) = &embed_runtime {
+                Some(fs::read(p).with_context(|| format!("read {}", p.display()))?)
+            } else {
+                None
+            };
+            let opts = vmp_rewriter::RewriteOptions {
+                write_entry_trampolines: write_trampolines,
+                embed_runtime_so: embed_so_bytes,
+                shim_exit_diagnostic: std::env::var("QVMP_DIAG_EXIT").is_ok(),
+                dt_needed_path: std::env::var("QVMP_DT_NEEDED").ok(),
+            };
             let (mut new_elf, report) = vmp_rewriter::rewrite_elf(&loaded, &stub_blob, &opts)
                 .map_err(|e| anyhow::anyhow!("rewrite failed: {e}"))?;
 
-            // 应用 armor pass：段名剥离 + payload 加密
+            let log_on = matches!(log.as_str(), "on" | "1" | "true" | "yes");
             let armor_opts = vmp_rewriter::ArmorOptions {
                 strip_shstrtab: strip_names,
                 strip_symtab: strip_names,
                 xor_payload,
                 hash_imports: false,
+                encrypt_rodata,
+                log_on,
             };
             let armor_rep = vmp_rewriter::apply_armor(&mut new_elf, report.blob_offset, &armor_opts)
                 .map_err(|e| anyhow::anyhow!("armor failed: {e}"))?;
@@ -365,7 +534,9 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "rewrite ok: kind={:?} patched_entries={} new_segment_vaddr={:#x} \
                  new_segment_size={} blob_offset={:#x}\n\
-                 armor: shstrtab_zeroed={} strtab_zeroed={} payload_xor_len={} imports_hashed={}\n\
+                 armor: shstrtab_zeroed={} strtab_zeroed={} payload_xor_len={} \
+                 rodata_vaddr={:#x} rodata_enc_len={} imports_hashed={} log_on={}\n\
+                 embed: bootstrap_vaddr={:#x} embedded_so_vaddr={:#x} embedded_so_len={} init_array_vaddr={:#x}\n\
                  → {} ({} bytes)",
                 loaded.kind,
                 report.patched_entries,
@@ -375,7 +546,14 @@ fn main() -> anyhow::Result<()> {
                 armor_rep.shstrtab_zeroed,
                 armor_rep.strtab_zeroed,
                 armor_rep.payload_xor_len,
+                armor_rep.rodata_vaddr,
+                armor_rep.rodata_encrypted_len,
                 armor_rep.imports_hashed,
+                log_on,
+                report.bootstrap_vaddr,
+                report.embedded_so_vaddr,
+                report.embedded_so_len,
+                report.init_array_vaddr,
                 output.display(),
                 new_elf.len()
             );
@@ -395,9 +573,9 @@ fn main() -> anyhow::Result<()> {
             let raw = fs::read(&blob)?;
             let b = unpack_blob(&raw)?;
             println!("magic = QVMP v1");
-            println!("ISA fingerprint = {}", hex::encode(b.spec.fingerprint));
-            println!("encrypt = {}", b.spec.encrypt);
-            println!("opcode 总数 = {}", b.spec.op_table.len());
+            println!("ISA fingerprint = {}", hex::encode(b.spec().fingerprint));
+            println!("encrypt = {}", b.spec().encrypt);
+            println!("opcode 总数 = {}", b.spec().op_table.len());
             println!("regions = {}", b.regions.len());
             for (i, r) in b.regions.iter().enumerate() {
                 println!(

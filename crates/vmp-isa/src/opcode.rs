@@ -233,6 +233,37 @@ pub enum VOp {
     AtomicCas = 102,
     /// 内存屏障：单线程 VM 环境下 noop
     Barrier = 103,
+
+    // ---- 位计数 / 位反转 (dp-1src) ----
+    /// Count Leading Zeros: Rd = clz(Rs); width 决定 32/64 bit.
+    Clz = 110,
+    /// Reverse Bits: Rd = rbit(Rs)
+    Rbit = 111,
+    /// REV: 字节序整体颠倒 (REV X / REV W)
+    Rev = 112,
+    /// REV16: 在每个 16-bit 半字内字节互换
+    Rev16 = 113,
+    /// REV32: 在每个 32-bit 字内字节互换 (仅 X 寄存器有意义)
+    Rev32 = 114,
+
+    // ---- 128-bit FREG 位运算 (NEON Vd.16b family) ----
+    /// fregs[Rd] = fregs[Rs] ^ fregs[Rt]
+    VEor = 120,
+    /// fregs[Rd] = fregs[Rs] & fregs[Rt]
+    VAnd = 121,
+    /// fregs[Rd] = fregs[Rs] | fregs[Rt]
+    VOr = 122,
+    /// fregs[Rd] = !fregs[Rs]
+    VNot = 123,
+    /// BIC: fregs[Rd] = fregs[Rs] & !fregs[Rt]
+    VBic = 124,
+
+    /// 每 64-bit lane 独立左移. fregs[Rd] = (lo<<imm, hi<<imm). imm 在 instr.imm.
+    VShlD = 125,
+    /// 每 64-bit lane 独立右移（逻辑）.
+    VLShrD = 126,
+    /// 每 64-bit lane 独立右循环 (XAR 用).
+    VRorD = 127,
 }
 
 pub const VOP_COUNT: usize = 64; // 上限；实际枚举值不超过此数
@@ -293,6 +324,19 @@ impl VOp {
             101 => VOp::AtomicSwap,
             102 => VOp::AtomicCas,
             103 => VOp::Barrier,
+            110 => VOp::Clz,
+            111 => VOp::Rbit,
+            112 => VOp::Rev,
+            113 => VOp::Rev16,
+            114 => VOp::Rev32,
+            120 => VOp::VEor,
+            121 => VOp::VAnd,
+            122 => VOp::VOr,
+            123 => VOp::VNot,
+            124 => VOp::VBic,
+            125 => VOp::VShlD,
+            126 => VOp::VLShrD,
+            127 => VOp::VRorD,
             _ => return None,
         };
         Some(result)
@@ -352,6 +396,19 @@ impl VOp {
             VOp::AtomicSwap,
             VOp::AtomicCas,
             VOp::Barrier,
+            VOp::Clz,
+            VOp::Rbit,
+            VOp::Rev,
+            VOp::Rev16,
+            VOp::Rev32,
+            VOp::VEor,
+            VOp::VAnd,
+            VOp::VOr,
+            VOp::VNot,
+            VOp::VBic,
+            VOp::VShlD,
+            VOp::VLShrD,
+            VOp::VRorD,
         ]
     }
 }

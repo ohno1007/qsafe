@@ -19,4 +19,4 @@ pub mod entry;
 pub mod linux;
 
 pub use blob::{pack_blob, unpack_blob, DataSegment, StubBlob, StubRegion};
-pub use entry::{dispatch_vm, StubError};
+pub use entry::{dispatch_vm, dispatch_vm_fp, preload_data_segments, StubError};

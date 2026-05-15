@@ -9,8 +9,6 @@ use vmp_isa::Width;
 
 pub struct LinuxHost {
     pub allow_raw_memory: bool,
-    /// dispatch_vm 总耗时基准（new 时刻），用于在 sys_exit 时打印 VMP 总损耗
-    pub start: std::time::Instant,
 }
 
 impl Default for LinuxHost {
@@ -20,8 +18,13 @@ impl Default for LinuxHost {
 }
 
 impl LinuxHost {
+    /// signal-safe 构造: no syscall/no TLS access. 不能在 new() 里调
+    /// `Instant::now()` —— bionic clock_gettime 走 vDSO 可能 touch TLS,
+    /// 在 SIGTRAP handler 路径上 reentrant 风险.
     pub fn new() -> Self {
-        Self { allow_raw_memory: true, start: std::time::Instant::now() }
+        Self {
+            allow_raw_memory: true,
+        }
     }
 }
 
@@ -57,38 +60,34 @@ impl HostBridge for LinuxHost {
     }
 
     fn native_call(&mut self, target: u64, args: &[u64]) -> Result<u64> {
-        if target == 0 {
-            return Err(Error::vm("LinuxHost.native_call: 空指针"));
+        // 兼容入口: GPR-only. FP 路径见 `native_call_fp`.
+        if target == 0 || target & 3 != 0 || target < 0x1000 {
+            return Err(Error::vm("native_call: target 不合法"));
         }
-        // 通过函数指针直接调用，最多 6 个 u64 参数（与 SysV / AAPCS64 对齐）
-        unsafe {
-            type F0 = extern "C" fn() -> u64;
-            type F1 = extern "C" fn(u64) -> u64;
-            type F2 = extern "C" fn(u64, u64) -> u64;
-            type F3 = extern "C" fn(u64, u64, u64) -> u64;
-            type F4 = extern "C" fn(u64, u64, u64, u64) -> u64;
-            type F5 = extern "C" fn(u64, u64, u64, u64, u64) -> u64;
-            type F6 = extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64;
-            let p = target as *const ();
-            let r = match args.len() {
-                0 => (core::mem::transmute::<_, F0>(p))(),
-                1 => (core::mem::transmute::<_, F1>(p))(args[0]),
-                2 => (core::mem::transmute::<_, F2>(p))(args[0], args[1]),
-                3 => (core::mem::transmute::<_, F3>(p))(args[0], args[1], args[2]),
-                4 => (core::mem::transmute::<_, F4>(p))(args[0], args[1], args[2], args[3]),
-                5 => (core::mem::transmute::<_, F5>(p))(args[0], args[1], args[2], args[3], args[4]),
-                _ => (core::mem::transmute::<_, F6>(p))(args[0], args[1], args[2], args[3], args[4], args[5]),
-            };
-            Ok(r)
+        let mut g = [0u64; 8];
+        for (i, v) in args.iter().take(8).enumerate() {
+            g[i] = *v;
         }
+        let f = [0u64; 8];
+        let (r, _) = unsafe { call_with_fp(target, &g, &f) };
+        Ok(r)
+    }
+
+    fn native_call_fp(
+        &mut self,
+        target: u64,
+        gpr_args: &[u64; 8],
+        fpr_args: &[u64; 8],
+    ) -> Result<(u64, u64)> {
+        if target == 0 || target & 3 != 0 || target < 0x1000 {
+            return Err(Error::vm("native_call_fp: target 不合法"));
+        }
+        let r = unsafe { call_with_fp(target, gpr_args, fpr_args) };
+        Ok(r)
     }
 
     fn syscall(&mut self, no: u64, args: &[u64]) -> Result<u64> {
-        // sys_exit / sys_exit_group 前打印总耗时，方便外部对比 native vs VMP 损耗
-        if no == 93 || no == 94 {
-            let el = self.start.elapsed();
-            eprintln!("[vmp] elapsed: {}us ({}ms)", el.as_micros(), el.as_millis());
-        }
+        // eprintln 路径删除 — signal handler 中不能走 stdio.
         let mut a = [0u64; 6];
         for (i, v) in args.iter().take(6).enumerate() {
             a[i] = *v;
@@ -126,6 +125,75 @@ impl HostBridge for LinuxHost {
             unsafe { std::slice::from_raw_parts(vaddr as *const u8, 8.min(bytes.len())) });
         Ok(())
     }
+}
+
+/// AAPCS64 函数调用蹦床: 装载 GPR x0..x7 + FP/SIMD v0..v7 (低 64 位) → blr target
+/// → 读回 (x0, d0 低 64 位). 这是替代 `transmute::<_, F8>(p)` 的核心: Rust
+/// 的 `extern "C"` 调用约定只搬 GPR, FP/SIMD 寄存器从来不被显式加载.
+///
+/// 用 naked extern "C" 函数包: target 在 x0, gpr_ptr 在 x1, fpr_ptr 在 x2 (AAPCS).
+/// 我们先用 x16/x17 暂存指针 (x16/x17 是平台 scratch, 调用约定允许任意覆盖),
+/// 再 ldp 从 gpr_ptr 把 x0..x7 装好, ldp d0..d7 从 fpr_ptr 装 FP. blr x16 调
+/// 用. 返回 fpr 在 x1 (AAPCS 16-byte struct return → x0,x1).
+///
+/// 用 `global_asm!` 而非 `asm!` 避免 Rust 寄存器分配器的复杂性: 这里我们对
+/// 整个调用规约负责, 不让编译器插手.
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
+core::arch::global_asm!(
+    ".globl qvmp_call_with_fp",
+    ".type  qvmp_call_with_fp, %function",
+    "qvmp_call_with_fp:",
+    // x0 = target, x1 = gpr_ptr (&[u64;8]), x2 = fpr_ptr (&[u64;8])
+    "stp x29, x30, [sp, #-16]!",
+    "mov x29, sp",
+    "mov x16, x0",                 // x16 = target (preserved across the ldp's)
+    "mov x17, x2",                 // x17 = fpr_ptr
+    // 装载 GPR x0..x7 from gpr_ptr (was x1).
+    "ldp x6, x7, [x1, #48]",       // load x6/x7 first since x1 is loaded last
+    "ldp x4, x5, [x1, #32]",
+    "ldp x2, x3, [x1, #16]",
+    "ldp x0, x1, [x1]",            // overwrites x1 (no longer needed)
+    // 装载 FP v0..v7 from fpr_ptr (saved in x17).
+    "ldp d0, d1, [x17]",
+    "ldp d2, d3, [x17, #16]",
+    "ldp d4, d5, [x17, #32]",
+    "ldp d6, d7, [x17, #48]",
+    "blr x16",
+    // x0 = gpr return; put fpr return in x1 (AAPCS 16-byte struct return slot).
+    "fmov x1, d0",
+    "ldp x29, x30, [sp], #16",
+    "ret",
+    ".size qvmp_call_with_fp, . - qvmp_call_with_fp",
+);
+
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
+extern "C" {
+    fn qvmp_call_with_fp(target: u64, gpr: *const u64, fpr: *const u64) -> CallRet;
+}
+
+#[repr(C)]
+struct CallRet {
+    gpr: u64,
+    fpr: u64,
+}
+
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
+unsafe fn call_with_fp(target: u64, gpr: &[u64; 8], fpr: &[u64; 8]) -> (u64, u64) {
+    let r = unsafe { qvmp_call_with_fp(target, gpr.as_ptr(), fpr.as_ptr()) };
+    (r.gpr, r.fpr)
+}
+
+#[cfg(not(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64")))]
+unsafe fn call_with_fp(target: u64, gpr: &[u64; 8], _fpr: &[u64; 8]) -> (u64, u64) {
+    // 非 aarch64 build (host CLI 测试): 退化为 GPR-only transmute.
+    type F8 = extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+    let p = target as *const ();
+    let r = unsafe {
+        (core::mem::transmute::<_, F8>(p))(
+            gpr[0], gpr[1], gpr[2], gpr[3], gpr[4], gpr[5], gpr[6], gpr[7],
+        )
+    };
+    (r, 0)
 }
 
 #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]

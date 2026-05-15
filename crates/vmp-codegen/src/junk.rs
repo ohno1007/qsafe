@@ -13,8 +13,14 @@ use rand::Rng;
 use rand_chacha::ChaCha20Rng;
 use vmp_isa::{Cond, Instr, VOp, Width};
 
-const SC1: u8 = 32;
-const SC2: u8 = 33;
+// CRITICAL: junk 寄存器必须跟 lifter scratch (V32/V33/V34) 错开。
+// lifter 把 ADRP+ADD 这样的多 native 指令展开成多条 IR，中间用 V32 暂存
+// 立即数；如果 junk 在 MovI(V32, imm) 和 Add(x0, x0, V32) 之间被插入并
+// 写 V32，立即数就丢了 (regr from junk_density>0 + ADRP+ADD imm pattern).
+// V62 = LOAD_BIAS_REG, V63 = XZR (interpreter 每周期重置)，也不能动。
+// V60/V61 是 lifter 不碰的高位 scratch。
+const SC1: u8 = 60;
+const SC2: u8 = 61;
 
 pub fn nop() -> Instr {
     Instr { op: VOp::Nop, ..Default::default() }
@@ -27,12 +33,20 @@ pub fn junk() -> Instr {
 }
 
 /// 生成一个"看起来像真指令"的 junk 序列，写入 `out`。返回插入的 IR 数量。
-/// 选择哪种 junk 由 rng 决定；调用方负责保证 SC1/SC2 寄存器不被原代码依赖（lifter 已经预留）。
+///
+/// **关键约束**：junk 在两条相邻 lifted IR 之间插入，所以**绝不能**改任何
+/// 被原代码依赖的状态：
+///   - 不写 V0..V31（ARM64 X0..X30 + SP）
+///   - 不写 lifter scratch V32/V33/V34
+///   - 不写 V62 (load_bias) / V63 (XZR)
+///   - 不动 NZCV (flags) —— 不发 Tst / Cmp / ALU-flag-update
+///   - 不动栈
+///
+/// 只能写 V60/V61，且只能用 不影响 flags 的 ALU op（Add/Or/Xor/And）。
 pub fn emit_decoy_seq(out: &mut Vec<Instr>, rng: &mut ChaCha20Rng) -> usize {
-    let kind = rng.gen_range(0..6u8);
+    let kind = rng.gen_range(0..4u8);
     match kind {
         0 => {
-            // 简单 1-byte junk
             out.push(junk());
             1
         }
@@ -44,23 +58,11 @@ pub fn emit_decoy_seq(out: &mut Vec<Instr>, rng: &mut ChaCha20Rng) -> usize {
             out.push(obfuscate());
             1
         }
-        3 => {
-            // 哑算术：Add SC1, SC1, 0 → 写 SC1，逻辑上 noop
+        _ => {
+            // MovI SC2=0; Add SC1 = SC1 + SC2  → SC1 不变, 不改 flags
             out.push(Instr { op: VOp::MovI, rd: SC2, imm: 0, width: Width::W64, ..Default::default() });
             out.push(Instr { op: VOp::Add, rd: SC1, rs: SC1, rt: SC2, width: Width::W64, ..Default::default() });
             2
-        }
-        4 => {
-            // Xor self → 0 + Tst 设标志；不 emit BCond（codegen 会把 BCond imm 当 branch fixup
-            // 索引解释，造成跳到 IR[0] 死循环）
-            out.push(Instr { op: VOp::Xor, rd: SC1, rs: SC1, rt: SC1, width: Width::W64, ..Default::default() });
-            out.push(Instr { op: VOp::Tst, rs: SC1, rt: SC1, width: Width::W64, ..Default::default() });
-            2
-        }
-        _ => {
-            // 哑 Cmp：Cmp SC1, SC1 → 设标志但不影响后续真实控制流（因为下条不是条件指令）
-            out.push(Instr { op: VOp::Cmp, rs: SC1, rt: SC1, width: Width::W64, ..Default::default() });
-            1
         }
     }
 }

@@ -28,8 +28,12 @@ impl IsaRandomizer {
         let all_ops = VOp::all();
         let total_variants: usize =
             all_ops.len() * (self.variants_per_op as usize);
-        // 1 字节 opcode 空间 = 256；预留少量空缺给非法值，便于 fuzz 检测。
-        assert!(total_variants <= 220, "ISA 随机化变体数超过 opcode 容量");
+        // 1 字节 opcode 空间 = 255 (opcode 0 保留作 sentinel "未分配").
+        assert!(
+            total_variants <= 254,
+            "ISA 随机化变体数 {} 超过 opcode 容量 (max 254)",
+            total_variants
+        );
 
         // 1) 生成可用 opcode 池并打乱
         let mut pool: Vec<u8> = (1u8..=255u8).collect();
