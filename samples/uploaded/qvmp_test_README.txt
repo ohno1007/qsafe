@@ -1,48 +1,39 @@
-qvmp_test.zip — v43 干掉 std::sync::Once + libc clock_gettime, 重开诊断
+qvmp_test.zip — v44 终极二分: 单 region 保护 vs 全量 + handler 计数器
 ========================================================================
 
-v42 全量 standard alloc-free 还挂. 再 audit 剩下两个 signal-unsafe 源:
+v43 (全量 standard, 无 malloc/Once/Instant) 还是相同位置挂. 说明真正
+的 root cause 不是 async-signal-safety. 必须用最小集合确认是机制问题
+还是累积问题.
 
-1. **`std::sync::Once::call_once`** 在 dispatch_vm_fp 头. Once 内部用 futex
-   做同步. 如果主线程刚开始 Once init 时 SIGTRAP 进入我们的 handler,
-   handler 调 dispatch_vm_fp → Once.call_once 看到 Initializing 状态 →
-   等 futex → **永远等不到 (主线程被中断了)** → 死锁或时序异常.
+v44 同时出两个包:
 
-2. **`std::time::Instant::now()`** 在 LinuxHost::new(). bionic clock_gettime
-   走 vDSO, 可能 touch TLS, signal-handler 不安全.
+A. **44A_only_r0.hardened**: **只保护 region 0** (entry region 一个).
+   全程只会有一次 SIGTRAP (entry trampoline 触发一次). 如果挂了 → 单
+   次 handler 就会破坏状态, 是机制问题. 如果出 UI → 至少证明 handler
+   单次可用, bug 是累积的.
 
-v43 修:
+B. **44B_full.hardened**: 完整 534 region (跟 v43 一样). 加 handler
+   计数器: handler 每进入一次累 1, 在 N 是 2 的幂或 1000 倍数时打:
+     [qvmp] handler entry #N
+   能告诉我们挂之前总共 SIGTRAP 多少次. 如果 N 在挂前已经几千几万,
+   那肯定是累积; 如果只有几百, 那就是某次具体 dispatch 出问题.
 
-- 新增 `pub fn preload_data_segments(blob, host)` in vmp-stub::entry, 把
-  map_data 循环从 dispatch_vm_fp 提到 qvmp_init 阶段 (主线程, 非 signal
-  context). 删掉 dispatch_vm_fp + dispatch_vm 里的 `std::sync::Once`.
-- LinuxHost 结构体删掉 `start: Instant` 字段, new() 完全无 syscall.
-- syscall handler 里删掉 `eprintln!` (sys_exit 路径上的耗时报告).
+测试顺序:
+  1. 跑 A. 出 UI 还是 SIGSEGV?
+  2. 跑 B. 看最后一行 "handler entry #N" 是多少, 再看 SIGSEGV 那一段.
 
-cdylib qvmp_init 现在的初始化顺序:
-  1. dl_iterate_phdr 找 QVMP magic
-  2. 解密 rodata
-  3. 解密 payload, unpack blob → BLOB.set
-  4. **preload_data_segments(blob, host)** ← 新增, 主线程上 mmap data segs
-  5. install_sigtrap_handler / install_sigsegv_logger
+报告格式:
+  A: 出 UI / SIGSEGV
+  B: 出 UI / SIGSEGV 时计数器 N = ____
 
-dispatch_vm_fp 现在的开头:
-  - 直接 blob.regions.get(region_id) → 拿 bytecode
-  - 不调任何 Once, 不分配任何 Instant
-  - 纯 atomic alloc_frame + Interpreter 跑
-
-整个 SIGTRAP→dispatch_vm_fp 路径**零 Once / 零 Instant / 零 alloc / 零
-mutex / 零 libc**.
-
-打开 --log on 看挂之前跑到哪一步. 如果还挂, 报告告诉我:
-  - 最后一行 [qvmp] 是 "dispatching region=N" 还是别的
-  - 总共出现了多少行 [qvmp] dispatching (估算 SIGTRAP 触发次数)
+不用粘整段日志, 只要这两个数据点.
 
 部署:
-  1. libqvmp_runtime.so → /data/local/tmp/  (.so 必须更新)
-  2. 43_no_once.hardened → 任意位置
-  3. MT 双击, 粘日志
+  1. libqvmp_runtime.so → /data/local/tmp/  (新 .so, 必须更新)
+  2. 44A_only_r0.hardened 或 44B_full.hardened → 任意位置
+  3. 双击运行
 
 MD5:
-  43_no_once.hardened  7e12b735c4fcdc3a33012025d8eb3473
-  libqvmp_runtime.so   81df25950068f792cb254f1934458b20  (必须更新)
+  44A_only_r0.hardened  4f64318979a07a4a2726f731b538b483
+  44B_full.hardened     7e12b735c4fcdc3a33012025d8eb3473
+  libqvmp_runtime.so    850e2eb263eec3c55b8eb9517a35a2f3

@@ -541,11 +541,20 @@ unsafe fn uc_set_pc(ucontext: *mut c_void, val: u64) {
     *p = val;
 }
 
+static HANDLER_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 extern "C" fn sigtrap_handler(
     _sig: libc::c_int,
     info: *mut libc::siginfo_t,
     ucontext: *mut c_void,
 ) {
+    let n = HANDLER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() || n % 1000 == 0 {
+        let mut buf = [0u8; 96];
+        let n_msg = format_dispatch_msg(&mut buf, b"qvmp_runtime: handler entry #", n as usize);
+        log_msg(&buf[..n_msg]);
+    }
     // si_addr (kernel's authoritative trap address) is at byte offset 16
     // in siginfo_t for SIGTRAP. The bionic ucontext layout has varied across
     // devices, so we trust si_addr over uc_pc() for the trapped instruction.
