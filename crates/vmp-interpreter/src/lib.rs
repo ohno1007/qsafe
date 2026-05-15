@@ -287,8 +287,33 @@ impl<'a> Interpreter<'a> {
                 VOp::Xor => self.alu(instr, |a, b| a ^ b),
                 VOp::Shl => self.alu(instr, |a, b| a.wrapping_shl((b & 63) as u32)),
                 VOp::LShr => self.alu(instr, |a, b| a.wrapping_shr((b & 63) as u32)),
-                VOp::AShr => self.alu(instr, |a, b| ((a as i64).wrapping_shr((b & 63) as u32)) as u64),
-                VOp::Ror => self.alu(instr, |a, b| a.rotate_right((b & 63) as u32)),
+                VOp::AShr => {
+                    // ASR 必须 width-aware: W32 时按 i32 做算术右移, 否则
+                    // u64 高 32 位是 0, sign bit (bit 31) 被视为正数, 无符号扩展.
+                    let a = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let b = self.state.regs[instr.rt as usize];
+                    let r = match instr.width {
+                        Width::W32 => {
+                            let amt = (b & 31) as u32;
+                            ((a as i32).wrapping_shr(amt)) as u32 as u64
+                        }
+                        _ => {
+                            let amt = (b & 63) as u32;
+                            ((a as i64).wrapping_shr(amt)) as u64
+                        }
+                    };
+                    self.state.regs[instr.rd as usize] = r & instr.width.mask();
+                }
+                VOp::Ror => {
+                    // RoR 也是 width-aware: W32 时按 32 位旋转, 否则 64 位.
+                    let a = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let b = self.state.regs[instr.rt as usize];
+                    let r = match instr.width {
+                        Width::W32 => (a as u32).rotate_right((b & 31) as u32) as u64,
+                        _ => a.rotate_right((b & 63) as u32),
+                    };
+                    self.state.regs[instr.rd as usize] = r & instr.width.mask();
+                }
                 VOp::Neg => {
                     let v = (self.state.regs[instr.rs as usize] as i64).wrapping_neg() as u64;
                     self.state.regs[instr.rd as usize] = v & instr.width.mask();

@@ -1,72 +1,80 @@
-target_app v53: scratch 缓冲扩容
-==================================
+target_app v54: 修签名验证错 (LDRS 符号扩展 + W32 Ror/ASR)
+==============================================================
 
-# v52 现场 — 巨大进展!
-
-```
-[qvmp] qvmp_init: enter
-[qvmp] qvmp_runtime: blob loaded, SIGTRAP+SIGSEGV handlers installed
-[qvmp] qvmp_runtime: handler entry #1
-[qvmp] qvmp_runtime: dispatching region=0
-[qvmp] qvmp_runtime: VM returned region=0     ← ✓ region 0 跑完
-... 重复 22 次 ...
-请输入卡密：11
-==> 接口地址 : https://api.qsafehub.com
-... 8 次 region 0 dispatch + return ...
-[qvmp] qvmp_runtime: handler entry #23
-[qvmp] qvmp_runtime: dispatching region=1     ← 切到 region 1
-[qvmp] qvmp_runtime: VM ERR region=1 err=Eb3:region 1 bytecode 57620 bytes exceeds BC_SCRATCH_BYTES 16384
-Trap
-```
-
-**Rewriter 修对了** — handler entry 一路打到 #23, region 0 跑了 22 次
-干净返回. License 验签真的进了我们 VMP 路径.
-
-# v53 修复
-
-region 1 的 bytecode 是 57,620 字节, 但 VM 的解密 scratch 缓冲只有 16KB.
-量子密码学函数 (Keccak/SHA-3 family) 用 NEON 重展开 + paranoid level
-junk_density=25% + 3 个 handler variants, 一个函数 lift 出来字节码涨到
-几十甚至 100+KB.
-
-inspect 看了一下当前 blob 最大的 region:
+# v53 现场 — VM 全流程跑起来
 
 ```
-region    bc_len
-[8]       139,421  ← 最大
-[1]        57,620  ← 这次崩的
-[*]         3,954
-[*]         3,006
+region 0  → 22 次干净返回 ✓
+region 1  → 1000+ 次干净返回 ✓ (= sha512_compress 之类)
+region 2  → 1 次干净返回 ✓
+[1] 服务端身份验签失败 ec=-25（MITM 风险，已退出）
 ```
 
-`crates/vmp-stub/src/entry.rs` 改两处:
+VM 全程跑完 — 流程通了, 但**算出来的结果跟 native 不一致**, 最后一步
+ECDSA / 后量子签名校验过不去.
 
+# 真因: 我之前扩 lifter 时埋了俩 silent bug
+
+## Bug 1: LDR-signed-extend 退化为 zero-extend
+
+v50 我把 LDR/STR 9-bit 的 mask 从锁死 STR-only 放开:
+```diff
+- if (raw >> 21) & 0x1FF == 0b111000_000  // 强制 opc=00 = STR
++ if (raw >> 24) & 0x3F == 0b111000 && (raw >> 21) & 1 == 0
+```
+
+放开之后 opc=00/01/10/11 都进来. 但我**只把 opc==0 当 Store, 其它一律
+当 Load**, 把 opc=10 (LDRSW/LDRSH/LDRSB to X) 和 opc=11 (LDRS to W)
+当成零扩展 Load. 真正的 LDRS 需要做符号扩展, 不做的话:
+
+  原 W = 0xFFFF (signed -1 as int16) → 应当扩展为 0xFFFFFFFFFFFFFFFF
+  我们 emit 出来的: 0x000000000000FFFF (零扩展)
+
+差 17 个 bit. Kyber 签名验证里大量 LDRSW 加载有符号多项式系数, 加载错
+→ 多项式运算偏差 → 签名验签失败.
+
+修: 加 `emit_load_sign_extend` 帮手, opc 高位是 1 (signed) 时在 Load
+之后追加 `Shl + AShr` 做符号扩展. 三个 LDR 子族都加上.
+
+## Bug 2: W32 Ror / AShr 走 64-bit 路径
+
+之前 Ror 实现:
 ```rust
-const POOL_SIZE: usize        = 32 * 1024 * 1024;  // 16MB → 32MB
-const BC_SCRATCH_BYTES: usize = 256 * 1024;        // 16KB → 256KB
+VOp::Ror => self.alu(instr, |a, b| a.rotate_right((b & 63) as u32)),
 ```
 
-每 frame = 64KB stack + 256KB scratch = 320KB. 32MB pool / 320KB = 100
-层递归 headroom. 当前最大 region 139KB 远低于 256KB 上限.
+`a` 经过 width 掩码后高 32 位 = 0, 然后调 `u64.rotate_right` — 这是
+64 位旋转, 不是 32 位.
 
-# 只需更新 .so
+例子: W32 a=1 (bit 0 set), 右旋 1 位:
+  正确: 0x80000000 (bit 0 → bit 31)
+  我们: u64 旋转 → 0x8000_0000_0000_0000, 掩到 32 位 = 0 (WRONG)
 
-这次不需要重新加固 binary — bug 在 runtime .so 里的常量配置. hardened
-binary 本身没动 (md5 跟 v52 一样).
+AShr 类似: 把 W32 当作 i64 算术右移, sign bit 看错位 (i64 sign 在 bit
+63 而不是 bit 31).
+
+修: Ror/AShr handler 都加 `match instr.width` 显式区分 W32 vs W64.
+
+# 改了哪些文件
+
+- `crates/vmp-arch/src/arm64/decode.rs`:
+  + `emit_load_sign_extend` 新函数
+  + 三个 LDR/STR family (unsigned-imm / 9-bit unscaled-pre-post / 寄存器偏移) 调用
+- `crates/vmp-interpreter/src/lib.rs`:
+  + VOp::Ror handler — width-aware
+  + VOp::AShr handler — width-aware
+
+# 覆盖率 (没动)
+
+30 region / 24%.
 
 # 部署
 
-1. **覆盖** `/data/local/tmp/libqvmp_runtime.so` ← **md5 必须对上新的**
-2. target_app.hardened 不用换 (md5 跟 v52 一样, 可跳过)
-3. MT 重新打开
-
-# 期望
-
-handler entry 应该一路往上数, 看到 region 1 dispatching 后能正常
-returned. 验签流程要更深入, 估计能跑到 `[2]` 服务端验证之后甚至完成
-整个 license 检查.
+1. **覆盖** /data/local/tmp/libqvmp_runtime.so ← md5 必须对新的
+2. **覆盖** target_app.hardened ← md5 也变了 (因为 lifter 输出变了)
+3. MT 重启
 
 # MD5
 
-  target_app.hardened   0ea6804dbbf9f26847ee58d89156b89b   ← 跟 v52 同
-  libqvmp_runtime.so    ae029ebd6284a887232077fec057672c   ← **必须更新**
+  target_app.hardened   7c756dcd893c5937bdf8ea6f8b8eee25   ← 更新
+  libqvmp_runtime.so    303006ff0de3a0f0451017c8662cc9ee   ← 更新

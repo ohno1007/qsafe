@@ -785,8 +785,9 @@ fn decode_load_store(raw: u32, pc: u64) -> Result<Vec<Instr>, &'static str> {
         };
         let scaled = imm12 * width.bytes() as i64;
         let op = if opc == 0 { VOp::Store } else { VOp::Load };
-        // 简化：LDRS（符号扩展）暂当作普通 Load
-        return Ok(vec![Instr { op, rd: rt, rs: rn, imm: scaled, width, ..Default::default() }]);
+        let mut out = vec![Instr { op, rd: rt, rs: rn, imm: scaled, width, ..Default::default() }];
+        emit_load_sign_extend(&mut out, rt, opc, size);
+        return Ok(out);
     }
 
     // ---- LDR/STR (immediate, 9-bit unscaled / pre-index / post-index) ----
@@ -811,7 +812,7 @@ fn decode_load_store(raw: u32, pc: u64) -> Result<Vec<Instr>, &'static str> {
             _ => Width::W64,
         };
         let op = if opc == 0 { VOp::Store } else { VOp::Load };
-        let mut out = Vec::with_capacity(4);
+        let mut out = Vec::with_capacity(6);
         match idx {
             0b00 => {
                 out.push(Instr { op, rd: rt, rs: rn, imm: imm9, width, ..Default::default() });
@@ -830,6 +831,7 @@ fn decode_load_store(raw: u32, pc: u64) -> Result<Vec<Instr>, &'static str> {
             }
             _ => return Err("LDR/STR idx 未分配"),
         }
+        emit_load_sign_extend(&mut out, rt, opc, size);
         return Ok(out);
     }
 
@@ -859,13 +861,33 @@ fn decode_load_store(raw: u32, pc: u64) -> Result<Vec<Instr>, &'static str> {
             out.push(Instr { op: VOp::Shl, rd: SCRATCH, rs: SCRATCH, rt: SCRATCH2, width: Width::W64, ..Default::default() });
         }
         out.push(Instr { op: VOp::Add, rd: SCRATCH, rs: SCRATCH, rt: rn, width: Width::W64, ..Default::default() });
-        // opc: 00=STR, 01=LDR, 10=LDRS to 64, 11=LDRS to 32（符号扩展近似为零扩展）
         let op = if opc == 0 { VOp::Store } else { VOp::Load };
         out.push(Instr { op, rd: rt, rs: SCRATCH, imm: 0, width, ..Default::default() });
+        emit_load_sign_extend(&mut out, rt, opc, size);
         return Ok(out);
     }
 
     Err("load/store 子类未实现")
+}
+
+/// 在 Load 指令后追加符号扩展. opc bit-1 = 1 表示 signed-extend; opc bit-0
+/// 决定扩展到 X (1) 还是 W (0). 我们用 Shl + AShr 二步走来同时覆盖两种.
+fn emit_load_sign_extend(out: &mut Vec<Instr>, rt: u8, opc: u32, size: u32) {
+    if (opc & 0b10) == 0 {
+        return; // STR (00) 或 LDR-zero-ext (01) — 不需要
+    }
+    let bits_loaded = match size {
+        0 => 8,
+        1 => 16,
+        2 => 32,
+        _ => return, // 64-bit 不可能 signed-extend (没意义)
+    };
+    let total_bits = if (opc & 0b01) == 1 { 32 } else { 64 };
+    let shift = total_bits - bits_loaded;
+    let width = if total_bits == 32 { Width::W32 } else { Width::W64 };
+    out.push(Instr { op: VOp::MovI, rd: SCRATCH, imm: shift as i64, width: Width::W64, ..Default::default() });
+    out.push(Instr { op: VOp::Shl, rd: rt, rs: rt, rt: SCRATCH, width, ..Default::default() });
+    out.push(Instr { op: VOp::AShr, rd: rt, rs: rt, rt: SCRATCH, width, ..Default::default() });
 }
 
 // =================================================================
