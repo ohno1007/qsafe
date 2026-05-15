@@ -98,24 +98,43 @@ fn format_dispatch_msg(buf: &mut [u8], prefix: &[u8], id: usize) -> usize {
     pos
 }
 
+/// raw write(2) via `svc #0` — POSIX 说 libc::write 是 async-signal-safe, 但
+/// bionic 的 libc wrapper 走 errno tls 等通路, 实际触发过 signal-handler 内的
+/// bionic 内部 mutex 重入. 直接 syscall 完全绕过 libc 状态.
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
+#[inline]
+unsafe fn raw_write(fd: i32, buf: *const u8, len: usize) {
+    let _ret: i64;
+    core::arch::asm!(
+        "svc #0",
+        in("x8") 64u64, // SYS_write
+        inlateout("x0") fd as u64 => _ret,
+        inlateout("x1") buf as u64 => _,
+        inlateout("x2") len as u64 => _,
+        lateout("x3") _, lateout("x4") _, lateout("x5") _,
+        lateout("x6") _, lateout("x7") _,
+        options(nostack),
+    );
+}
+
+#[cfg(not(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64")))]
+unsafe fn raw_write(fd: i32, buf: *const u8, len: usize) {
+    let _ = libc::write(fd, buf as *const _, len);
+}
+
 fn log_msg(msg: &[u8]) {
     if !log_enabled() {
         return;
     }
     let stripped = if msg.last() == Some(&0) { &msg[..msg.len() - 1] } else { msg };
+    // 全程 raw syscall, 不调 bionic logger / __android_log_write —— 后者在
+    // 内部走 socket + mutex, 在 SIGTRAP handler 路径上撞主线程 logger mutex
+    // 会重入死锁/堆损坏.
     unsafe {
         let prefix = b"[qvmp] ";
-        libc::write(2, prefix.as_ptr() as *const _, prefix.len());
-        libc::write(2, stripped.as_ptr() as *const _, stripped.len());
-        libc::write(2, b"\n".as_ptr() as *const _, 1);
-    }
-    #[cfg(target_os = "android")]
-    unsafe {
-        __android_log_write(
-            4,
-            b"qvmp\0".as_ptr() as *const _,
-            msg.as_ptr() as *const _,
-        );
+        raw_write(2, prefix.as_ptr(), prefix.len());
+        raw_write(2, stripped.as_ptr(), stripped.len());
+        raw_write(2, b"\n".as_ptr(), 1);
     }
 }
 

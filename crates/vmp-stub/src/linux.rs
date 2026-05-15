@@ -11,8 +11,6 @@ pub struct LinuxHost {
     pub allow_raw_memory: bool,
     /// dispatch_vm 总耗时基准（new 时刻），用于在 sys_exit 时打印 VMP 总损耗
     pub start: std::time::Instant,
-    /// 缓存 /proc/self/maps 中的可执行段区间，懒加载。
-    exec_ranges: Vec<(u64, u64)>,
 }
 
 impl Default for LinuxHost {
@@ -26,35 +24,7 @@ impl LinuxHost {
         Self {
             allow_raw_memory: true,
             start: std::time::Instant::now(),
-            exec_ranges: Vec::new(),
         }
-    }
-
-    /// 解析 /proc/self/maps，重建可执行段表。失败静默 —— 后续校验会降级为
-    /// "不在 cache 内即不允许"，但调用方可选择忽略不校验。
-    fn refresh_exec_ranges(&mut self) {
-        let Ok(s) = std::fs::read_to_string("/proc/self/maps") else { return };
-        let mut v: Vec<(u64, u64)> = Vec::new();
-        for line in s.lines() {
-            // 行格式: addr-addr perms offset dev inode path
-            let mut it = line.split_whitespace();
-            let Some(range) = it.next() else { continue };
-            let Some(perms) = it.next() else { continue };
-            if perms.len() < 3 || perms.as_bytes().get(2) != Some(&b'x') {
-                continue;
-            }
-            let Some((a, b)) = range.split_once('-') else { continue };
-            let (Ok(start), Ok(end)) = (
-                u64::from_str_radix(a, 16),
-                u64::from_str_radix(b, 16),
-            ) else { continue };
-            v.push((start, end));
-        }
-        self.exec_ranges = v;
-    }
-
-    fn target_in_exec(&self, t: u64) -> bool {
-        self.exec_ranges.iter().any(|&(s, e)| t >= s && t < e)
     }
 }
 
@@ -90,37 +60,17 @@ impl HostBridge for LinuxHost {
     }
 
     fn native_call(&mut self, target: u64, args: &[u64]) -> Result<u64> {
-        // 第一道防线：基本健全性。
-        if target == 0 {
-            return Err(Error::vm("native_call: 空指针 target=0"));
-        }
-        if target & 3 != 0 {
-            return Err(Error::vm(format!(
-                "native_call: target 未对齐 {:#x}",
-                target
-            )));
-        }
-        if target < 0x1000 {
-            return Err(Error::vm(format!(
-                "native_call: target 落在低地址（疑似垃圾） {:#x}",
-                target
-            )));
+        // 最小校验 (signal-safe, 不走 alloc):
+        //   - target == 0 / 未对齐 / 低地址 → 不可能是合法函数指针.
+        // 之前的 /proc/self/maps 校验每次 LinuxHost::new 都 cache 空, 第一次
+        // BLR 会去 fs::read_to_string → bionic malloc, 在 SIGTRAP handler 路径
+        // 上重入主线程 malloc 锁, 是 v37/38/40/41 同位置挂的真正元凶之一.
+        if target == 0 || target & 3 != 0 || target < 0x1000 {
+            return Err(Error::vm("native_call: target 不合法"));
         }
 
-        // 第二道：必须落在某个 r-x 段。第一次未命中时刷新一次 cache，
-        // 应对 dlopen 之后新映射的库。
-        if !self.target_in_exec(target) {
-            self.refresh_exec_ranges();
-            if !self.target_in_exec(target) {
-                return Err(Error::vm(format!(
-                    "native_call: target {:#x} 不在任何可执行映射内",
-                    target
-                )));
-            }
-        }
-
-        // ARM64 AAPCS64 支持 x0..x7 全部为整数参数。固定走 F8 即可，
-        // 多出的参数在被调函数侧会被忽略 —— 比 F6 截断更兼容。
+        // ARM64 AAPCS64 支持 x0..x7 全部为整数参数. 固定走 F8 即可,
+        // 多出的参数在被调函数侧会被忽略.
         type F8 = extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
         let mut a = [0u64; 8];
         for (i, v) in args.iter().take(8).enumerate() {

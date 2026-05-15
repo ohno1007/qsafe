@@ -33,8 +33,33 @@ pub static MAIN_EXEC_LOAD_BIAS: AtomicU64 = AtomicU64::new(0);
 /// MAIN_EXEC_LOAD_BIAS，用于 ADRP / ADR / LDR-literal 的运行时重定位。
 pub const VM_REG_LOAD_BIAS: usize = 62;
 
-extern "C" {
-    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+/// Raw `SYS_write` via inline syscall — completely bypasses libc/bionic logger
+/// machinery, which holds internal mutexes that deadlock if the SIGTRAP handler
+/// re-enters them. POSIX `write(2)` is technically async-signal-safe, but
+/// observed bionic interactions (errno TLS, sockets, etc) make the syscall
+/// path the only truly safe option for tracing on the signal path.
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
+#[inline]
+unsafe fn syscall_write(fd: i32, buf: *const u8, len: usize) {
+    let _r: i64;
+    core::arch::asm!(
+        "svc #0",
+        in("x8") 64u64,
+        inlateout("x0") fd as u64 => _r,
+        inlateout("x1") buf as u64 => _,
+        inlateout("x2") len as u64 => _,
+        lateout("x3") _, lateout("x4") _, lateout("x5") _,
+        lateout("x6") _, lateout("x7") _,
+        options(nostack),
+    );
+}
+
+#[cfg(not(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64")))]
+unsafe fn syscall_write(fd: i32, buf: *const u8, len: usize) {
+    extern "C" {
+        fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    }
+    let _ = write(fd, buf, len);
 }
 
 fn trace_native_call(rd: u8, target: u64, args: &[u64]) {
@@ -100,7 +125,7 @@ fn trace_native_call(rd: u8, target: u64, args: &[u64]) {
     }
     push(&mut buf, &mut pos, b"\n");
     unsafe {
-        let _ = write(2, buf.as_ptr(), pos);
+        syscall_write(2, buf.as_ptr(), pos);
     }
 }
 
@@ -139,7 +164,7 @@ fn trace_native_ret(target: u64, ret: u64) {
     push_hex(&mut buf, &mut pos, target);
     push(&mut buf, &mut pos, b")\n");
     unsafe {
-        let _ = write(2, buf.as_ptr(), pos);
+        syscall_write(2, buf.as_ptr(), pos);
     }
 }
 
@@ -320,15 +345,12 @@ impl<'a> Interpreter<'a> {
                     let rd = instr.rd;
                     let target_ptr = self.state.regs[rd as usize];
                     trace_native_call(rd, target_ptr, &self.state.regs[..8]);
+                    // 错误路径以前用 format!() 包装上下文 — format! 会触发
+                    // bionic malloc, 在 SIGTRAP handler 重入主线程堆 mutex.
+                    // 直接透传错误, 保留原始信息. 失败信息在 SIGSEGV handler
+                    // 的寄存器 dump 里能找到 rd 对应的值.
                     let ret = match self.host.as_deref_mut() {
-                        Some(h) => h
-                            .native_call(target_ptr, &self.state.regs[..8])
-                            .map_err(|e| {
-                                Error::vm(format!(
-                                    "BLR x{} target={:#x}: {}",
-                                    rd, target_ptr, e
-                                ))
-                            })?,
+                        Some(h) => h.native_call(target_ptr, &self.state.regs[..8])?,
                         None => return Err(Error::vm("E2")),
                     };
                     trace_native_ret(target_ptr, ret);
