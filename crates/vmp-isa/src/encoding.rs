@@ -184,6 +184,22 @@ impl Instr {
             VOp::AtomicAdd | VOp::AtomicSwap | VOp::AtomicCas => Layout::r3w(),
             // 内存屏障无操作数
             VOp::Barrier => Layout::r0(),
+
+            // 位计数 / 位反转: rd + rs + width
+            VOp::Clz | VOp::Rbit | VOp::Rev | VOp::Rev16 | VOp::Rev32 => Layout {
+                has_rd: true, has_rs: true, has_rt: false,
+                has_width: true, has_cond: false, imm_bytes: 0,
+            },
+
+            // 128-bit FREG 位运算: rd + rs + rt (无 width, 永远 Q-reg)
+            VOp::VEor | VOp::VAnd | VOp::VOr | VOp::VBic => Layout {
+                has_rd: true, has_rs: true, has_rt: true,
+                has_width: false, has_cond: false, imm_bytes: 0,
+            },
+            // 单源位反: rd + rs
+            VOp::VNot => Layout::r2(),
+            // 每 lane 移位/旋转: rd + rs + imm32 (imm = shift amount)
+            VOp::VShlD | VOp::VLShrD | VOp::VRorD => Layout::r2i32w(),
         }
     }
 

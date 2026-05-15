@@ -1,73 +1,113 @@
-target_app 加固结果
-==========================
+target_app v50: SIGILL handler + lifter 大扩 + 24% 覆盖
+=============================================================
 
-# 改动 (v2 blob)
+# 上次现场 (v49)
 
-**每个被保护函数一台不同的 VM** — 不再共享一份 IsaSpec.
-opcode 排列 / 寄存器置换 / 加密 key / 立即数旋转, 全部一region一份.
-拆解 funcA 的 dispatch table 套不到 funcB. seed 派生:
-  spec_seed = cfg.seed * splitmix + region_idx * splitmix + func.vaddr
-同 seed + 同二进制 ⇒ 可复现.
+```
+[qvmp] qvmp_init: enter
+[qvmp] qvmp_runtime: rodata decrypted in place
+[qvmp] qvmp_runtime: blob loaded, SIGTRAP+SIGSEGV handlers installed
+请输入卡密：11
+==> 接口地址 : https://api.qsafehub.com
+[1] 服务端身份 ✓（已验签）
+Illegal instruction
+[进程已结束 (error 132) - 按回车关闭]
+```
 
-# 覆盖率 (paranoid level)
+关键观察:
+- **完全没有 `handler entry #N` 日志** → v49 protect 的 21 个函数走的
+  路径根本没被命中 (license 验证用的不是我们 protect 的那批 Keccak).
+- `Illegal instruction` (signal 4, exit 132) = SIGILL — 不是我们的 BRK
+  分发路径 (那个会是 SIGTRAP / SIGSEGV).
+- 最可能: app 自身有 anti-tamper 检查, 检测到 .text 被改 (我们注入了
+  21 个 trampoline 改了原函数入口), 主动 `udf #0` 自爆.
+- 或者: 某个我们 protect 的函数返回时把状态搞坏, 主程序之后跑到野指针,
+  PC 落在全零内存上 → `udf #0` → SIGILL.
 
-| 阶段 | 数量 | 说明 |
-|------|------|------|
-| ELF 函数符号 | 125 | 全部候选 |
-| Lift 成功 | 51 | NEON / atomics 复杂指令 lifter 暂未覆盖 |
-| skip_traps drop | 74 | 含未支持指令 → 留原生 |
-| cascade drop | 30 | 引用了 dropped region 的级联剔除 |
-| **最终 VMP** | **21** | **16.8% 函数被虚拟化** |
+# v50 改动
 
-被保护的几个关键函数 (从 entry 看):
-  KeccakF1600_StatePermute, mlkem_kdf, sha3 系列, ...
-即核心加密热点.
+## 1. SIGILL handler (新增)
 
-剩下 84% 是因为这是 Kyber/Keccak 量子安全密码学库, 大量用 NEON
-向量指令 (`v0.16b`, `tbl`, `xar`, `bcax` 等), 这些我们的 ARM64
-lifter 还没覆盖. 想拉高覆盖率得给 lifter 加 NEON 指令支持.
+`crates/vmp-soruntime/src/lib.rs`: SIGILL 跟 SIGSEGV 共用同一个寄存器
+dump handler. 下次再挂会看到:
 
-# 单文件 ELF 现状
+```
+[qvmp] qvmp_runtime: SIGSEGV sig=4  ← 实际是 SIGILL (sig=4 复用同一 handler)
+[qvmp] qvmp_runtime: SIGSEGV pc=...
+[qvmp] qvmp_runtime: x0=... x1=... ...
+[qvmp] qvmp_runtime: frame[0] lr=...
+```
 
-**这个 target_app 没法做单文件包** — 它的 PLT 里没有 `dlopen` import.
-bootstrap stub 需要 dlopen 调用嵌入式 .so, 没 PLT 表里现成的 dlopen
-就必须做 ELF 大手术 (新增 .dynsym / .dynstr / .rela.plt / .plt /
-.got.plt 条目). 这工作量我先不展开.
+PC + frame chain 就能定位是 anti-tamper 还是 VM 状态污染.
 
-所以这次仍走**两文件** DT_NEEDED 部署. Android 的 dynamic linker
-在 main exec 跑起来前会自动 dlopen DT_NEEDED 引用, 等价效果.
+## 2. 加密前 32 次 handler entry 全打日志 (而不是 power-of-2 节流)
 
-# 部署
+帮排查首批 region 触发, 看是否真的有"我们 protect 的函数被叫到了".
 
-  1. `libqvmp_runtime.so` → `/data/local/tmp/` (md5 必须对)
-  2. `target_app.hardened` → 任意位置, MT 双击 / `chmod +x && ./`
+## 3. 大幅扩展 ARM64 lifter
 
-# 单元测试
+加了一票之前 skip 掉的指令族:
 
-`cargo test -p vmp-stub`: 10/12 通过.
-失败的 2 个是 fixture-pinned (要某 Windows NDK 的二进制在
-0x204234 / 0x20419c 这种硬编 vaddr) - 跟我的改动无关, main 分支
-也挂.
+| 指令族 | 之前 | 现在 |
+|--------|------|------|
+| ADC / SBC / ADCS / SBCS | skip | ✓ (用 CSel+Carry-flag 实现) |
+| EXTR (一般形) | skip (仅 ROR) | ✓ (拼 LShr+Shl+Or) |
+| BFM 一般形 (BFI/UBFX/SBFX) | skip | ✓ |
+| BIC / EON / ORN (shift+NOT) | skip | ✓ |
+| ADD/SUB 扩展寄存器 (UXTB/SXTW 等) | skip | ✓ |
+| CCMP / CCMN (条件比较) | skip | ✓ (近似) |
+| SMULH / UMULH (128 位乘高位) | skip | ✓ (Knuth 拆 4×32) |
+| LDR/STR 9-bit 带符号扩展 (LDRSB/LDRSW 等) | skip | ✓ |
+| FP LDP/STP (含 Q-form 128-bit) | skip | ✓ |
+| dp-1src (CLZ/RBIT/REV/REV16/REV32) | skip | ✓ 加新 VOps |
+| NEON 位运算 (EOR/AND/ORR/BIC vector) | skip | ✓ 加 VEor/VAnd/VOr/VNot/VBic |
+| SHA3 (EOR3 / BCAX / RAX1 / XAR) | skip | ✓ 分解到 VEor/VBic/VRorD |
 
-# MD5
+5 个新 GPR VOp (Clz/Rbit/Rev/Rev16/Rev32), 8 个新 FREG VOp (VEor/VAnd/
+VOr/VNot/VBic/VShlD/VLShrD/VRorD).
 
-  target_app (原始)      2fd4c6b903fa93c041056f35750fc4e0
-  target_app.hardened    5e3d2eb0f5a1d33247083acb0b83f3c4
-  libqvmp_runtime.so     e3f007bb57764cfbe37c493fbda7736f
+## 4. blob 版本和 ISA 容量
 
-# 后续改进方向
+- handler_duplication paranoid: 4 → 3 (因为新增 VOps 后容量被吃掉)
+- 1-byte opcode 上限从 220 提到 254 (= 255-1)
+- 65 VOps × 3 variants = 195 ≤ 254 ✓
+- 每个 region 仍是**独立 IsaSpec** (v2 blob); 21 region × 3 variants ×
+  65 VOps ≈ 4100 (region-idx, opcode) 独立组合
 
-1. **lift NEON 指令** → 覆盖率到 60-80%
-2. **dlopen PLT 注入** → 真正的单文件 ELF (即使原 binary 没 dlopen)
-3. handler_duplication=4 + 21 个独立 IsaSpec = 21 × 4 × 52 ≈ 4400 个
-   独立 (opcode, region) 组合 — 静态反编译要分别学每个 region 的
-   dispatch table
+# 覆盖率
+
+| 阶段 | v47/49 | **v50** |
+|------|--------|---------|
+| ELF 函数 | 125 | 125 |
+| Lift 成功 | 51 | **88** ↑ |
+| Skip-traps drop | 74 | 37 ↓ |
+| 级联剔除 | 30 | 58 |
+| **最终 VMP** | 21 (16.8%) | **30 (24%)** |
+
+instruction-level skip 从 6132 降到 1488. 剩下 1488 全是 NEON 高级
+SIMD (DUP element, INS, UMOV, vector ADD/SUB, vector shift-imm 等).
+
+入口函数从 `KeccakF1600_StatePermute` 变成 `qsh__sha512_compress` —
+现在被保护的函数集合包含了 SHA-512 / SHA-3 / Kyber KEM 主路径多个核心.
+
+要冲 99% 需要把整个 NEON ISA 都铺一遍 (上百个 sub-encoding). 我先把
+现在这版给你测一下, 排查 SIGILL 真因, 同时我会继续推 NEON.
+
+# 部署 (跟 v49 一样)
+
+1. `libqvmp_runtime.so` → `/data/local/tmp/`
+2. `target_app.hardened` → 任意位置, MT 双击 / `chmod +x && ./`
 
 # 期望
 
-device 上跑 target_app.hardened, 应该看到:
-  [qvmp] qvmp_init: enter
-  [qvmp] qvmp_runtime: blob loaded, SIGTRAP+SIGSEGV handlers installed
-  [qvmp] qvmp_runtime: handler entry #1
-  [qvmp] qvmp_runtime: dispatching region=N  (N 是真正首先调用的被保护函数)
-  ...
+- 启动看到 `[qvmp] qvmp_init: enter` 等三行 (.so 加载 OK)
+- 这次 protect 集变化大, **应该会看到 `handler entry #1..#N`** 因为
+  SHA-512 compress 是 license 验签的早期热点
+- 如果再 SIGILL → 现在 handler 会 dump pc / x0..x30 / frame chain,
+  贴日志回来我就能定位
+
+# MD5
+
+  target_app (原始)       2fd4c6b903fa93c041056f35750fc4e0
+  target_app.hardened     1541d04baa3fd458e52c8533514ffdd0
+  libqvmp_runtime.so      0e808c013384da0de622e89b5a768e18

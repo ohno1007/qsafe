@@ -397,6 +397,10 @@ fn install_sigsegv_logger() {
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
         libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
+        // SIGILL 同套 handler: 在 VMP 上下文里, 如果 caller 回 lr 之后跑到
+        // 一段全 0 / 未初始化内存当指令解 → udf #0 → SIGILL. 拿到 pc/regs
+        // 才能定位是哪个 region 返回时把状态搞坏了.
+        libc::sigaction(libc::SIGILL, &sa, std::ptr::null_mut());
     }
 }
 
@@ -560,7 +564,8 @@ extern "C" fn sigtrap_handler(
     ucontext: *mut c_void,
 ) {
     let n = HANDLER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    if n.is_power_of_two() || n % 1000 == 0 {
+    // 早期诊断: 前 32 次全打, 之后退回 power-of-two / 1000 倍数节流.
+    if n <= 32 || n.is_power_of_two() || n % 1000 == 0 {
         let mut buf = [0u8; 96];
         let n_msg = format_dispatch_msg(&mut buf, b"qvmp_runtime: handler entry #", n as usize);
         log_msg(&buf[..n_msg]);

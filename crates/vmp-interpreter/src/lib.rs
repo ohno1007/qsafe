@@ -567,6 +567,106 @@ impl<'a> Interpreter<'a> {
                 VOp::Barrier => {
                     // 单线程 VM：内存屏障 = noop
                 }
+
+                // ==== Bit-count / bit-reverse (dp-1src) ====
+                VOp::Clz => {
+                    let v = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let bits = (instr.width.bytes() * 8) as u32;
+                    let r = if v == 0 { bits as u64 } else { v.leading_zeros() as u64 - (64 - bits as u64) };
+                    self.state.regs[instr.rd as usize] = r;
+                }
+                VOp::Rbit => {
+                    let v = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let r = if instr.width.bytes() == 4 {
+                        (v as u32).reverse_bits() as u64
+                    } else {
+                        v.reverse_bits()
+                    };
+                    self.state.regs[instr.rd as usize] = r;
+                }
+                VOp::Rev => {
+                    let v = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let r = if instr.width.bytes() == 4 {
+                        (v as u32).swap_bytes() as u64
+                    } else {
+                        v.swap_bytes()
+                    };
+                    self.state.regs[instr.rd as usize] = r;
+                }
+                VOp::Rev16 => {
+                    let v = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let r = if instr.width.bytes() == 4 {
+                        let v = v as u32;
+                        let lo = ((v & 0xFFFF) as u16).swap_bytes() as u32;
+                        let hi = (((v >> 16) & 0xFFFF) as u16).swap_bytes() as u32;
+                        ((hi << 16) | lo) as u64
+                    } else {
+                        let mut r: u64 = 0;
+                        for i in 0..4 {
+                            let h = ((v >> (i * 16)) & 0xFFFF) as u16;
+                            r |= (h.swap_bytes() as u64) << (i * 16);
+                        }
+                        r
+                    };
+                    self.state.regs[instr.rd as usize] = r;
+                }
+                VOp::Rev32 => {
+                    let v = self.state.regs[instr.rs as usize] & instr.width.mask();
+                    let r = if instr.width.bytes() == 4 {
+                        (v as u32).swap_bytes() as u64
+                    } else {
+                        // 在 64-bit reg 内按 32-bit 字翻转字节
+                        let lo = ((v & 0xFFFF_FFFF) as u32).swap_bytes() as u64;
+                        let hi = ((v >> 32) as u32).swap_bytes() as u64;
+                        (hi << 32) | lo
+                    };
+                    self.state.regs[instr.rd as usize] = r;
+                }
+
+                // ==== 128-bit NEON 位运算 ====
+                VOp::VEor => {
+                    self.state.fregs[instr.rd as usize & 31] =
+                        self.state.fregs[instr.rs as usize & 31] ^ self.state.fregs[instr.rt as usize & 31];
+                }
+                VOp::VAnd => {
+                    self.state.fregs[instr.rd as usize & 31] =
+                        self.state.fregs[instr.rs as usize & 31] & self.state.fregs[instr.rt as usize & 31];
+                }
+                VOp::VOr => {
+                    self.state.fregs[instr.rd as usize & 31] =
+                        self.state.fregs[instr.rs as usize & 31] | self.state.fregs[instr.rt as usize & 31];
+                }
+                VOp::VNot => {
+                    self.state.fregs[instr.rd as usize & 31] =
+                        !self.state.fregs[instr.rs as usize & 31];
+                }
+                VOp::VBic => {
+                    self.state.fregs[instr.rd as usize & 31] =
+                        self.state.fregs[instr.rs as usize & 31] & !self.state.fregs[instr.rt as usize & 31];
+                }
+
+                // ==== 128-bit FREG 每-64-bit-lane 移位/旋转 ====
+                VOp::VShlD => {
+                    let v = self.state.fregs[instr.rs as usize & 31];
+                    let amt = (instr.imm & 63) as u32;
+                    let lo = (v as u64).wrapping_shl(amt);
+                    let hi = ((v >> 64) as u64).wrapping_shl(amt);
+                    self.state.fregs[instr.rd as usize & 31] = (lo as u128) | ((hi as u128) << 64);
+                }
+                VOp::VLShrD => {
+                    let v = self.state.fregs[instr.rs as usize & 31];
+                    let amt = (instr.imm & 63) as u32;
+                    let lo = (v as u64).wrapping_shr(amt);
+                    let hi = ((v >> 64) as u64).wrapping_shr(amt);
+                    self.state.fregs[instr.rd as usize & 31] = (lo as u128) | ((hi as u128) << 64);
+                }
+                VOp::VRorD => {
+                    let v = self.state.fregs[instr.rs as usize & 31];
+                    let amt = (instr.imm & 63) as u32;
+                    let lo = (v as u64).rotate_right(amt);
+                    let hi = ((v >> 64) as u64).rotate_right(amt);
+                    self.state.fregs[instr.rd as usize & 31] = (lo as u128) | ((hi as u128) << 64);
+                }
             }
         }
     }
