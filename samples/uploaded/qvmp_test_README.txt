@@ -1,80 +1,69 @@
-target_app v54: 修签名验证错 (LDRS 符号扩展 + W32 Ror/ASR)
-==============================================================
+target_app v55: 两个二分定位包
+=====================================
 
-# v53 现场 — VM 全流程跑起来
+# v54 还失败的原因
+
+我猜了 LDRS + W32 Ror/AShr 但没修对症, 说明 bug 在别处. 给你两个包帮二分:
+
+## protected 函数列表
 
 ```
-region 0  → 22 次干净返回 ✓
-region 1  → 1000+ 次干净返回 ✓ (= sha512_compress 之类)
-region 2  → 1 次干净返回 ✓
-[1] 服务端身份验签失败 ec=-25（MITM 风险，已退出）
+[ 0] qsh__sha512_compress    ← SHA-512, 30 次调用
+[ 1] qsh__ge_add             ← Ed25519 点加法, 1000+ 次
+[ 2] qsh__fe51_invert        ← 51-bit 域元素求逆, 1 次
+[ 3] qsh_base64_encode
+[ 4] KeccakF1600_StatePermute (sha3 内核)
+[ 5] shake128_squeezeblocks
+[ 6] sha3_512
+[ 7..18] PQCLEAN_MLKEM768_CLEAN_* (Kyber 后量子)
+[19..29] shake/sha3 系列
 ```
 
-VM 全程跑完 — 流程通了, 但**算出来的结果跟 native 不一致**, 最后一步
-ECDSA / 后量子签名校验过不去.
+# 这次给你两个包
 
-# 真因: 我之前扩 lifter 时埋了俩 silent bug
+## A) `target_app_light.hardened`  (最简单的 protect 路径)
 
-## Bug 1: LDR-signed-extend 退化为 zero-extend
+- `--level light`: handler_duplication=1 (无 variant), junk_density=0 (无垃圾指令),
+  encrypt_bytecode=false (字节码不加密)
+- 全 30 个 region 仍然 protect
+- 走的是 lifter+interpreter 最干净的路径
+- 如果**这个还失败** → bug 在基础 lifter/interpreter (我新加的某条 VOp 算错)
+- 如果**这个成功** → bug 在 paranoid 的 junk insertion / variant assignment
 
-v50 我把 LDR/STR 9-bit 的 mask 从锁死 STR-only 放开:
-```diff
-- if (raw >> 21) & 0x1FF == 0b111000_000  // 强制 opc=00 = STR
-+ if (raw >> 24) & 0x3F == 0b111000 && (raw >> 21) & 1 == 0
-```
+MD5: `24266ac5ecfd249f3ac1f974ff8b525b`
 
-放开之后 opc=00/01/10/11 都进来. 但我**只把 opc==0 当 Store, 其它一律
-当 Load**, 把 opc=10 (LDRSW/LDRSH/LDRSB to X) 和 opc=11 (LDRS to W)
-当成零扩展 Load. 真正的 LDRS 需要做符号扩展, 不做的话:
+## B) `target_app_nogeadd.hardened`  (paranoid 但跳过 Ed25519)
 
-  原 W = 0xFFFF (signed -1 as int16) → 应当扩展为 0xFFFFFFFFFFFFFFFF
-  我们 emit 出来的: 0x000000000000FFFF (零扩展)
+- `--level paranoid`
+- `--exclude qsh__ge_add --exclude qsh__fe51_invert`
+- 跳过 Ed25519 的点加 + 域求逆
+- 剩下 28 个 region 仍走 paranoid 路径
+- 如果**这个成功** → bug 在 ge_add / fe51_invert 这两个函数的 lift
+- 如果**这个也失败** → bug 在 sha512_compress 或其他函数
 
-差 17 个 bit. Kyber 签名验证里大量 LDRSW 加载有符号多项式系数, 加载错
-→ 多项式运算偏差 → 签名验签失败.
+MD5: `0efaac7626c602058a3ee549779ca840`
 
-修: 加 `emit_load_sign_extend` 帮手, opc 高位是 1 (signed) 时在 Load
-之后追加 `Shl + AShr` 做符号扩展. 三个 LDR 子族都加上.
+# 怎么测
 
-## Bug 2: W32 Ror / AShr 走 64-bit 路径
-
-之前 Ror 实现:
-```rust
-VOp::Ror => self.alu(instr, |a, b| a.rotate_right((b & 63) as u32)),
-```
-
-`a` 经过 width 掩码后高 32 位 = 0, 然后调 `u64.rotate_right` — 这是
-64 位旋转, 不是 32 位.
-
-例子: W32 a=1 (bit 0 set), 右旋 1 位:
-  正确: 0x80000000 (bit 0 → bit 31)
-  我们: u64 旋转 → 0x8000_0000_0000_0000, 掩到 32 位 = 0 (WRONG)
-
-AShr 类似: 把 W32 当作 i64 算术右移, sign bit 看错位 (i64 sign 在 bit
-63 而不是 bit 31).
-
-修: Ror/AShr handler 都加 `match instr.width` 显式区分 W32 vs W64.
-
-# 改了哪些文件
-
-- `crates/vmp-arch/src/arm64/decode.rs`:
-  + `emit_load_sign_extend` 新函数
-  + 三个 LDR/STR family (unsigned-imm / 9-bit unscaled-pre-post / 寄存器偏移) 调用
-- `crates/vmp-interpreter/src/lib.rs`:
-  + VOp::Ror handler — width-aware
-  + VOp::AShr handler — width-aware
-
-# 覆盖率 (没动)
-
-30 region / 24%.
+1. `libqvmp_runtime.so` 不变 (跟 v54 同), 不用换
+2. 先测 A, 看是否验签成功
+3. 再测 B, 看是否验签成功
+4. 把两个结果都贴回来 — 即使两个都失败, 看日志里 region 序号能再缩小
 
 # 部署
 
-1. **覆盖** /data/local/tmp/libqvmp_runtime.so ← md5 必须对新的
-2. **覆盖** target_app.hardened ← md5 也变了 (因为 lifter 输出变了)
-3. MT 重启
+  cp libqvmp_runtime.so /data/local/tmp/ (已经放过可跳过)
 
-# MD5
+  cp target_app_light.hardened <某处>
+  chmod +x; ./ 或 MT 双击
+  → 看是不是验签 ✓
 
-  target_app.hardened   7c756dcd893c5937bdf8ea6f8b8eee25   ← 更新
-  libqvmp_runtime.so    303006ff0de3a0f0451017c8662cc9ee   ← 更新
+  cp target_app_nogeadd.hardened <某处>
+  chmod +x; ./ 或 MT 双击
+  → 看是不是验签 ✓
+
+# MD5 总表
+
+  libqvmp_runtime.so              303006ff0de3a0f0451017c8662cc9ee  (v54 同)
+  target_app_light.hardened       24266ac5ecfd249f3ac1f974ff8b525b
+  target_app_nogeadd.hardened     0efaac7626c602058a3ee549779ca840
