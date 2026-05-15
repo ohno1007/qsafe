@@ -60,26 +60,29 @@ impl HostBridge for LinuxHost {
     }
 
     fn native_call(&mut self, target: u64, args: &[u64]) -> Result<u64> {
-        // 最小校验 (signal-safe, 不走 alloc):
-        //   - target == 0 / 未对齐 / 低地址 → 不可能是合法函数指针.
-        // 之前的 /proc/self/maps 校验每次 LinuxHost::new 都 cache 空, 第一次
-        // BLR 会去 fs::read_to_string → bionic malloc, 在 SIGTRAP handler 路径
-        // 上重入主线程 malloc 锁, 是 v37/38/40/41 同位置挂的真正元凶之一.
+        // 兼容入口: GPR-only. FP 路径见 `native_call_fp`.
         if target == 0 || target & 3 != 0 || target < 0x1000 {
             return Err(Error::vm("native_call: target 不合法"));
         }
-
-        // ARM64 AAPCS64 支持 x0..x7 全部为整数参数. 固定走 F8 即可,
-        // 多出的参数在被调函数侧会被忽略.
-        type F8 = extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
-        let mut a = [0u64; 8];
+        let mut g = [0u64; 8];
         for (i, v) in args.iter().take(8).enumerate() {
-            a[i] = *v;
+            g[i] = *v;
         }
-        let p = target as *const ();
-        let r = unsafe {
-            (core::mem::transmute::<_, F8>(p))(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7])
-        };
+        let f = [0u64; 8];
+        let (r, _) = unsafe { call_with_fp(target, &g, &f) };
+        Ok(r)
+    }
+
+    fn native_call_fp(
+        &mut self,
+        target: u64,
+        gpr_args: &[u64; 8],
+        fpr_args: &[u64; 8],
+    ) -> Result<(u64, u64)> {
+        if target == 0 || target & 3 != 0 || target < 0x1000 {
+            return Err(Error::vm("native_call_fp: target 不合法"));
+        }
+        let r = unsafe { call_with_fp(target, gpr_args, fpr_args) };
         Ok(r)
     }
 
@@ -122,6 +125,66 @@ impl HostBridge for LinuxHost {
             unsafe { std::slice::from_raw_parts(vaddr as *const u8, 8.min(bytes.len())) });
         Ok(())
     }
+}
+
+/// AAPCS64 函数调用蹦床: 装载 GPR x0..x7 + FP/SIMD v0..v7 (低 64 位) → blr target
+/// → 读回 (x0, d0 低 64 位). 这是替代 `transmute::<_, F8>(p)` 的核心: Rust
+/// 的 `extern "C"` 调用约定只搬 GPR, FP/SIMD 寄存器从来不被显式加载. ImGui /
+/// Vulkan 大量函数把 float / ImVec2 / ImVec4 经 v0..v7 传, 走 transmute 路径
+/// callee 拿到的是 SIGTRAP 触发那一刻 caller 的 stale FP regs — VM 内的浮点
+/// 计算结果完全丢. 用 inline asm 直接装载寄存器, 才能让 VM 算出的 FP 值真正
+/// 落到 callee.
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
+unsafe fn call_with_fp(target: u64, gpr: &[u64; 8], fpr: &[u64; 8]) -> (u64, u64) {
+    let g_ret: u64;
+    let f_ret: u64;
+    let fpr_ptr = fpr.as_ptr();
+    core::arch::asm!(
+        "ldp d0, d1, [{fp}]",
+        "ldp d2, d3, [{fp}, #16]",
+        "ldp d4, d5, [{fp}, #32]",
+        "ldp d6, d7, [{fp}, #48]",
+        "blr {tgt}",
+        "fmov {fret}, d0",
+        fp = in(reg) fpr_ptr,
+        tgt = in(reg) target,
+        fret = lateout(reg) f_ret,
+        inlateout("x0") gpr[0] => g_ret,
+        inlateout("x1") gpr[1] => _,
+        inlateout("x2") gpr[2] => _,
+        inlateout("x3") gpr[3] => _,
+        inlateout("x4") gpr[4] => _,
+        inlateout("x5") gpr[5] => _,
+        inlateout("x6") gpr[6] => _,
+        inlateout("x7") gpr[7] => _,
+        lateout("x8") _, lateout("x9") _, lateout("x10") _, lateout("x11") _,
+        lateout("x12") _, lateout("x13") _, lateout("x14") _, lateout("x15") _,
+        // x18 是 Android/aarch64 平台保留寄存器 (TLS), 不能列入 clobber list.
+        // Android NDK clang 会保证不被调函数破坏它. blr 出去再回来还是同一个值,
+        // 所以也不需要声明.
+        lateout("x16") _, lateout("x17") _, lateout("x30") _,
+        out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+        out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+        out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+        out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+        out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+        out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+        options(nostack),
+    );
+    (g_ret, f_ret)
+}
+
+#[cfg(not(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64")))]
+unsafe fn call_with_fp(target: u64, gpr: &[u64; 8], _fpr: &[u64; 8]) -> (u64, u64) {
+    // 非 aarch64 build (host CLI 测试): 退化为 GPR-only transmute.
+    type F8 = extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+    let p = target as *const ();
+    let r = unsafe {
+        (core::mem::transmute::<_, F8>(p))(
+            gpr[0], gpr[1], gpr[2], gpr[3], gpr[4], gpr[5], gpr[6], gpr[7],
+        )
+    };
+    (r, 0)
 }
 
 #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]

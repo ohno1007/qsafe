@@ -264,6 +264,22 @@ impl<'a> HostBridge for NestedDispatchHost<'a> {
         self.inner.store(addr, v, w)
     }
     fn native_call(&mut self, target: u64, args: &[u64]) -> vmp_core::Result<u64> {
+        // GPR-only 兼容入口 — interpreter 现在走 native_call_fp 不再调这里,
+        // 但保留 fallback 防意外回退.
+        let mut gpr = [0u64; 8];
+        for (i, v) in args.iter().take(8).enumerate() {
+            gpr[i] = *v;
+        }
+        let fpr = [0u64; 8];
+        self.native_call_fp(target, &gpr, &fpr).map(|(g, _)| g)
+    }
+
+    fn native_call_fp(
+        &mut self,
+        target: u64,
+        gpr_args: &[u64; 8],
+        fpr_args: &[u64; 8],
+    ) -> vmp_core::Result<(u64, u64)> {
         // BLR Rn 时 target 可能直接是另一个被保护函数的 trampoline 入口,
         // 或是 `B <trampoline>` 之类的单指令蹦床. 直接调 native 会撞嵌套
         // SIGTRAP; 即便靠 SA_NODEFER 撑住, 多两次信号上下文不便宜.
@@ -272,19 +288,11 @@ impl<'a> HostBridge for NestedDispatchHost<'a> {
         let load_bias = vmp_interpreter::MAIN_EXEC_LOAD_BIAS
             .load(core::sync::atomic::Ordering::Relaxed);
         if load_bias != 0 {
-            let resolved = resolve_to_region(self.blob, load_bias, target);
-            if let Some(region_id) = resolved {
-                let mut gpr = [0u64; 8];
-                let mut fpr = [0u64; 8];
-                for (i, v) in args.iter().take(8).enumerate() {
-                    gpr[i] = *v;
-                }
-                return self
-                    .vm_call_region_fp(region_id as u64, &gpr, &fpr)
-                    .map(|(g, _)| g);
+            if let Some(region_id) = resolve_to_region(self.blob, load_bias, target) {
+                return self.vm_call_region_fp(region_id as u64, gpr_args, fpr_args);
             }
         }
-        self.inner.native_call(target, args)
+        self.inner.native_call_fp(target, gpr_args, fpr_args)
     }
     fn syscall(&mut self, no: u64, args: &[u64]) -> vmp_core::Result<u64> {
         self.inner.syscall(no, args)

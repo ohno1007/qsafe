@@ -123,6 +123,19 @@ pub trait HostBridge {
     fn store(&mut self, addr: u64, value: u64, width: Width) -> Result<()>;
     /// 调用 native 函数指针，最多 8 个参数（按 ABI），返回值 in r0
     fn native_call(&mut self, target: u64, args: &[u64]) -> Result<u64>;
+    /// FP-aware native call: 同时传 GPR V0..V7 + FREG D0..D7（低 64 位），
+    /// 返回 (GPR V0, FREG D0 低 64 位)。AAPCS64 调用约定 GPR/FPR 各自传值；
+    /// 不提供 FP 路径时回退为 `native_call`，丢弃浮点入参/返回。
+    fn native_call_fp(
+        &mut self,
+        target: u64,
+        gpr_args: &[u64; 8],
+        fpr_args: &[u64; 8],
+    ) -> Result<(u64, u64)> {
+        let _ = fpr_args;
+        let r = self.native_call(target, gpr_args)?;
+        Ok((r, 0))
+    }
     /// 系统调用（架构相关）
     fn syscall(&mut self, no: u64, args: &[u64]) -> Result<u64>;
     /// 跨 region 调用（仅 GPR 路径，向后兼容）：BL 跳到另一个被保护函数时触发。

@@ -345,16 +345,25 @@ impl<'a> Interpreter<'a> {
                     let rd = instr.rd;
                     let target_ptr = self.state.regs[rd as usize];
                     trace_native_call(rd, target_ptr, &self.state.regs[..8]);
-                    // 错误路径以前用 format!() 包装上下文 — format! 会触发
-                    // bionic malloc, 在 SIGTRAP handler 重入主线程堆 mutex.
-                    // 直接透传错误, 保留原始信息. 失败信息在 SIGSEGV handler
-                    // 的寄存器 dump 里能找到 rd 对应的值.
-                    let ret = match self.host.as_deref_mut() {
-                        Some(h) => h.native_call(target_ptr, &self.state.regs[..8])?,
+                    // AAPCS64 同时传 GPR (x0..x7) 和 FP/SIMD (v0..v7) 参数. 之前
+                    // 只传 GPR, FP 路径完全丢: hardware V0..V7 仍是 SIGTRAP 触发
+                    // 时 caller 的值 (stale). ImGui/Vulkan 大量 float / ImVec2 /
+                    // ImVec4 经 V0..V7 传参, callee 拿到旧值 → 算出错误指针 /
+                    // vtable → 跑一会必挂. 这是 v37 起 multi-region 全量挂的真因.
+                    let mut gpr = [0u64; 8];
+                    let mut fpr = [0u64; 8];
+                    for i in 0..8 {
+                        gpr[i] = self.state.regs[i];
+                        fpr[i] = self.state.fregs[i] as u64;
+                    }
+                    let (gpr_ret, fpr_ret) = match self.host.as_deref_mut() {
+                        Some(h) => h.native_call_fp(target_ptr, &gpr, &fpr)?,
                         None => return Err(Error::vm("E2")),
                     };
-                    trace_native_ret(target_ptr, ret);
-                    self.state.regs[0] = ret;
+                    trace_native_ret(target_ptr, gpr_ret);
+                    self.state.regs[0] = gpr_ret;
+                    let hi = self.state.fregs[0] & !0xFFFF_FFFF_FFFF_FFFFu128;
+                    self.state.fregs[0] = hi | (fpr_ret as u128);
                 }
                 VOp::CallRegion => {
                     let region_id = instr.imm as u64;
