@@ -9,8 +9,6 @@ use vmp_isa::Width;
 
 pub struct LinuxHost {
     pub allow_raw_memory: bool,
-    /// dispatch_vm 总耗时基准（new 时刻），用于在 sys_exit 时打印 VMP 总损耗
-    pub start: std::time::Instant,
 }
 
 impl Default for LinuxHost {
@@ -20,10 +18,12 @@ impl Default for LinuxHost {
 }
 
 impl LinuxHost {
+    /// signal-safe 构造: no syscall/no TLS access. 不能在 new() 里调
+    /// `Instant::now()` —— bionic clock_gettime 走 vDSO 可能 touch TLS,
+    /// 在 SIGTRAP handler 路径上 reentrant 风险.
     pub fn new() -> Self {
         Self {
             allow_raw_memory: true,
-            start: std::time::Instant::now(),
         }
     }
 }
@@ -84,11 +84,7 @@ impl HostBridge for LinuxHost {
     }
 
     fn syscall(&mut self, no: u64, args: &[u64]) -> Result<u64> {
-        // sys_exit / sys_exit_group 前打印总耗时，方便外部对比 native vs VMP 损耗
-        if no == 93 || no == 94 {
-            let el = self.start.elapsed();
-            eprintln!("[vmp] elapsed: {}us ({}ms)", el.as_micros(), el.as_millis());
-        }
+        // eprintln 路径删除 — signal handler 中不能走 stdio.
         let mut a = [0u64; 6];
         for (i, v) in args.iter().take(6).enumerate() {
             a[i] = *v;

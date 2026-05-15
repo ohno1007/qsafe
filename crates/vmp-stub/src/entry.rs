@@ -127,6 +127,20 @@ pub enum StubError {
 }
 
 /// FP-aware 入口：同时传 GPR + FP 参数，返回 (GPR V0, FREG D0 低 64 位)。
+/// Pre-load the blob's data segments BEFORE entering signal context. Caller
+/// (cdylib qvmp_init) must invoke this once on the main thread, outside any
+/// SIGTRAP handler. Previously the same loop ran inside dispatch_vm_fp behind
+/// a `std::sync::Once`, but `Once` uses a futex internally — if the main
+/// thread is mid-Once-init when SIGTRAP fires and our handler hits the same
+/// Once, we'd block on the futex forever (deadlock).
+pub fn preload_data_segments(blob: &super::StubBlob, host: &mut dyn HostBridge) {
+    for ds in &blob.data_segments {
+        if let Err(e) = host.map_data(ds.vaddr, &ds.bytes, ds.prot) {
+            log::warn!("map_data {:#x} 失败: {}", ds.vaddr, e);
+        }
+    }
+}
+
 /// 单顶层调用（vmp-runtime main）从 `dispatch_vm` 进入；递归（CallRegion）走此路径。
 pub fn dispatch_vm_fp(
     blob: &super::StubBlob,
@@ -135,16 +149,6 @@ pub fn dispatch_vm_fp(
     fpr_args: &[u64; 8],
     host: &mut dyn HostBridge,
 ) -> Result<(u64, u64), StubError> {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        for ds in &blob.data_segments {
-            if let Err(e) = host.map_data(ds.vaddr, &ds.bytes, ds.prot) {
-                log::warn!("map_data {:#x} 失败: {}", ds.vaddr, e);
-            }
-        }
-    });
-
     let r = blob.regions.get(region_id).ok_or(StubError::NoRegion(region_id))?;
     let bc = &blob.bytecode_pool[r.bc_offset as usize..(r.bc_offset + r.bc_len) as usize];
 
@@ -198,18 +202,9 @@ pub fn dispatch_vm(
     args: &[u64],
     host: &mut dyn HostBridge,
 ) -> Result<u64, StubError> {
-    // 第一次进入：把原 ELF 的 .rodata / .data / .bss 等加载到对应 vaddr，
-    // 让 lifter 翻译的 ADR / LDR-literal / 全局访存在 vmp-runtime 进程里也能命中。
-    // 用静态 OnceLock 防止重入时重复 map（递归 dispatch_vm 走 NestedDispatchHost 会触发）。
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        for ds in &blob.data_segments {
-            if let Err(e) = host.map_data(ds.vaddr, &ds.bytes, ds.prot) {
-                log::warn!("map_data {:#x} 失败: {}", ds.vaddr, e);
-            }
-        }
-    });
+    // map_data was previously gated by std::sync::Once here -- moved to
+    // preload_data_segments() invoked from cdylib qvmp_init so the futex
+    // inside Once never gets touched from a signal handler.
 
     let r = blob.regions.get(region_id).ok_or(StubError::NoRegion(region_id))?;
     let bc = &blob.bytecode_pool[r.bc_offset as usize..(r.bc_offset + r.bc_len) as usize];

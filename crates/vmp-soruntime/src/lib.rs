@@ -43,6 +43,14 @@ static INIT_ARRAY_ENTRY: extern "C" fn() = qvmp_init;
 extern "C" fn qvmp_init() {
     if let Some(blob) = discover_and_decrypt_blob() {
         let _ = BLOB.set(blob);
+        // Pre-load the blob's data segments BEFORE installing the SIGTRAP
+        // handler. preload_data_segments calls mmap repeatedly; we want
+        // those done on the main thread (no signal handler shenanigans) so
+        // the previous std::sync::Once-guarded path inside dispatch_vm_fp
+        // can be deleted entirely (Once's futex isn't signal-safe).
+        let blob_ref = BLOB.get().unwrap();
+        let mut host = vmp_stub::linux::LinuxHost::new();
+        vmp_stub::preload_data_segments(blob_ref, &mut host);
         install_sigtrap_handler();
         install_sigsegv_logger();
         log_msg(b"qvmp_runtime: blob loaded, SIGTRAP+SIGSEGV handlers installed\0");
