@@ -76,15 +76,28 @@ pub fn rewrite_elf(
     // 关键：选 vaddr 同时拿到原有 LOAD 的最大 p_align（典型现代 ARM64 binary
     // 是 0x4000 = 16KB）。新 LOAD 必须用同样对齐，否则 16KB 页设备 mmap 会
     // 跟前段最后一页冲突 → bionic 报通用 PIE error。
-    let (new_vaddr_base, page_align_u64) = next_load_vaddr(&loaded.raw)?;
+    let (next_load_vaddr_val, page_align_u64) = next_load_vaddr(&loaded.raw)?;
     let page_align = page_align_u64 as usize;
 
     // ---- 1. 用 identity mapping (p_offset == p_vaddr) 放新 LOAD ----
-    // 之前用 file_offset = next-page (例如 0x298000) + vaddr = 0x2ac000，差
-    // 0x14000。Android 14+ 上某些 kernel/linker 路径用 `load_bias + e_phoff`
-    // 算 AT_PHDR (回退分支)，把 PHDR.p_offset 当 vaddr 用。这种情况下 vaddr
-    // 必须等于 file offset 否则 PHDR 读到错地方 → 通用 PIE error。
-    // 直接把文件 pad 到 new_vaddr_base，让接下来追加的内容 file_off == vaddr。
+    // Android 14+ 某些 kernel/linker 路径用 `load_bias + e_phoff` 算 AT_PHDR
+    // (回退分支)，把 PHDR.p_offset 当 vaddr 用。所以新 LOAD 必须满足
+    // file_off == vaddr.
+    //
+    // 但: 原 ELF 末尾常有 .debug_* / .strtab / section header table 等
+    // unloaded 内容把文件撑大. 如果 next_load_vaddr (= max(load_vaddr+memsz),
+    // 页对齐) 小于 out.len(), 直接 append 就会让 trampoline 落在
+    // file_off > new_vaddr_base 的位置 — LOAD segment 把 0x70000..0xC4000
+    // 映射成 RX, 但其中前半截是 stale debug bytes; 任何被 patch 的
+    // `B trampoline=0x70000+N*16` 都跳到 debug 数据当指令解 → SIGILL.
+    //
+    // 修正: new_vaddr_base 取 max(next_load_vaddr, ceil(file_size, page))
+    // — 两个约束都满足: file_off==vaddr + 不撞已有文件内容.
+    let aligned_file_end = {
+        let mask = page_align_u64 - 1;
+        ((out.len() as u64) + mask) & !mask
+    };
+    let new_vaddr_base = next_load_vaddr_val.max(aligned_file_end);
     let new_segment_off = new_vaddr_base as usize;
     while out.len() < new_segment_off {
         out.push(0);
