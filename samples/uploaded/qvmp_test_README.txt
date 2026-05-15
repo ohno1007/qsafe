@@ -1,51 +1,73 @@
-qvmp_test.zip — v48 探针 + global_asm 重写 FP 调用蹦床
-==========================================================
+target_app 加固结果
+==========================
 
-# v47 的问题
+# 改动 (v2 blob)
 
-v47 silently 挂 (no logs). 但 .so 看着正常, 符号完整, 程序段对.
-怀疑两个方向:
-  A) inline asm! 的寄存器分配跟 BIND_NOW 之类的 .so 链接特性互冲
-  B) qvmp_init 根本没跑到 (dlopen 失败 / 文件没刷)
+**每个被保护函数一台不同的 VM** — 不再共享一份 IsaSpec.
+opcode 排列 / 寄存器置换 / 加密 key / 立即数旋转, 全部一region一份.
+拆解 funcA 的 dispatch table 套不到 funcB. seed 派生:
+  spec_seed = cfg.seed * splitmix + region_idx * splitmix + func.vaddr
+同 seed + 同二进制 ⇒ 可复现.
 
-v48 改两处帮排查:
+# 覆盖率 (paranoid level)
 
-1. **`crates/vmp-soruntime/src/lib.rs`** 在 qvmp_init 开头加一行**不经
-   LOG_FLAG 控制**的 raw_write `[qvmp] qvmp_init: enter`. 这是探针:
-     - 看到这行 → .init_array 跑了, .so 链接 OK; 然后 LOG_FLAG 也设上,
-       后续 log_msg 才会出来.
-     - 没看到 → dlopen 没跑成功 (deploy 没刷 .so / 路径不对 / .so 不兼容).
+| 阶段 | 数量 | 说明 |
+|------|------|------|
+| ELF 函数符号 | 125 | 全部候选 |
+| Lift 成功 | 51 | NEON / atomics 复杂指令 lifter 暂未覆盖 |
+| skip_traps drop | 74 | 含未支持指令 → 留原生 |
+| cascade drop | 30 | 引用了 dropped region 的级联剔除 |
+| **最终 VMP** | **21** | **16.8% 函数被虚拟化** |
 
-2. **`crates/vmp-stub/src/linux.rs`** 把 call_with_fp 从 `core::arch::asm!`
-   inline 改成 `core::arch::global_asm!` 写一个 naked 函数 `qvmp_call_with_fp`.
-   Rust 寄存器分配器完全不介入, 整个 ABI 由我们汇编直接定义:
-     x0 = target, x1 = gpr_ptr, x2 = fpr_ptr  (入)
-     x0, x1 = (gpr_ret, fpr_ret)              (出)
+被保护的几个关键函数 (从 entry 看):
+  KeccakF1600_StatePermute, mlkem_kdf, sha3 系列, ...
+即核心加密热点.
 
-   这样 inline asm 跟 Rust register coloring 的任何潜在冲突彻底消除.
+剩下 84% 是因为这是 Kyber/Keccak 量子安全密码学库, 大量用 NEON
+向量指令 (`v0.16b`, `tbl`, `xar`, `bcax` 等), 这些我们的 ARM64
+lifter 还没覆盖. 想拉高覆盖率得给 lifter 加 NEON 指令支持.
 
-# 包
+# 单文件 ELF 现状
 
-48_full.hardened: standard 534 region 全量, embed-runtime, 单文件双击.
-libqvmp_runtime.so: 配套 .so (此 build 不依赖, 但还是放着).
+**这个 target_app 没法做单文件包** — 它的 PLT 里没有 `dlopen` import.
+bootstrap stub 需要 dlopen 调用嵌入式 .so, 没 PLT 表里现成的 dlopen
+就必须做 ELF 大手术 (新增 .dynsym / .dynstr / .rela.plt / .plt /
+.got.plt 条目). 这工作量我先不展开.
+
+所以这次仍走**两文件** DT_NEEDED 部署. Android 的 dynamic linker
+在 main exec 跑起来前会自动 dlopen DT_NEEDED 引用, 等价效果.
 
 # 部署
 
-  1. 48_full.hardened → 任意位置
-  2. MT 双击
+  1. `libqvmp_runtime.so` → `/data/local/tmp/` (md5 必须对)
+  2. `target_app.hardened` → 任意位置, MT 双击 / `chmod +x && ./`
 
-# 预期
+# 单元测试
 
-A) 看到 `[qvmp] qvmp_init: enter` 一行就够告诉我 .so 加载了; 后面再看
-   能不能看到 `handler entry #1` 等正常日志.
-B) 如果 v48 跑得跟 v46 一样 (从 handler #1 一路 log 到 handler #128 后
-   SIGSEGV), 说明 FP 修复也没生效 — 我的诊断方向错了.
-C) 如果 v48 一路 log 但比 v46 跑得远 (handler #N 远超 128), 说明 FP fix
-   起作用了.
-D) 如果 v48 还是 `[qvmp] qvmp_init: enter` 之后立刻挂, 那是我的 asm 调
-   用约定有问题, 已经可以缩到 call_with_fp.
+`cargo test -p vmp-stub`: 10/12 通过.
+失败的 2 个是 fixture-pinned (要某 Windows NDK 的二进制在
+0x204234 / 0x20419c 这种硬编 vaddr) - 跟我的改动无关, main 分支
+也挂.
 
 # MD5
 
-  48_full.hardened    589b9143a2ec06dcb22930a44715d5f8
-  libqvmp_runtime.so  db1a3a437a70c20742dca8e01fe1a632
+  target_app (原始)      2fd4c6b903fa93c041056f35750fc4e0
+  target_app.hardened    5e3d2eb0f5a1d33247083acb0b83f3c4
+  libqvmp_runtime.so     e3f007bb57764cfbe37c493fbda7736f
+
+# 后续改进方向
+
+1. **lift NEON 指令** → 覆盖率到 60-80%
+2. **dlopen PLT 注入** → 真正的单文件 ELF (即使原 binary 没 dlopen)
+3. handler_duplication=4 + 21 个独立 IsaSpec = 21 × 4 × 52 ≈ 4400 个
+   独立 (opcode, region) 组合 — 静态反编译要分别学每个 region 的
+   dispatch table
+
+# 期望
+
+device 上跑 target_app.hardened, 应该看到:
+  [qvmp] qvmp_init: enter
+  [qvmp] qvmp_runtime: blob loaded, SIGTRAP+SIGSEGV handlers installed
+  [qvmp] qvmp_runtime: handler entry #1
+  [qvmp] qvmp_runtime: dispatching region=N  (N 是真正首先调用的被保护函数)
+  ...
