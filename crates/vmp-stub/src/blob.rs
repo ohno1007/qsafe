@@ -1,26 +1,35 @@
 //! StubBlob 二进制格式
 //!
+//! v2 layout:
 //! ```text
 //!   magic[4]    = "QVMP"
-//!   version: u16 = 1
-//!   isa_len: u32
-//!   isa_bytes: ...     (IsaSpec 序列化)
+//!   version: u16 = 2
+//!   spec_count: u32
+//!   for each spec: isa_len: u32, isa_bytes: ... (IsaSpec 序列化)
 //!   region_count: u32
 //!   region[0..n]:
 //!      patch_addr: u64
 //!      patch_len:  u32
 //!      bc_offset:  u32
 //!      bc_len:     u32
+//!      spec_idx:   u32        ← v2 加: 每个 region 指向自己的 IsaSpec
 //!   bytecode_pool_len: u32
 //!   bytecode_pool: ...
+//!   entry_region: u32
+//!   data_segments: ...
 //! ```
+//!
+//! v2 与 v1 不兼容：v2 把"一个全局 IsaSpec"换成"每个 region 一个独立 IsaSpec"，
+//! 静态分析 region A 拿到的 opcode→VOp 表完全不能套用到 region B。每个被保护
+//! 函数有自己的 opcode 排列、寄存器置换、加密 key、立即数旋转, 等于每个函数
+//! 跑在一台**不同的虚拟机**上。
 
 use vmp_core::{Error, Result};
 use vmp_isa::{HandlerVariant, IsaSpec, OpEncoding};
 use std::collections::HashMap;
 
 pub const MAGIC: &[u8; 4] = b"QVMP";
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 #[derive(Debug, Clone)]
 pub struct StubRegion {
@@ -28,6 +37,9 @@ pub struct StubRegion {
     pub patch_len: u32,
     pub bc_offset: u32,
     pub bc_len: u32,
+    /// 指向 `StubBlob.specs` 中的 IsaSpec 索引。同一进程内, 每个 region 可独立选
+    /// 自己的 ISA — 一段 bytecode 必须用自己 region 的 spec 解才能跑.
+    pub spec_idx: u32,
 }
 
 /// 原 ELF 加载段的拷贝，dispatch_vm 启动时通过 host.map_data 映射到对应 vaddr。
@@ -42,7 +54,9 @@ pub struct DataSegment {
 
 #[derive(Debug, Clone)]
 pub struct StubBlob {
-    pub spec: IsaSpec,
+    /// 每个 region 拿自己 spec_idx 对应的 spec. `specs[0]` 同时作为 v1
+    /// 兼容入口 — 旧测试代码读 `blob.spec` 时拿到第一个.
+    pub specs: Vec<IsaSpec>,
     pub regions: Vec<StubRegion>,
     pub bytecode_pool: Vec<u8>,
     /// 程序入口 region 索引（通常是 `_start` / `main` 所在 region）。
@@ -52,14 +66,30 @@ pub struct StubBlob {
     pub data_segments: Vec<DataSegment>,
 }
 
+impl StubBlob {
+    /// 拿 region_idx 对应 region 的 IsaSpec.
+    pub fn spec_for_region(&self, region_idx: usize) -> &IsaSpec {
+        let r = &self.regions[region_idx];
+        &self.specs[r.spec_idx as usize]
+    }
+
+    /// v1 兼容入口: 默认 spec (第一个). 老测试代码直接读 `blob.spec`.
+    pub fn spec(&self) -> &IsaSpec {
+        &self.specs[0]
+    }
+}
+
 pub fn pack_blob(blob: &StubBlob) -> Vec<u8> {
     let mut out = Vec::with_capacity(1024 + blob.bytecode_pool.len());
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
 
-    let isa = pack_isa(&blob.spec);
-    out.extend_from_slice(&(isa.len() as u32).to_le_bytes());
-    out.extend_from_slice(&isa);
+    out.extend_from_slice(&(blob.specs.len() as u32).to_le_bytes());
+    for spec in &blob.specs {
+        let isa = pack_isa(spec);
+        out.extend_from_slice(&(isa.len() as u32).to_le_bytes());
+        out.extend_from_slice(&isa);
+    }
 
     out.extend_from_slice(&(blob.regions.len() as u32).to_le_bytes());
     for r in &blob.regions {
@@ -67,6 +97,7 @@ pub fn pack_blob(blob: &StubBlob) -> Vec<u8> {
         out.extend_from_slice(&r.patch_len.to_le_bytes());
         out.extend_from_slice(&r.bc_offset.to_le_bytes());
         out.extend_from_slice(&r.bc_len.to_le_bytes());
+        out.extend_from_slice(&r.spec_idx.to_le_bytes());
     }
     out.extend_from_slice(&(blob.bytecode_pool.len() as u32).to_le_bytes());
     out.extend_from_slice(&blob.bytecode_pool);
@@ -97,11 +128,19 @@ pub fn unpack_blob(data: &[u8]) -> Result<StubBlob> {
     }
     let ver = u16::from_le_bytes(take(&mut p, 2)?.try_into().unwrap());
     if ver != VERSION {
-        return Err(Error::parse(format!("stub blob 版本不支持: {}", ver)));
+        return Err(Error::parse(format!(
+            "stub blob 版本不支持: {} (需 {})",
+            ver, VERSION
+        )));
     }
-    let isa_len = u32::from_le_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
-    let isa_bytes = take(&mut p, isa_len)?.to_vec();
-    let spec = unpack_isa(&isa_bytes)?;
+
+    let spec_count = u32::from_le_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
+    let mut specs = Vec::with_capacity(spec_count);
+    for _ in 0..spec_count {
+        let isa_len = u32::from_le_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
+        let isa_bytes = take(&mut p, isa_len)?.to_vec();
+        specs.push(unpack_isa(&isa_bytes)?);
+    }
 
     let region_count = u32::from_le_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
     let mut regions = Vec::with_capacity(region_count);
@@ -110,22 +149,22 @@ pub fn unpack_blob(data: &[u8]) -> Result<StubBlob> {
         let patch_len = u32::from_le_bytes(take(&mut p, 4)?.try_into().unwrap());
         let bc_offset = u32::from_le_bytes(take(&mut p, 4)?.try_into().unwrap());
         let bc_len = u32::from_le_bytes(take(&mut p, 4)?.try_into().unwrap());
+        let spec_idx = u32::from_le_bytes(take(&mut p, 4)?.try_into().unwrap());
         regions.push(StubRegion {
             patch_addr,
             patch_len,
             bc_offset,
             bc_len,
+            spec_idx,
         });
     }
     let pool_len = u32::from_le_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
     let bytecode_pool = take(&mut p, pool_len)?.to_vec();
-    // entry_region 字段是 v1 后兼容性扩展：找不到（旧 blob）时默认 0
     let entry_region = if data.len() >= p + 4 {
         u32::from_le_bytes(take(&mut p, 4)?.try_into().unwrap())
     } else {
         0
     };
-    // data_segments 字段是 v1.1 后扩展
     let mut data_segments = Vec::new();
     if data.len() >= p + 4 {
         let n = u32::from_le_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
@@ -139,7 +178,7 @@ pub fn unpack_blob(data: &[u8]) -> Result<StubBlob> {
     }
 
     Ok(StubBlob {
-        spec,
+        specs,
         regions,
         bytecode_pool,
         entry_region,

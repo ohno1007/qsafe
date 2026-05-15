@@ -53,6 +53,7 @@ fn arm64_fpdemo_full_path() {
             patch_len: f.size as u32,
             bc_offset: pool.len() as u32,
             bc_len: bc.len() as u32,
+            spec_idx: 0,
         });
         pool.extend_from_slice(&bc);
     }
@@ -63,7 +64,7 @@ fn arm64_fpdemo_full_path() {
     extract_data_segs(&obj.raw, &mut data_segments);
 
     let blob = StubBlob {
-        spec,
+        specs: vec![spec],
         regions,
         bytecode_pool: pool,
         entry_region: entry as u32,
@@ -103,12 +104,13 @@ fn arm64_fpdemo_scale_returns_40() {
     let bc = cg.encode(&funcs[0].ir).unwrap();
 
     let blob = StubBlob {
-        spec,
+        specs: vec![spec],
         regions: vec![StubRegion {
             patch_addr: scale_sym.vaddr,
             patch_len: scale_sym.size as u32,
             bc_offset: 0,
             bc_len: bc.len() as u32,
+            spec_idx: 0,
         }],
         bytecode_pool: bc,
         entry_region: 0,
@@ -122,7 +124,7 @@ fn arm64_fpdemo_scale_returns_40() {
     // 解决方案：手工创建一个 Interpreter，自己塞 fregs 再跑 run。
     use vmp_interpreter::Interpreter;
     let bc_decrypt_view = &blob.bytecode_pool[..];
-    let mut interp = Interpreter::new(&blob.spec, bc_decrypt_view).with_host(&mut host).with_iv_salt(0);
+    let mut interp = Interpreter::new(blob.spec(), bc_decrypt_view).with_host(&mut host).with_iv_salt(0);
     // 给 SP 一块栈（避免任何潜在 prologue 操作；scale 其实是 leaf）
     let mut vm_stack: Vec<u64> = vec![0u64; 8192];
     let stack_top = (vm_stack.as_mut_ptr() as u64).wrapping_add(64 * 1024);
@@ -178,12 +180,13 @@ fn arm64_multifn_full_protect_path() {
             patch_len: func.size as u32,
             bc_offset: pool.len() as u32,
             bc_len: bc.len() as u32,
+            spec_idx: 0,
         });
         pool.extend_from_slice(&bc);
     }
 
     let blob = StubBlob {
-        spec,
+        specs: vec![spec],
         regions,
         bytecode_pool: pool,
         entry_region: 0,
@@ -255,12 +258,13 @@ fn arm64_multifn_sum_of_squares() {
     let bc = cg.encode(&ir).unwrap();
 
     let blob = StubBlob {
-        spec,
+        specs: vec![spec],
         regions: vec![StubRegion {
             patch_addr: 0x204234,
             patch_len: 68,
             bc_offset: 0,
             bc_len: bc.len() as u32,
+            spec_idx: 0,
         }],
         bytecode_pool: bc,
         entry_region: 0,
@@ -300,12 +304,13 @@ fn arm64_mov_imm_ret_returns_42() {
         let bc = cg.encode(&ir).unwrap();
 
         let blob = StubBlob {
-            spec,
+            specs: vec![spec],
             regions: vec![StubRegion {
                 patch_addr: 0x1000,
                 patch_len: bytes.len() as u32,
                 bc_offset: 0,
                 bc_len: bc.len() as u32,
+            spec_idx: 0,
             }],
             bytecode_pool: bc,
             entry_region: 0,
@@ -445,12 +450,13 @@ fn arm64_real_sumsq_returns_385() {
     let bc = cg.encode(&ir).unwrap();
 
     let blob = StubBlob {
-        spec,
+        specs: vec![spec],
         regions: vec![StubRegion {
             patch_addr: 0x20419c,
             patch_len: bytes.len() as u32,
             bc_offset: 0,
             bc_len: bc.len() as u32,
+            spec_idx: 0,
         }],
         bytecode_pool: bc,
         entry_region: 0,
@@ -542,12 +548,13 @@ fn arm64_simulate_cli_protect_path() {
     }
 
     let mut blob = StubBlob {
-        spec,
+        specs: vec![spec],
         regions: vec![StubRegion {
             patch_addr: 0x20419c,
             patch_len: bytes.len() as u32,
             bc_offset: 0,
             bc_len: bc.len() as u32,
+            spec_idx: 0,
         }],
         bytecode_pool: bc,
         entry_region: 0,
@@ -573,7 +580,7 @@ fn isaspec_pack_unpack_roundtrip() {
     let spec1 = IsaRandomizer::new(0xDEADBEEF_u64.wrapping_add(0x20419c), 2, true).build();
     // 直接 pack / unpack ISA spec（通过 StubBlob 间接）
     let blob1 = StubBlob {
-        spec: spec1.clone(),
+        specs: vec![spec1.clone()],
         regions: vec![],
         bytecode_pool: vec![],
         entry_region: 0,
@@ -581,7 +588,7 @@ fn isaspec_pack_unpack_roundtrip() {
     };
     let packed = pack_blob(&blob1);
     let blob2 = unpack_blob(&packed).expect("unpack");
-    let spec2 = &blob2.spec;
+    let spec2 = blob2.spec();
 
     let mut diffs = Vec::new();
     if spec1.fingerprint != spec2.fingerprint { diffs.push(format!("fingerprint mismatch")); }
@@ -621,8 +628,8 @@ fn arm64_real_sumsq_via_packed_blob() {
         "blob: regions={} pool={} encrypt={} opcodes={}",
         blob.regions.len(),
         blob.bytecode_pool.len(),
-        blob.spec.encrypt,
-        blob.spec.op_table.len()
+        blob.spec().encrypt,
+        blob.spec().op_table.len()
     );
 
     let mut host = TraceHost {
@@ -702,12 +709,13 @@ fn run_arm64(bytes: &[u8], base: u64, args: &[u64; 8], seed: u64, encrypt: bool)
     let mut cg = CodeGen::new(&spec, seed.wrapping_add(1), 0, 2);
     let bc = cg.encode(&ir).unwrap();
     let blob = StubBlob {
-        spec,
+        specs: vec![spec],
         regions: vec![StubRegion {
             patch_addr: base,
             patch_len: bytes.len() as u32,
             bc_offset: 0,
             bc_len: bc.len() as u32,
+            spec_idx: 0,
         }],
         bytecode_pool: bc,
         entry_region: 0,

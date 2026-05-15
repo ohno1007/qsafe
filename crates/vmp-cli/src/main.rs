@@ -196,8 +196,13 @@ fn main() -> anyhow::Result<()> {
             cfg.include_funcs.extend(only);
             cfg.exclude_funcs.extend(exclude);
 
-            let spec = IsaRandomizer::new(cfg.seed, cfg.handler_duplication, cfg.encrypt_bytecode).build();
-            log::info!("ISA 指纹: {}", hex::encode(spec.fingerprint));
+            // v2 blob: 一个 region 一个 IsaSpec. 第 0 个 spec 仍由 cfg.seed
+            // 派生作为"默认"; 各 region 自己的 spec 在第三遍 codegen 时按需生成
+            // (那时已经知道最终 region 数 — 经过 cascade-drop 的). 这里先做个
+            // 占位, 真正的 specs 在下面循环里建.
+            let default_spec =
+                IsaRandomizer::new(cfg.seed, cfg.handler_duplication, cfg.encrypt_bytecode).build();
+            log::info!("默认 ISA 指纹: {}", hex::encode(default_spec.fingerprint));
 
             // 第一遍：lift 每个候选函数到 IR（branch imm 仍是绝对地址）。
             let mut funcs: Vec<FunctionRegion> = Vec::new();
@@ -369,12 +374,30 @@ fn main() -> anyhow::Result<()> {
                 );
             }
 
-            // 第三遍：每个 region 独立 codegen，用 region_idx 作 IV salt。
+            // 第三遍：每个 region 独立 codegen，并且**每个 region 用它自己的
+            // IsaSpec** — opcode 映射, 寄存器置换, 加密 key, 立即数旋转全独立.
+            // 静态分析者拆解 region A 的 dispatch table 完全不能套到 region B 上;
+            // 等于每个被保护函数运行在一台不同的虚拟机里.
+            //
+            // 每个 region 的 spec 由 (cfg.seed ⊕ region_idx ⊕ func.vaddr) 派生,
+            // 复现性: 同一 seed + 同一二进制 ⇒ 同一份 spec 集.
+            let mut specs: Vec<vmp_isa::IsaSpec> = Vec::with_capacity(funcs.len());
             let mut pool: Vec<u8> = Vec::new();
             let mut regions: Vec<StubRegion> = Vec::new();
             for (region_idx, func) in funcs.iter().enumerate() {
+                let spec_seed = cfg
+                    .seed
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add((region_idx as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9))
+                    .wrapping_add(func.vaddr);
+                let region_spec = IsaRandomizer::new(
+                    spec_seed,
+                    cfg.handler_duplication,
+                    cfg.encrypt_bytecode,
+                )
+                .build();
                 let mut cg = CodeGen::new(
-                    &spec,
+                    &region_spec,
                     cfg.seed.wrapping_add(func.vaddr),
                     if cfg.insert_junk { 25 } else { 0 },
                     cfg.handler_duplication,
@@ -388,7 +411,13 @@ fn main() -> anyhow::Result<()> {
                     patch_len: func.size as u32,
                     bc_offset: bc_offset as u32,
                     bc_len: bc.len() as u32,
+                    spec_idx: region_idx as u32,
                 });
+                specs.push(region_spec);
+            }
+            // 没有 region 时仍要塞一个 spec 作为默认入口
+            if specs.is_empty() {
+                specs.push(default_spec);
             }
 
             // 选择入口 region：优先匹配 ELF 真实 entry point，否则 _start / main，否则 0。
@@ -417,7 +446,7 @@ fn main() -> anyhow::Result<()> {
             );
 
             let blob = StubBlob {
-                spec,
+                specs,
                 regions,
                 bytecode_pool: pool,
                 entry_region,
@@ -544,9 +573,9 @@ fn main() -> anyhow::Result<()> {
             let raw = fs::read(&blob)?;
             let b = unpack_blob(&raw)?;
             println!("magic = QVMP v1");
-            println!("ISA fingerprint = {}", hex::encode(b.spec.fingerprint));
-            println!("encrypt = {}", b.spec.encrypt);
-            println!("opcode 总数 = {}", b.spec.op_table.len());
+            println!("ISA fingerprint = {}", hex::encode(b.spec().fingerprint));
+            println!("encrypt = {}", b.spec().encrypt);
+            println!("opcode 总数 = {}", b.spec().op_table.len());
             println!("regions = {}", b.regions.len());
             for (i, r) in b.regions.iter().enumerate() {
                 println!(

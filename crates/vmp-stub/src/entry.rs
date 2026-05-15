@@ -177,7 +177,8 @@ pub fn dispatch_vm_fp(
 
     let result = (|| {
         let mut nested = NestedDispatchHost { blob, inner: host };
-        let mut interp = Interpreter::new(&blob.spec, bc)
+        let spec = blob.spec_for_region(region_id);
+        let mut interp = Interpreter::new(spec, bc)
             .with_host(&mut nested)
             .with_iv_salt(region_id as u64);
         interp.state.regs[31] = initial_sp;
@@ -234,7 +235,8 @@ pub fn dispatch_vm(
 
     let result = (|| {
         let mut nested = NestedDispatchHost { blob, inner: host };
-        let mut interp = Interpreter::new(&blob.spec, bc)
+        let spec = blob.spec_for_region(region_id);
+        let mut interp = Interpreter::new(spec, bc)
             .with_host(&mut nested)
             .with_iv_salt(region_id as u64);
         interp.state.regs[31] = initial_sp;

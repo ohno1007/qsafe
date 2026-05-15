@@ -86,7 +86,10 @@ impl ProtectConfig {
                 seed: 0xFEED_FACE_DEAD_BEEF,
                 encrypt_bytecode: true,
                 insert_junk: true,
-                handler_duplication: 8,
+                // duplication=4 ≈ 208/220 opcode cap. Paranoid 的额外混淆来自
+                // **每个 region 独立 IsaSpec** (v2 blob): 同一 VOp 在 funcA 跟
+                // funcB 的 opcode 完全不同, 比单纯把 variants 拉到 8 强得多.
+                handler_duplication: 4,
                 anti_debug: true,
                 anti_vm: true,
                 include_funcs: vec![],
