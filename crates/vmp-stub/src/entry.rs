@@ -30,9 +30,13 @@ use vmp_isa::Width;
 // ImGui/C++ 容器算法 (std::vector::resize, std::sort, 字符串拼接) 嵌套调用
 // 轻松 20-30 层. 1MB 池 / 80KB 每 frame 只够 12 层 → "frame pool exhausted"
 // 错误 (Eb3) 是 v37-v44 全量挂的真正 root cause. 升 16MB → ~200 层够用.
-const POOL_SIZE: usize = 16 * 1024 * 1024;
+//
+// v52 又遇到 BC_SCRATCH 不够: 量子密码学 region 经 lifter + junk + 多 variant
+// 之后 bytecode 能涨到 ~140KB. 16KB scratch 直接溢出. 拉到 256KB, frame 总
+// 320KB; 配合 pool 32MB ⇒ ~100 层递归 headroom.
+const POOL_SIZE: usize = 32 * 1024 * 1024;
 const VM_STACK_BYTES: usize = 64 * 1024;
-const BC_SCRATCH_BYTES: usize = 16 * 1024;
+const BC_SCRATCH_BYTES: usize = 256 * 1024;
 const FRAME_BYTES: usize = VM_STACK_BYTES + BC_SCRATCH_BYTES;
 
 static POOL_BASE: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
