@@ -195,17 +195,44 @@ pub fn rewrite_elf(
         )?;
     }
 
-    // ---- 5. 在每个 region 的 patch_addr 写 B <trampoline> ----
+    // ---- 5. 在每个 region 的 patch_addr 写 trampoline 跳转 ----
+    // BTI 兼容: 如果二进制启用了 ARMv8.5 Branch Target Identification (每个
+    // indirect-call 目标必须有 `bti c/j/jc` 或 `paciasp` 等 PAC 指令), 用
+    // 一条裸 `B trampoline` 覆盖函数入口时, 凡是通过 BLR/BR 到该函数的调用
+    // 都会在落地那条 B 上触发 Branch Target Exception → kernel SIGILL.
+    //
+    // 解决: 用 2 条指令 patch — `bti jc` (HINT, allow both BR 和 BLR landing)
+    // 后面跟 `B trampoline`. 函数入口至少 8 字节才能完整 patch; 否则 fallback
+    // 单 `B trampoline` (BTI-less 二进制路径).
     let mut patched_entries = 0usize;
     if opts.write_entry_trampolines {
+        // 判断原 ELF 是否带 BTI: 简单方法 — 看任何函数入口是否有 `bti c/j/jc`
+        // 或 `paciasp/pacibsp` 指令. 一处即代表整个 .text 走 BTI 模式
+        // (BTI 是 page-attribute, ld 通常全段一致).
+        let bti_enabled = detect_bti_protection(&loaded.raw);
+        let bti_jc_inst: u32 = 0xD50324DF; // BTI jc — allow both call/jump landing
         for (idx, region) in blob.regions.iter().enumerate() {
             let target_vaddr = new_segment_vaddr + (idx * 16) as u64;
             let file_off = match vaddr_to_file_off(&loaded.raw, region.patch_addr) {
                 Some(o) => o,
                 None => continue,
             };
-            let rel = (target_vaddr as i64) - (region.patch_addr as i64);
-            // 偏移可能溢出 ±128MB；超出时跳过（rewriter 还原成只嵌入不 patch）。
+
+            // 估算可以写多少字节: min(patch_len, 8 if BTI else 4)
+            let avail = region.patch_len as usize;
+            let want = if bti_enabled && avail >= 8 { 8 } else { 4 };
+            if file_off + want > out.len() {
+                continue;
+            }
+
+            let (bti_prefix_offset, b_inst_addr) = if want == 8 {
+                // 第二条指令位置: patch_addr + 4
+                (0usize, region.patch_addr + 4)
+            } else {
+                (0, region.patch_addr)
+            };
+
+            let rel = (target_vaddr as i64) - (b_inst_addr as i64);
             let b_inst = match encode_b(rel as i32) {
                 Ok(v) => v,
                 Err(_) => {
@@ -216,10 +243,16 @@ pub fn rewrite_elf(
                     continue;
                 }
             };
-            if file_off + 4 > out.len() {
-                continue;
+
+            if want == 8 {
+                LittleEndian::write_u32(
+                    &mut out[file_off + bti_prefix_offset..file_off + bti_prefix_offset + 4],
+                    bti_jc_inst,
+                );
+                LittleEndian::write_u32(&mut out[file_off + 4..file_off + 8], b_inst);
+            } else {
+                LittleEndian::write_u32(&mut out[file_off..file_off + 4], b_inst);
             }
-            LittleEndian::write_u32(&mut out[file_off..file_off + 4], b_inst);
             patched_entries += 1;
         }
     }
@@ -665,6 +698,53 @@ fn next_load_vaddr(elf_bytes: &[u8]) -> Result<(u64, u64)> {
 }
 
 /// 把 patch_addr (虚拟地址) 转成原 ELF 文件内的字节偏移。
+/// 嗅探 ELF 是否启用 ARMv8.5 BTI 保护.
+///
+/// 启发式: 扫前若干条 .text 指令, 看到任何 `bti c/j/jc` 或 `paciasp/pacibsp`
+/// 即认为整段开启了 GP (Guarded Page) 属性, 所有 indirect-call 落地点必须
+/// 是 BTI / PAC 指令. 这是 ld + binutils 在链接器侧识别 `.note.gnu.property`
+/// 后给每段加的 PROT_BTI.
+///
+/// 准确判定要查 PT_GNU_PROPERTY note 的 AArch64 Feature 1 bit, 但实践上
+/// 函数入口处看一眼就够 — false positive 几乎不存在.
+fn detect_bti_protection(elf_bytes: &[u8]) -> bool {
+    use byteorder::{ByteOrder, LittleEndian};
+    use goblin::elf::program_header::{PF_X, PT_LOAD};
+    use goblin::elf::Elf;
+
+    let elf = match Elf::parse(elf_bytes) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    for ph in &elf.program_headers {
+        if ph.p_type != PT_LOAD || (ph.p_flags & PF_X) == 0 {
+            continue;
+        }
+        let off = ph.p_offset as usize;
+        let len = ph.p_filesz as usize;
+        if off + len > elf_bytes.len() {
+            continue;
+        }
+        let mut i = 0;
+        while i + 4 <= len.min(0x4000) {
+            let inst = LittleEndian::read_u32(&elf_bytes[off + i..off + i + 4]);
+            // BTI 编码: 0xD503_24XX 其中 XX 高 3 位 = 001 (c=0x5F, j=0x9F, jc=0xDF)
+            // PAC: 0xD503_233F (paciasp), 0xD503_237F (pacibsp), 0xD503_2BBF (autiasp).
+            // 都属于 HINT 系列 0xD503_2X 1F 共性.
+            if inst == 0xD503245F   // bti c
+                || inst == 0xD503249F // bti j
+                || inst == 0xD50324DF // bti jc
+                || inst == 0xD503233F // paciasp
+                || inst == 0xD503237F // pacibsp
+            {
+                return true;
+            }
+            i += 4;
+        }
+    }
+    false
+}
+
 fn vaddr_to_file_off(elf_bytes: &[u8], vaddr: u64) -> Option<usize> {
     use goblin::elf::Elf;
     let elf = Elf::parse(elf_bytes).ok()?;

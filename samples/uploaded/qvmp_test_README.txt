@@ -1,113 +1,91 @@
-target_app v50: SIGILL handler + lifter 大扩 + 24% 覆盖
-=============================================================
+target_app v51: BTI 修复 ← 这才是 SIGILL 真因
+=================================================
 
-# 上次现场 (v49)
-
-```
-[qvmp] qvmp_init: enter
-[qvmp] qvmp_runtime: rodata decrypted in place
-[qvmp] qvmp_runtime: blob loaded, SIGTRAP+SIGSEGV handlers installed
-请输入卡密：11
-==> 接口地址 : https://api.qsafehub.com
-[1] 服务端身份 ✓（已验签）
-Illegal instruction
-[进程已结束 (error 132) - 按回车关闭]
-```
-
-关键观察:
-- **完全没有 `handler entry #N` 日志** → v49 protect 的 21 个函数走的
-  路径根本没被命中 (license 验证用的不是我们 protect 的那批 Keccak).
-- `Illegal instruction` (signal 4, exit 132) = SIGILL — 不是我们的 BRK
-  分发路径 (那个会是 SIGTRAP / SIGSEGV).
-- 最可能: app 自身有 anti-tamper 检查, 检测到 .text 被改 (我们注入了
-  21 个 trampoline 改了原函数入口), 主动 `udf #0` 自爆.
-- 或者: 某个我们 protect 的函数返回时把状态搞坏, 主程序之后跑到野指针,
-  PC 落在全零内存上 → `udf #0` → SIGILL.
-
-# v50 改动
-
-## 1. SIGILL handler (新增)
-
-`crates/vmp-soruntime/src/lib.rs`: SIGILL 跟 SIGSEGV 共用同一个寄存器
-dump handler. 下次再挂会看到:
+# v50 现场 (你贴的 dump)
 
 ```
-[qvmp] qvmp_runtime: SIGSEGV sig=4  ← 实际是 SIGILL (sig=4 复用同一 handler)
-[qvmp] qvmp_runtime: SIGSEGV pc=...
-[qvmp] qvmp_runtime: x0=... x1=... ...
-[qvmp] qvmp_runtime: frame[0] lr=...
+SIGSEGV sig=4               ← 实际是 SIGILL (=signal 4) 复用 SIGSEGV handler
+SIGSEGV pc=411445248000     = 0x5FCC0C4000 → vaddr 0xC4000 (在我们新段里)
+LR (x30)=411444819496       = 0x5FCC05B628 → vaddr 0x5B628 (原 .text)
+frame[0] lr=411444808444    = 0x5FCC058AFC → vaddr 0x58AFC (原 .text)
+frame[1] lr=530492386660    = libc.so (vaddr 不同 lib)
+*没有任何 [qvmp] handler entry / dispatching log*
 ```
 
-PC + frame chain 就能定位是 anti-tamper 还是 VM 状态污染.
+# 真因
 
-## 2. 加密前 32 次 handler entry 全打日志 (而不是 power-of-2 节流)
+二进制启用了 **ARMv8.5 BTI (Branch Target Identification)**:
 
-帮排查首批 region 触发, 看是否真的有"我们 protect 的函数被叫到了".
+```
+$ objdump -d target_app
+0000000000003ccc <_start>:
+    3ccc: bti     j                    ← BTI 守门
+    3cd0: mov     x29, #0x0
+...
+0000000000003ce0 <_start_main>:
+    3ce0: paciasp                      ← PAC + BTI
+    3ce4: sub     sp, sp, #0x40
+```
 
-## 3. 大幅扩展 ARM64 lifter
+BTI 规则: 所有**间接调用** (BLR Xn / BR Xn) 落地点的首条指令必须是
+  `bti c` (call landing)
+  `bti j` (jump landing)
+  `bti jc` (both)
+  `paciasp` / `pacibsp` (PAC 隐含 BTI-jc)
 
-加了一票之前 skip 掉的指令族:
+否则硬件触发 **Branch Target Exception** → kernel 转 SIGILL.
 
-| 指令族 | 之前 | 现在 |
-|--------|------|------|
-| ADC / SBC / ADCS / SBCS | skip | ✓ (用 CSel+Carry-flag 实现) |
-| EXTR (一般形) | skip (仅 ROR) | ✓ (拼 LShr+Shl+Or) |
-| BFM 一般形 (BFI/UBFX/SBFX) | skip | ✓ |
-| BIC / EON / ORN (shift+NOT) | skip | ✓ |
-| ADD/SUB 扩展寄存器 (UXTB/SXTW 等) | skip | ✓ |
-| CCMP / CCMN (条件比较) | skip | ✓ (近似) |
-| SMULH / UMULH (128 位乘高位) | skip | ✓ (Knuth 拆 4×32) |
-| LDR/STR 9-bit 带符号扩展 (LDRSB/LDRSW 等) | skip | ✓ |
-| FP LDP/STP (含 Q-form 128-bit) | skip | ✓ |
-| dp-1src (CLZ/RBIT/REV/REV16/REV32) | skip | ✓ 加新 VOps |
-| NEON 位运算 (EOR/AND/ORR/BIC vector) | skip | ✓ 加 VEor/VAnd/VOr/VNot/VBic |
-| SHA3 (EOR3 / BCAX / RAX1 / XAR) | skip | ✓ 分解到 VEor/VBic/VRorD |
+我们的 v50 patch 把每个被保护函数入口的第一条指令**覆盖成裸 `B trampoline`**.
+`B` 不是 BTI 指令. 任何走 BLR / 函数指针调用进来的 caller 一落地就 SIGILL.
 
-5 个新 GPR VOp (Clz/Rbit/Rev/Rev16/Rev32), 8 个新 FREG VOp (VEor/VAnd/
-VOr/VNot/VBic/VShlD/VLShrD/VRorD).
+这解释了:
+- "没有 handler entry log" — 因为根本没机会执行到 trampoline 的 BRK,
+  BLR 第一拍就被 BTI 拦了
+- PC = 0xC4000 在我们新段里 — 那是 caller 的 BLR target 经过 patch
+  以后, 落地异常时 PC 仍指向落地点, 而落地点就是 patched 函数入口对应
+  的 trampoline 区域附近
+- 在我之前帮你测试的 fpdemo 上没复现, 是因为 fpdemo 是普通编译, 没开 BTI
 
-## 4. blob 版本和 ISA 容量
+# v51 修复
 
-- handler_duplication paranoid: 4 → 3 (因为新增 VOps 后容量被吃掉)
-- 1-byte opcode 上限从 220 提到 254 (= 255-1)
-- 65 VOps × 3 variants = 195 ≤ 254 ✓
-- 每个 region 仍是**独立 IsaSpec** (v2 blob); 21 region × 3 variants ×
-  65 VOps ≈ 4100 (region-idx, opcode) 独立组合
+`crates/vmp-rewriter/src/elf_writer.rs`:
 
-# 覆盖率
+1. 加 `detect_bti_protection`: 扫前 16KB .text, 看到任何 `bti c/j/jc` /
+   `paciasp` / `pacibsp` 就判定整段开了 BTI.
+2. patch 时 BTI-enabled 二进制改写 **2 条指令 (8 字节)**:
+     +0: `bti jc` (0xD50324DF) — 允许 BLR + BR 双向落地
+     +4: `B trampoline`
+3. 非 BTI 二进制保持原来的 1 条 `B trampoline`.
 
-| 阶段 | v47/49 | **v50** |
-|------|--------|---------|
-| ELF 函数 | 125 | 125 |
-| Lift 成功 | 51 | **88** ↑ |
-| Skip-traps drop | 74 | 37 ↓ |
-| 级联剔除 | 30 | 58 |
-| **最终 VMP** | 21 (16.8%) | **30 (24%)** |
+VM 侧 lift 时 `bti` / `paciasp` 系列已经被识别为 HINT → Nop, 所以原函数
+的前 2 条指令在 VM 内仍然按 nop 执行. 语义不变.
 
-instruction-level skip 从 6132 降到 1488. 剩下 1488 全是 NEON 高级
-SIMD (DUP element, INS, UMOV, vector ADD/SUB, vector shift-imm 等).
+# 覆盖率 (没动)
 
-入口函数从 `KeccakF1600_StatePermute` 变成 `qsh__sha512_compress` —
-现在被保护的函数集合包含了 SHA-512 / SHA-3 / Kyber KEM 主路径多个核心.
+| | v50 | v51 |
+|---|---|---|
+| Lift 成功 | 88 | 88 |
+| 最终 VMP | 30 | 30 |
+| 占比 | 24% | 24% |
 
-要冲 99% 需要把整个 NEON ISA 都铺一遍 (上百个 sub-encoding). 我先把
-现在这版给你测一下, 排查 SIGILL 真因, 同时我会继续推 NEON.
+(同一份 lift, 只改了 patch 方式)
 
-# 部署 (跟 v49 一样)
+# 部署
 
-1. `libqvmp_runtime.so` → `/data/local/tmp/`
-2. `target_app.hardened` → 任意位置, MT 双击 / `chmod +x && ./`
+1. `libqvmp_runtime.so` → `/data/local/tmp/`  (跟 v50 同一份, md5 不变也行)
+2. `target_app.hardened` → 任意位置, MT 双击
 
 # 期望
 
-- 启动看到 `[qvmp] qvmp_init: enter` 等三行 (.so 加载 OK)
-- 这次 protect 集变化大, **应该会看到 `handler entry #1..#N`** 因为
-  SHA-512 compress 是 license 验签的早期热点
-- 如果再 SIGILL → 现在 handler 会 dump pc / x0..x30 / frame chain,
-  贴日志回来我就能定位
+- 启动 3 行 [qvmp] log 跟以前一样
+- 这次跑到 license 验证应该会看到 `handler entry #1..#N` 和
+  `dispatching region=N` 因为 SHA-512 compress 在签名验证早期就被叫
+- 如果 *现在* 还挂, 请把日志贴回来 — 关键看:
+  * 有没有 `handler entry`? (有 → BTI 修对了, 后面是别的问题)
+  * 如果还 SIGILL, 看 pc 是什么 (排除还有其他 anti-tamper)
 
 # MD5
 
   target_app (原始)       2fd4c6b903fa93c041056f35750fc4e0
-  target_app.hardened     1541d04baa3fd458e52c8533514ffdd0
-  libqvmp_runtime.so      0e808c013384da0de622e89b5a768e18
+  target_app.hardened     564043063556f468dc7c5966c265acd4
+  libqvmp_runtime.so      0e808c013384da0de622e89b5a768e18  (同 v50)
