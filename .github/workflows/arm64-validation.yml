@@ -35,3 +35,18 @@ jobs:
             exit 1
           fi
           grep -F 'QVMP_BLOB SHA-256 mismatch' "$RUNNER_TEMP/mismatch.log"
+      - name: Check NDK C and C++ hardening
+        shell: bash
+        run: |
+          build="$RUNNER_TEMP/ndk-hardening"
+          cmake -S ci/ndk-hardening -B "$build" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$build"
+          export READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          for binary in "$build/check_c" "$build/check_cpp"; do
+            bash ci/check-android-runtime.sh "$binary"
+            symbols=$("$READELF" -Ws "$binary")
+            grep -F '__stack_chk_fail' <<<"$symbols"
+            grep -F '__read_chk' <<<"$symbols"
+          done
