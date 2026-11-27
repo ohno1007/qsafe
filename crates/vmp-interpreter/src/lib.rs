@@ -12,7 +12,7 @@ pub mod state;
 
 use log::trace;
 use vmp_core::{Error, Result};
-use vmp_isa::{decode_instr, Cond, IsaSpec, VOp, Width};
+use vmp_isa::{decode_instr, Cond, Instr, IsaSpec, VOp, Width};
 
 pub use state::{HostBridge, VmState};
 
@@ -382,8 +382,43 @@ impl<'a> Interpreter<'a> {
                 VOp::Barrier => {
                     // 单线程 VM：内存屏障 = noop
                 }
+                VOp::VExt | VOp::VTbl | VOp::VTbx => self.vector_bytes(instr)?,
             }
         }
+    }
+
+    fn vector_bytes(&mut self, instr: Instr) -> Result<()> {
+        let (lanes, argument) = instr.vector_byte_operands()
+            .ok_or_else(|| Error::vm("invalid vector byte operands"))?;
+        let rd = usize::from(instr.rd);
+        let rn = usize::from(instr.rs);
+        let rm = usize::from(instr.rt);
+        let regs = &self.state.fregs;
+        if rd >= regs.len() || rn >= regs.len() || rm >= regs.len() {
+            return Err(Error::vm("invalid vector register"));
+        }
+        // Stage the result so overlapping operands read the original register values.
+        // Zero initialization also clears the upper half on every 8B write.
+        let mut result = [0u8; 16];
+        let right = regs[rm].to_le_bytes();
+        if instr.op == VOp::VExt {
+            let split = lanes - argument;
+            result[..split].copy_from_slice(&regs[rn].to_le_bytes()[argument..lanes]);
+            result[split..lanes].copy_from_slice(&right[..argument]);
+        } else {
+            let old = regs[rd].to_le_bytes();
+            for lane in 0..lanes {
+                let index = usize::from(right[lane]);
+                if index < 16 * argument {
+                    let table_reg = (rn + index / 16) % regs.len();
+                    result[lane] = (regs[table_reg] >> (8 * (index % 16))) as u8;
+                } else if instr.op == VOp::VTbx {
+                    result[lane] = old[lane];
+                }
+            }
+        }
+        self.state.fregs[rd] = u128::from_le_bytes(result);
+        Ok(())
     }
 
     fn alu(&mut self, instr: vmp_isa::Instr, f: impl Fn(u64, u64) -> u64) {

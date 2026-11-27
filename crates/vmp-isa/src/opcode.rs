@@ -233,6 +233,12 @@ pub enum VOp {
     AtomicCas = 102,
     /// 内存屏障：单线程 VM 环境下 noop
     Barrier = 103,
+    /// Extract consecutive bytes from two SIMD registers.
+    VExt = 210,
+    /// Look up bytes in one to four consecutive SIMD registers.
+    VTbl = 211,
+    /// As VTbl, preserving destination bytes for out-of-range indices.
+    VTbx = 212,
 }
 
 pub const VOP_COUNT: usize = 64; // 上限；实际枚举值不超过此数
@@ -293,6 +299,9 @@ impl VOp {
             101 => VOp::AtomicSwap,
             102 => VOp::AtomicCas,
             103 => VOp::Barrier,
+            210 => VOp::VExt,
+            211 => VOp::VTbl,
+            212 => VOp::VTbx,
             _ => return None,
         };
         Some(result)
@@ -352,6 +361,9 @@ impl VOp {
             VOp::AtomicSwap,
             VOp::AtomicCas,
             VOp::Barrier,
+            VOp::VExt,
+            VOp::VTbl,
+            VOp::VTbx,
         ]
     }
 }
@@ -432,6 +444,9 @@ impl VOp {
             VOp::AtomicSwap => "AtomicSwap",
             VOp::AtomicCas => "AtomicCas",
             VOp::Barrier => "Barrier",
+            VOp::VExt => "VExt",
+            VOp::VTbl => "VTbl",
+            VOp::VTbx => "VTbx",
         }
     }
 }

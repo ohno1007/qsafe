@@ -114,6 +114,26 @@ impl Layout {
 }
 
 impl Instr {
+    /// For EXT/TBL/TBX bit 8 selects 16 active bytes (otherwise 8).
+    /// The low byte holds the EXT byte offset or the TBL/TBX table register count.
+    pub fn vector_bytes(op: VOp, rd: u8, rs: u8, rt: u8, wide: bool, argument: u8) -> Self {
+        let imm = ((wide as i64) << 8) | i64::from(argument);
+        Self { op, rd, rs, rt, imm, ..Self::default() }
+    }
+
+    pub fn vector_byte_operands(&self) -> Option<(usize, usize)> {
+        if !(0..=0x1ff).contains(&self.imm) {
+            return None;
+        }
+        let lanes = if self.imm & 0x100 != 0 { 16 } else { 8 };
+        let argument = (self.imm & 0xff) as usize;
+        match self.op {
+            VOp::VExt if argument < lanes => Some((lanes, argument)),
+            VOp::VTbl | VOp::VTbx if (1..=4).contains(&argument) => Some((lanes, argument)),
+            _ => None,
+        }
+    }
+
     pub fn layout(&self) -> Layout {
         match self.op {
             VOp::Nop | VOp::Ret | VOp::VExit | VOp::Trap | VOp::Junk | VOp::Obfuscate => Layout::r0(),
@@ -184,6 +204,10 @@ impl Instr {
             VOp::AtomicAdd | VOp::AtomicSwap | VOp::AtomicCas => Layout::r3w(),
             // 内存屏障无操作数
             VOp::Barrier => Layout::r0(),
+            VOp::VExt | VOp::VTbl | VOp::VTbx => Layout {
+                has_rd: true, has_rs: true, has_rt: true,
+                has_width: false, has_cond: false, imm_bytes: 4,
+            },
         }
     }
 

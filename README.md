@@ -320,6 +320,25 @@ LinuxHost 实现完整，rewriter 写的跳板格式确定。
 | `vmp-rewriter` | ~280 | ELF in-place 重写：追加 LOAD segment + 跳板 + entry patch |
 | `vmp-cli` | ~330 | `protect` / `lift` / `run` / `inspect` / `rewrite` / `ar-list` |
 
+## Android ARM64 构建与输入校验
+
+Cargo 为 `aarch64-linux-android` 显式指定 PIC、完整 RELRO 和不可执行栈。运行时可执行文件以 PIE 链接。这些选项作用于本项目链接的 ELF。已有 ELF 或共享库自身的编译期保护取决于其原始构建。
+
+Android NDK 的 C/C++ 项目可以用 CMake 3.17 或以上在自己的目标上开启强栈保护，并为优化构建启用至少二级 FORTIFY。将 `QSAFE_SOURCE_DIR` 设为本仓库路径。下例在定义 `my_native_target` 后开启这些选项。
+
+```cmake
+include("${QSAFE_SOURCE_DIR}/cmake/QsafeAndroidHardening.cmake")
+qsafe_harden_android_target(my_native_target)
+```
+
+若构建系统已有可信的制品摘要，可在设置 `QVMP_BLOB` 时同时设置 `QVMP_BLOB_SHA256`（64 个十六进制字符）。构建脚本读取一次输入并校验即将嵌入的同一份数据。摘要不符、格式错误或指定摘要但缺少输入时，构建会失败。此检查用于构建阶段的输入完整性。
+
+ARM64 解码器支持 NEON 字节操作 `EXT`、`TBL` 和 `TBX` 的 8B 与 16B 形式。查表可使用 1 至 4 个连续向量寄存器。回归用例覆盖寄存器重叠、V31 到 V0 的回绕以及越界索引。
+
+```bash
+cargo test -p vmp-stub --test neon_bytes
+```
+
 ## 安全声明
 
 VMP 类技术的核心价值在于**抬高分析成本**，而非提供密码学级别的不可破解保证。

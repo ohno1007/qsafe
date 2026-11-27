@@ -26,4 +26,4 @@ default = ["dev-logger"]
 dev-logger = ["dep:env_logger"]
 
 [build-dependencies]
-# 构建时把外部 .qvmp 文件复制到 OUT_DIR，供 include_bytes! 嵌入。
+sha2.workspace = true

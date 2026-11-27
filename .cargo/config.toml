@@ -1,5 +1,6 @@
 # 使用 NDK 工具链做交叉编译。Windows 路径用正斜杠避免转义。
 [target.aarch64-linux-android]
+rustflags = ["-C", "relocation-model=pic", "-C", "relro-level=full", "-C", "link-arg=-Wl,-z,noexecstack"]
 linker = "D:/android-ndk-r29-beta4/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd"
 ar = "D:/android-ndk-r29-beta4/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
 
