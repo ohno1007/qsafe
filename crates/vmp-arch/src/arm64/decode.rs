@@ -921,6 +921,25 @@ fn decode_data_reg(raw: u32) -> Result<Vec<Instr>, &'static str> {
 // SIMD / FP（标量子集 + LSE atomics）
 // =================================================================
 fn decode_simd_fp(raw: u32) -> Result<Vec<Instr>, &'static str> {
+    let wide = raw & (1 << 30) != 0;
+    let rd = (raw & 31) as u8;
+    let rn = ((raw >> 5) & 31) as u8;
+    let rm = ((raw >> 16) & 31) as u8;
+    // EXT leaves Q, Rm, imm4, Rn and Rd variable.
+    if raw & 0xbfe0_8400 == 0x2e00_0000 {
+        let offset = ((raw >> 11) & 15) as u8;
+        if !wide && offset >= 8 {
+            return Err("EXT offset outside 8B vector");
+        }
+        return Ok(vec![Instr::vector_bytes(VOp::VExt, rd, rn, rm, wide, offset)]);
+    }
+    // TBL/TBX share a class. Each table register contributes 16 bytes in both forms.
+    if raw & 0xbfe0_8c00 == 0x0e00_0000 {
+        let op = if raw & (1 << 12) == 0 { VOp::VTbl } else { VOp::VTbx };
+        let registers = (((raw >> 13) & 3) + 1) as u8;
+        return Ok(vec![Instr::vector_bytes(op, rd, rn, rm, wide, registers)]);
+    }
+
     // ---- MOVI (advanced SIMD modified immediate) ----
     // 仅识别 cmode=1110 + abc/defgh=0 → 整 vreg 清零的常见情形（编译器初始化用）
     // 0x2f00e400 (Q=0 D 寄存器), 0x6f00e400 (Q=1 整 Q 寄存器)

@@ -1,0 +1,37 @@
+name: ARM64 validation
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Test byte permutations and the scalar baseline
+        run: |
+          cargo test -p vmp-stub --test neon_bytes
+          cargo test -p vmp-stub --test end_to_end arm64_add_xn_xm_returns_sum
+      - name: Build and inspect the Android runtime
+        shell: bash
+        run: |
+          rustup target add aarch64-linux-android
+          bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$bin/aarch64-linux-android21-clang"
+          export CC_aarch64_linux_android="$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
+          export AR_aarch64_linux_android="$bin/llvm-ar"
+          export QVMP_BLOB="$RUNNER_TEMP/input.bin"
+          printf '%s' 'build-time integrity fixture' > "$QVMP_BLOB"
+          QVMP_BLOB_SHA256=$(sha256sum "$QVMP_BLOB" | cut -d' ' -f1)
+          export QVMP_BLOB_SHA256
+          cargo build --target aarch64-linux-android --release -p vmp-runtime
+          READELF="$bin/llvm-readelf" bash ci/check-android-runtime.sh target/aarch64-linux-android/release/vmp-runtime
+          printf '%s' 'changed' >> "$QVMP_BLOB"
+          if cargo build --target aarch64-linux-android --release -p vmp-runtime > "$RUNNER_TEMP/mismatch.log" 2>&1; then
+            echo "Changed build input was accepted" >&2
+            exit 1
+          fi
+          grep -F 'QVMP_BLOB SHA-256 mismatch' "$RUNNER_TEMP/mismatch.log"
